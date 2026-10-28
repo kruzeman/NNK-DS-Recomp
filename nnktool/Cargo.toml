@@ -1,0 +1,13 @@
+[package]
+name = "nnktool"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "nnktool"
+path = "src/main.rs"
+
+[dependencies]
+
+[profile.release]
+opt-level = 2

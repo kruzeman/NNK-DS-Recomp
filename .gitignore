@@ -1,0 +1,40 @@
+# Ni no Kuni DS (B2KJ) — never commit game data.
+
+# ROM images
+*.nds
+*.NDS
+*.ds
+*.zip
+*.7z
+
+# BIOS / firmware dumps
+bios/
+*.bin
+
+# extracted / generated game data (binaries, overlays, FNT dumps, ...)
+work/
+extract/
+out/
+*.raw
+*.elf
+
+# Ghidra project databases + locks (analysis artifacts live in work/ghidra)
+*.gpr
+*.rep/
+*.lock
+*.lock~
+*.log.html
+*.prp
+*.lock.db
+
+# Rust build output
+nnktool/target/
+target/
+
+# Python
+__pycache__/
+*.pyc
+
+# editor noise
+*.swp
+*~
