@@ -21,7 +21,6 @@ out/
 # Ghidra project databases + locks (analysis artifacts live in work/ghidra)
 *.gpr
 *.rep/
-*.lock
 *.lock~
 *.log.html
 *.prp
