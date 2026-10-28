@@ -143,12 +143,15 @@ static int64_t edge_fn(const GxRasVertex *u, const GxRasVertex *v,
            (int64_t)(v->sy - u->sy) * (px - u->sx);
 }
 
-/* top-left fill rule: boundary pixels count on top and left edges only
- * (for the area2 > 0 winding used below) */
+/* top-left fill rule: a pixel exactly on an edge counts only for top and
+ * left edges (for the area2 > 0 winding used below).  Top = horizontal,
+ * running right; left = any edge running up-screen; everything else is
+ * exclusive.  Directions reverse on the shared edge of the neighbor
+ * triangle, so shared edges stay gapless. */
 static int edge_inclusive(const GxRasVertex *u, const GxRasVertex *v)
 {
     if (u->sy == v->sy && u->sx < v->sx) return 1; /* top edge */
-    if (u->sx == v->sx && v->sy < u->sy) return 1; /* left edge */
+    if (v->sy < u->sy) return 1;                   /* left edge (incl. diagonal) */
     return 0;
 }
 

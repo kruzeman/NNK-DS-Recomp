@@ -1,5 +1,5 @@
 diff --git a/src/GPU3D.cpp b/src/GPU3D.cpp
-index 3272a349..40e74131 100644
+index 3272a349..b8271bc0 100644
 --- a/src/GPU3D.cpp
 +++ b/src/GPU3D.cpp
 @@ -17,8 +17,11 @@
@@ -14,7 +14,7 @@ index 3272a349..40e74131 100644
  #include "NDS.h"
  #include "GPU.h"
  #include "FIFO.h"
-@@ -31,6 +34,218 @@ namespace melonDS
+@@ -31,6 +34,222 @@ namespace melonDS
  using Platform::Log;
  using Platform::LogLevel;
  
@@ -59,6 +59,7 @@ index 3272a349..40e74131 100644
 +static std::vector<u8> RecBuf;
 +static std::vector<PressEvent> Events;
 +static size_t NextEvent = 0;
++static bool Injecting = false;
 +static int Unit = 0;
 +static int PendingFB = -1;
 +static long FrameBudget = 0;
@@ -120,6 +121,7 @@ index 3272a349..40e74131 100644
 +}
 +
 +bool Active() noexcept { if (!Inited) Init(); return On; }
++bool InputLocked() noexcept { if (!Inited) Init(); return On && !Events.empty() && !Injecting; }
 +int PendingUnit() noexcept { return PendingFB; }
 +
 +void Word(u32 val) noexcept
@@ -140,7 +142,7 @@ index 3272a349..40e74131 100644
 +        for (int i = 0; i < 4; i++) RecBuf.push_back((u8)(val >> (i * 8)));
 +        return;
 +    }
-+    if (addr != 0x04000060 && (addr < 0x04000330 || addr >= 0x040003FF))
++    if (addr != 0x04000060 && addr != 0x04000610 && (addr < 0x04000330 || addr >= 0x040003FF))
 +        return; // not render-relevant
 +    RecBuf.push_back(0x02);
 +    RecBuf.push_back((u8)width);
@@ -164,6 +166,7 @@ index 3272a349..40e74131 100644
 +    Unit++;
 +
 +    // input events due at (the VBlank starting) this new unit
++    Injecting = true;
 +    while (NextEvent < Events.size() && Events[NextEvent].Unit <= Unit)
 +    {
 +        const PressEvent& ev = Events[NextEvent++];
@@ -174,6 +177,7 @@ index 3272a349..40e74131 100644
 +        case 2: nds.ReleaseScreen(); break;
 +        }
 +    }
++    Injecting = false;
 +
 +    if (Pace > 0)
 +    {
@@ -233,7 +237,7 @@ index 3272a349..40e74131 100644
  // 3D engine notes
  //
  // vertex/polygon RAM is filled when a complete polygon is defined, after it's been culled and clipped
-@@ -2424,6 +2639,7 @@ bool YSort(Polygon* a, Polygon* b)
+@@ -2424,6 +2643,7 @@ bool YSort(Polygon* a, Polygon* b)
  
  void GPU3D::VBlank() noexcept
  {
@@ -241,7 +245,7 @@ index 3272a349..40e74131 100644
      if (GeometryEnabled)
      {
          if (RenderingEnabled)
-@@ -2510,6 +2726,7 @@ void GPU3D::SetRenderXPos(u16 xpos, u16 mask) noexcept
+@@ -2510,6 +2730,7 @@ void GPU3D::SetRenderXPos(u16 xpos, u16 mask) noexcept
  
  void GPU3D::WriteToGXFIFO(u32 val) noexcept
  {
@@ -249,7 +253,7 @@ index 3272a349..40e74131 100644
      if (NumCommands == 0)
      {
          NumCommands = 4;
-@@ -2687,6 +2904,7 @@ void GPU3D::Write8(u32 addr, u8 val) noexcept
+@@ -2687,6 +2908,7 @@ void GPU3D::Write8(u32 addr, u8 val) noexcept
  {
      if (!RenderingEnabled && addr >= 0x04000320 && addr < 0x04000400) return;
      if (!GeometryEnabled  && addr >= 0x04000400 && addr < 0x04000700) return;
@@ -257,7 +261,7 @@ index 3272a349..40e74131 100644
  
      switch (addr)
      {
-@@ -2737,6 +2955,7 @@ void GPU3D::Write16(u32 addr, u16 val) noexcept
+@@ -2737,6 +2959,7 @@ void GPU3D::Write16(u32 addr, u16 val) noexcept
  {
      if (!RenderingEnabled && addr >= 0x04000320 && addr < 0x04000400) return;
      if (!GeometryEnabled  && addr >= 0x04000400 && addr < 0x04000700) return;
@@ -265,7 +269,7 @@ index 3272a349..40e74131 100644
  
      switch (addr)
      {
-@@ -2824,6 +3043,7 @@ void GPU3D::Write32(u32 addr, u32 val) noexcept
+@@ -2824,6 +3047,7 @@ void GPU3D::Write32(u32 addr, u32 val) noexcept
  {
      if (!RenderingEnabled && addr >= 0x04000320 && addr < 0x04000400) return;
      if (!GeometryEnabled  && addr >= 0x04000400 && addr < 0x04000700) return;
@@ -274,10 +278,10 @@ index 3272a349..40e74131 100644
      switch (addr)
      {
 diff --git a/src/GPU3D.h b/src/GPU3D.h
-index 73eff2ff..079f0e90 100644
+index 73eff2ff..85769ea7 100644
 --- a/src/GPU3D.h
 +++ b/src/GPU3D.h
-@@ -85,6 +85,24 @@ struct Polygon
+@@ -85,6 +85,25 @@ struct Polygon
  class Renderer3D;
  class NDS;
  
@@ -291,6 +295,7 @@ index 73eff2ff..079f0e90 100644
 +namespace GXLog
 +{
 +bool Active() noexcept;
++bool InputLocked() noexcept; // true while a MELONDS_GXLOG_PRESS schedule owns input
 +int PendingUnit() noexcept; // unit index whose render is in flight, -1 if none
 +void Word(u32 val) noexcept; // raw GX FIFO word (WriteToGXFIFO)
 +void RegWrite(u32 addr, u32 val, int width) noexcept; // 3D MMIO write
@@ -326,3 +331,42 @@ index e6202700..6dece380 100644
      FrameIdentical = !(textureChanged || texPalChanged) && GPU3D.RenderFrameIdentical;
  
      if (RenderThreadRunning.load(std::memory_order_relaxed))
+diff --git a/src/NDS.cpp b/src/NDS.cpp
+index c6dc85fa..06185750 100644
+--- a/src/NDS.cpp
++++ b/src/NDS.cpp
+@@ -33,6 +33,12 @@
+ #include "Wifi.h"
+ #include "AREngine.h"
+ #include "Platform.h"
++
++// GX FIFO capture tooling (see gxrender/ref/melonds-gxfifo-log.patch): while a
++// MELONDS_GXLOG_PRESS schedule is active it owns all emulated input, so the
++// frontend's per-frame SetKeyMask/TouchScreen/ReleaseScreen calls must not
++// clobber the injected state.
++namespace GXLog { bool InputLocked() noexcept; }
+ #include "FreeBIOS.h"
+ #include "Args.h"
+ #include "version.h"
+@@ -1164,11 +1170,13 @@ void NDS::CancelEvent(u32 id)
+ 
+ void NDS::TouchScreen(u16 x, u16 y)
+ {
++    if (GXLog::InputLocked()) return;
+     SPI.GetTSC()->SetTouchCoords(x, y);
+ }
+ 
+ void NDS::ReleaseScreen()
+ {
++    if (GXLog::InputLocked()) return;
+     SPI.GetTSC()->SetTouchCoords(0x000, 0xFFF);
+ }
+ 
+@@ -1205,6 +1213,7 @@ void NDS::CheckKeyIRQ(u32 cpu, u32 oldkey, u32 newkey)
+ 
+ void NDS::SetKeyMask(u32 mask)
+ {
++    if (GXLog::InputLocked()) return;
+     u32 key_lo = mask & 0x3FF;
+     u32 key_hi = (mask >> 10) & 0x3;
+ 

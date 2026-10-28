@@ -66,21 +66,23 @@ hit-test commands (BOX/POS/VEC_TEST), which do not affect rendering.**
 | 2   | 4-color (2bpp paletted)     | implemented | palette base = texpal<<3 |
 | 3   | 16-color (4bpp paletted)    | implemented | used by golden test |
 | 4   | 256-color (8bpp paletted)   | implemented | |
-| 5   | 4x4-texel compressed        | stub        | renders solid magenta marker; CONFIRMED as the dominant real-game diff (Ni no Kuni street scene uses format 5 for large surfaces — see GX_TRACES.md §4) |
+| 5   | 4x4-texel compressed        | implemented | melonDS TextureLookup case-5 mirror: block table at vram 0x20000+(addr&0x1FFFC)/2, modes 0-3, slot-1 texel-0 quirk (tests T8) |
 | 6   | A5I3                        | implemented | |
 | 7   | direct 15bpp (BGR555+A)     | implemented | bit15 = alpha (0/31) |
 
 Wrapping (repeat/flip per axis, bits 16-19), color-0 transparency (bit 29),
 and palette-RAM lookups follow melonDS TextureLookup() arithmetic exactly.
-**Coverage: 7/8 formats (87.5%); 4x4-compressed is the single stub.**
+**Coverage: 8/8 formats (100%).**
 
 ## Rasterizer / shading status
 
 Implemented (software path, deterministic):
 - barycentric scanline fill with the top-left rule; pixel centers in 1/16 px
+  (on-edge pixels count on top edges — horizontal, running right — and left
+  edges — any up-running edge, incl. diagonal — so shared edges are gapless)
 - perspective-correct attributes (1/w) for color and texture coords
-- backface culling: front face = clockwise winding in screen space (y down),
-  POLYGON_ATTR bits 6/7 render front/back
+- backface culling in clip space (melonDS (x,y,w)-normal dot test, before
+  clipping); POLYGON_ATTR bits 6/7 render front/back faces
 - depth: Z-buffer (z/w, 12.12) or W-buffer (clip w) per POLYGON_ATTR bit 14;
   pass if new depth < old (first-submitted wins ties)
 - shading modes (melonDS RenderPixel arithmetic): modulation, decal,
@@ -93,9 +95,14 @@ Implemented (software path, deterministic):
   integer arithmetic identical to melonDS CalculateLighting()
 
 Partial / staged:
-- clipping: near plane only (clip w >= 1/64), linear clip-space attribute
-  interpolation; side/far planes not implemented — screen coordinates are
-  clamped to +/-512 px as a guard (no visible effect inside the viewport)
+- clipping/culling: mirrors melonDS GPU3D.cpp SubmitPolygon/ClipPolygon —
+  culling in clip space on the (x, y, w) normal BEFORE clipping (dot < 0 =
+  back face / POLYGON_ATTR bit 7, dot > 0 = front / bit 6, dot == 0 draws);
+  Sutherland-Hodgman against z=±w, y=±w, x=±w with the far-plane reject
+  (z > w drops the polygon unless POLYGON_ATTR bit 12); attributes
+  interpolate with hardware trunc-toward-zero arithmetic; W truncated to
+  24 bits and any w == 0 vertex makes the polygon degenerate (not
+  rendered).  Unimplemented: the ZeroDotW check (0x04000610 is captured)
 - wireframe polygons (alpha = 0) are drawn filled at forced alpha 31;
   1px-edge wireframe rendering is staged
 - translucent polygons blend in submission order (no depth-sorted

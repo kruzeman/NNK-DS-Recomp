@@ -267,45 +267,106 @@ static void submit_vertex(Gx *gx)
     }
 }
 
-/* Clip a polygon against the near plane (clip_w >= GX_NEAR_W).  All vertex
- * attributes are interpolated linearly in clip space.  Returns the clipped
- * vertex count (up to 6).  Full 6-plane frustum clipping is staged. */
-#define GX_NEAR_W 0x40 /* 1/64 in 1.19.12 */
+/* Polygon culling and clipping — mirrors melonDS GPU3D.cpp SubmitPolygon /
+ * ClipSegment / ClipAgainstPlane / ClipPolygon:
+ *  - culling runs in CLIP space on the raw polygon, using the normal over
+ *    (x, y, w): dot < 0 = back face (POLYGON_ATTR bit 7), dot > 0 = front
+ *    face (bit 6), dot == 0 draws regardless of the attribute bits;
+ *  - clipping is the hardware's vertex-walk against z=+w/-w, then y, then x;
+ *    a vertex past the far plane (z > w) rejects the whole polygon unless
+ *    POLYGON_ATTR bit 12 (far-plane intersect) is set;
+ *  - attributes interpolate with the hardware's trunc-toward-zero arithmetic;
+ *  - W is truncated to 24 bits and any vertex ending at w == 0 makes the
+ *    polygon degenerate (melonDS Degenerate flag: not rendered).
+ * After full +/-w clipping every vertex maps inside the viewport, so screen
+ * coordinates need no clamping for ordinary geometry (the wide clamp in
+ * fill_ras_vertex is only an overflow guard). */
 
-static int clip_near(const GxClipVertex *in, int nin, GxClipVertex *out)
+static void clip_segment(GxClipVertex *out, const GxClipVertex *vin,
+                         const GxClipVertex *voutv, int comp, int plane)
 {
-    int n = 0, i;
-    for (i = 0; i < nin; i++) {
-        const GxClipVertex *a = &in[i];
-        const GxClipVertex *b = &in[(i + 1) % nin];
-        int ain = a->clip[3] >= GX_NEAR_W;
-        int bin = b->clip[3] >= GX_NEAR_W;
-        if (ain)
-            out[n++] = *a;
-        if (ain != bin) {
-            /* intersection: t = (nearw - a.w) / (b.w - a.w) in 1.19.12 */
-            int64_t dw = b->clip[3] - a->clip[3];
-            int64_t t;
-            GxClipVertex *o;
-            if (dw == 0)
-                continue;
-            t = ((int64_t)(GX_NEAR_W - a->clip[3]) << 12) / dw;
-            o = &out[n];
-            o->clip[0] = a->clip[0] + (int32_t)(((int64_t)(b->clip[0] - a->clip[0]) * t) >> 12);
-            o->clip[1] = a->clip[1] + (int32_t)(((int64_t)(b->clip[1] - a->clip[1]) * t) >> 12);
-            o->clip[2] = a->clip[2] + (int32_t)(((int64_t)(b->clip[2] - a->clip[2]) * t) >> 12);
-            o->clip[3] = GX_NEAR_W;
-            o->s = a->s + (int32_t)(((int64_t)(b->s - a->s) * t) >> 12);
-            o->t = a->t + (int32_t)(((int64_t)(b->t - a->t) * t) >> 12);
-            o->r = (uint8_t)gx_clamp32(a->r + (((int64_t)(b->r - a->r) * t) >> 12), 0, 31);
-            o->g = (uint8_t)gx_clamp32(a->g + (((int64_t)(b->g - a->g) * t) >> 12), 0, 31);
-            o->b = (uint8_t)gx_clamp32(a->b + (((int64_t)(b->b - a->b) * t) >> 12), 0, 31);
-            n++;
+    int64_t factor_num = vin->clip[3] - (int64_t)plane * vin->clip[comp];
+    int32_t factor_den = (int32_t)(factor_num -
+        ((int64_t)voutv->clip[3] - (int64_t)plane * voutv->clip[comp]));
+    int i;
+    if (factor_den == 0) {
+        *out = *vin;
+        out->clip[comp] = plane * out->clip[3];
+        return;
+    }
+    for (i = 0; i < 4; i++)
+        if (i != comp)
+            out->clip[i] = vin->clip[i] + (int32_t)(((int64_t)(voutv->clip[i] -
+                vin->clip[i]) * factor_num) / factor_den);
+    out->clip[comp] = plane * out->clip[3];
+    out->s = vin->s + (int32_t)(((int64_t)(voutv->s - vin->s) * factor_num) / factor_den);
+    out->t = vin->t + (int32_t)(((int64_t)(voutv->t - vin->t) * factor_num) / factor_den);
+    out->r = (uint8_t)gx_clamp32(vin->r + (((int64_t)(voutv->r - vin->r) * factor_num) / factor_den), 0, 31);
+    out->g = (uint8_t)gx_clamp32(vin->g + (((int64_t)(voutv->g - vin->g) * factor_num) / factor_den), 0, 31);
+    out->b = (uint8_t)gx_clamp32(vin->b + (((int64_t)(voutv->b - vin->b) * factor_num) / factor_den), 0, 31);
+}
+
+/* Clip one component against both planes comp = +w / -w (melonDS
+ * ClipAgainstPlane: the + side runs first into temp[], the - side back into
+ * verts[]).  Returns the new vertex count, 0 if the polygon is rejected. */
+static int clip_comp(Gx *gx, int comp, GxClipVertex *verts, int nverts,
+                     GxClipVertex *temp)
+{
+    int i, prev, next, c = 0;
+
+    for (i = 0; i < nverts; i++) {
+        GxClipVertex vtx = verts[i];
+        prev = i ? i - 1 : nverts - 1;
+        next = i + 1 < nverts ? i + 1 : 0;
+        if (vtx.clip[comp] > vtx.clip[3]) {
+            if (comp == 2 && !(gx->cur_polygon_attr & (1u << 12)))
+                return 0; /* far-plane reject */
+            if (verts[prev].clip[comp] <= verts[prev].clip[3]) {
+                clip_segment(&temp[c], &vtx, &verts[prev], comp, 1);
+                c++;
+            }
+            if (verts[next].clip[comp] <= verts[next].clip[3]) {
+                clip_segment(&temp[c], &vtx, &verts[next], comp, 1);
+                c++;
+            }
+        } else {
+            temp[c++] = vtx;
         }
-        if (n >= 6)
+        if (c >= 9)
             break;
     }
-    return n;
+    nverts = c;
+    c = 0;
+    for (i = 0; i < nverts; i++) {
+        GxClipVertex vtx = temp[i];
+        prev = i ? i - 1 : nverts - 1;
+        next = i + 1 < nverts ? i + 1 : 0;
+        if (vtx.clip[comp] < -vtx.clip[3]) {
+            if (temp[prev].clip[comp] >= -temp[prev].clip[3]) {
+                clip_segment(&verts[c], &vtx, &temp[prev], comp, -1);
+                c++;
+            }
+            if (temp[next].clip[comp] >= -temp[next].clip[3]) {
+                clip_segment(&verts[c], &vtx, &temp[next], comp, -1);
+                c++;
+            }
+        } else {
+            verts[c++] = vtx;
+        }
+        if (c >= 9)
+            break;
+    }
+    return c;
+}
+
+static int clip_polygon(Gx *gx, GxClipVertex *verts, int nverts,
+                        GxClipVertex *temp)
+{
+    nverts = clip_comp(gx, 2, verts, nverts, temp);
+    if (nverts == 0) return 0;
+    nverts = clip_comp(gx, 1, verts, nverts, temp);
+    if (nverts == 0) return 0;
+    return clip_comp(gx, 0, verts, nverts, temp);
 }
 
 static void fill_ras_vertex(Gx *gx, const GxClipVertex *cv, GxRasVertex *rv)
@@ -313,9 +374,9 @@ static void fill_ras_vertex(Gx *gx, const GxClipVertex *cv, GxRasVertex *rv)
     int64_t w = cv->clip[3];
     int32_t wbuffer = (int32_t)((gx->cur_polygon_attr >> 14) & 1);
 
-    /* screen mapping: clip x/y in [-w, w] -> viewport, y down.
-     * Coordinates are clamped to +/-512 px: real frustum clipping of
-     * off-screen vertices is staged (see GX_COVERAGE.md). */
+    /* screen mapping: clip x/y in [-w, w] -> viewport, y down (melonDS
+     * hires-position formula).  After full +/-w clipping coordinates land
+     * inside the viewport; the clamp is an overflow guard only. */
     rv->sx = gx_clamp32((((int64_t)cv->clip[0] + w) * gx->vp_w * GX_SCREEN_ONE) / (w * 2) +
                         (int64_t)gx->vp_x0 * GX_SCREEN_ONE, -(1 << 13), 1 << 13);
     rv->sy = gx_clamp32((((int64_t)w - cv->clip[1]) * gx->vp_h * GX_SCREEN_ONE) / (w * 2) +
@@ -327,7 +388,8 @@ static void fill_ras_vertex(Gx *gx, const GxClipVertex *cv, GxRasVertex *rv)
         rv->depth = gx_clamp32(((int64_t)cv->clip[2] << 12) / w, -(1 << 28), 1 << 28);
     }
     rv->invw = (int32_t)(((int64_t)1 << GX_INVW_SHIFT) / w);
-    if (rv->invw < 256) rv->invw = 256; /* keeps I_i = invw>>8 nonzero */
+    if (rv->invw < 256) rv->invw = 256;   /* keeps I_i = invw>>8 nonzero */
+    if (rv->invw > (1 << 24)) rv->invw = 1 << 24; /* w < 1/64: bound interp */
 
     rv->s = cv->s;
     rv->t = cv->t;
@@ -341,11 +403,10 @@ static void submit_triangle(Gx *gx, const GxClipVertex *a,
 {
     GxPolygon poly;
     int64_t area2;
-    uint32_t attr = gx->cur_polygon_attr;
 
     memset(&poly, 0, sizeof(poly));
     poly.nv = 3;
-    poly.attr = attr;
+    poly.attr = gx->cur_polygon_attr;
     poly.texparam = gx->tex_param;
     poly.texpal = gx->tex_palette;
 
@@ -356,12 +417,31 @@ static void submit_triangle(Gx *gx, const GxClipVertex *a,
     area2 = gx_poly_area2(&poly);
     if (area2 == 0)
         return;
-    /* DS: front faces wind clockwise on screen (area2 > 0) */
-    if (area2 > 0) {
-        if (!(attr & (1u << 6))) return; /* front face disabled */
-    } else {
-        if (!(attr & (1u << 7))) return; /* back face disabled */
-    }
+
+    gx->n_polys_drawn++;
+    if (gx->draw_fn)
+        gx->draw_fn(gx->draw_user, &poly);
+    if (!gx->skip_software)
+        gx_raster_polygon(&gx->surface, &poly, &gx->env);
+}
+
+static void submit_quad(Gx *gx, const GxClipVertex *v)
+{
+    GxPolygon poly;
+    int64_t area2;
+    int i;
+
+    memset(&poly, 0, sizeof(poly));
+    poly.nv = 4;
+    poly.attr = gx->cur_polygon_attr;
+    poly.texparam = gx->tex_param;
+    poly.texpal = gx->tex_palette;
+    for (i = 0; i < 4; i++)
+        fill_ras_vertex(gx, &v[i], &poly.v[i]);
+
+    area2 = gx_poly_area2(&poly);
+    if (area2 == 0)
+        return;
 
     gx->n_polys_drawn++;
     if (gx->draw_fn)
@@ -372,56 +452,64 @@ static void submit_triangle(Gx *gx, const GxClipVertex *a,
 
 static void submit_polygon(Gx *gx)
 {
-    GxClipVertex clipped[6];
+    GxClipVertex clipped[10], temp[10];
     const GxClipVertex *v = gx->temp_vtx;
     int nv = (gx->polygon_mode == 1) ? 4 : 3;
     int i, n;
+    int64_t nx, ny, nz, dot;
+    uint32_t attr = gx->cur_polygon_attr;
 
     gx->n_polys++;
 
-    for (i = 0; i < nv; i++) {
-        if (v[i].clip[3] < GX_NEAR_W) {
-            n = clip_near(v, nv, clipped);
-            if (n < 3)
-                return;
-            for (i = 1; i + 1 < n; i++)
-                submit_triangle(gx, &clipped[0], &clipped[i], &clipped[i + 1]);
-            return;
-        }
+    /* culling in clip space (melonDS GPU3D::SubmitPolygon): normal over the
+     * (x, y, w) components of the raw polygon, normalized to 32 bits */
+    nx = (int64_t)(int32_t)((uint32_t)v[0].clip[1] - (uint32_t)v[1].clip[1]) *
+             (int32_t)((uint32_t)v[2].clip[3] - (uint32_t)v[1].clip[3]) -
+         (int64_t)(int32_t)((uint32_t)v[0].clip[3] - (uint32_t)v[1].clip[3]) *
+             (int32_t)((uint32_t)v[2].clip[1] - (uint32_t)v[1].clip[1]);
+    ny = (int64_t)(int32_t)((uint32_t)v[0].clip[3] - (uint32_t)v[1].clip[3]) *
+             (int32_t)((uint32_t)v[2].clip[0] - (uint32_t)v[1].clip[0]) -
+         (int64_t)(int32_t)((uint32_t)v[0].clip[0] - (uint32_t)v[1].clip[0]) *
+             (int32_t)((uint32_t)v[2].clip[3] - (uint32_t)v[1].clip[3]);
+    nz = (int64_t)(int32_t)((uint32_t)v[0].clip[0] - (uint32_t)v[1].clip[0]) *
+             (int32_t)((uint32_t)v[2].clip[1] - (uint32_t)v[1].clip[1]) -
+         (int64_t)(int32_t)((uint32_t)v[0].clip[1] - (uint32_t)v[1].clip[1]) *
+             (int32_t)((uint32_t)v[2].clip[0] - (uint32_t)v[1].clip[0]);
+    while (nx != (int32_t)nx || ny != (int32_t)ny || nz != (int32_t)nz) {
+        nx >>= 4; ny >>= 4; nz >>= 4;
+    }
+    dot = (int64_t)v[1].clip[0] * nx + (int64_t)v[1].clip[1] * ny +
+          (int64_t)v[1].clip[3] * nz;
+    if (dot < 0) {
+        if (!(attr & (1u << 7))) { gx->n_culled_back++; return; }
+    } else if (dot > 0) {
+        if (!(attr & (1u << 6))) { gx->n_culled_front++; return; }
     }
 
-    if (nv == 4) {
-        /* submit as a proper quad (rasterizer fans it 0-1-2 / 0-2-3) */
-        GxPolygon poly;
-        int64_t area2;
-        uint32_t attr = gx->cur_polygon_attr;
-
-        memset(&poly, 0, sizeof(poly));
-        poly.nv = 4;
-        poly.attr = attr;
-        poly.texparam = gx->tex_param;
-        poly.texpal = gx->tex_palette;
-        for (i = 0; i < 4; i++)
-            fill_ras_vertex(gx, &v[i], &poly.v[i]);
-
-        area2 = gx_poly_area2(&poly);
-        if (area2 == 0)
-            return;
-        if (area2 > 0) {
-            if (!(attr & (1u << 6))) return;
-        } else {
-            if (!(attr & (1u << 7))) return;
-        }
-
-        gx->n_polys_drawn++;
-        if (gx->draw_fn)
-            gx->draw_fn(gx->draw_user, &poly);
-        if (!gx->skip_software)
-            gx_raster_polygon(&gx->surface, &poly, &gx->env);
+    for (i = 0; i < nv; i++)
+        clipped[i] = v[i];
+    n = clip_polygon(gx, clipped, nv, temp);
+    if (n < 3) {
+        gx->n_drop_clip++;
         return;
     }
 
-    submit_triangle(gx, &v[0], &v[1], &v[2]);
+    /* W truncated to 24 bits; a zero W anywhere makes the polygon degenerate
+     * (melonDS marks it Degenerate and the renderer skips it) */
+    for (i = 0; i < n; i++) {
+        clipped[i].clip[3] &= 0x00FFFFFF;
+        if (clipped[i].clip[3] == 0) {
+            gx->n_drop_degenerate++;
+            return;
+        }
+    }
+
+    if (n == 4 && nv == 4) {
+        submit_quad(gx, clipped);
+        return;
+    }
+    for (i = 1; i + 1 < n; i++)
+        submit_triangle(gx, &clipped[0], &clipped[i], &clipped[i + 1]);
 }
 
 /* ------------------------------------------------------------------ */

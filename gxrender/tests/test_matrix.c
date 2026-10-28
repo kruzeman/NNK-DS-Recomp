@@ -118,17 +118,19 @@ static void test_matrix_ops(void)
 
 static void test_transform_and_viewport(void)
 {
-    /* Pipeline test: proj=identity, pos=translate(1.0, 2.0, -3.0),
-     * full-screen viewport.  Hand-computed for vertex A=(0x400,0,0):
-     *   clip = (0x400*1 + 1.0, 2.0, -3.0, 1.0) = (0x1400, 0x2000, -0x3000, 0x1000)
-     *   sx = ((0x1400 + 0x1000) * 256 * 16) / (2*0x1000) = 0x2400/2 = 4608
-     *   sy = ((0x1000 - 0x2000) * 192 * 16) / (2*0x1000) = -1536
-     *   depth(Z) = (clip_z << 12) / w = -0x3000
+    /* Pipeline test: proj=identity, pos=translate(0.25, 0.25, -0.5),
+     * full-screen viewport.  The triangle lies INSIDE the clip volume
+     * (|x|,|y|,|z| <= w) so full frustum clipping leaves it untouched.
+     * Hand-computed for vertex A=(0,0,0):
+     *   clip = (0x400, 0x400, -0x800, 0x1000)
+     *   sx = ((0x400 + 0x1000) * 256 * 16) / (2*0x1000) = 2560
+     *   sy = ((0x1000 - 0x400) * 192 * 16) / (2*0x1000) = 1152
+     *   depth(Z) = (clip_z << 12) / w = -0x800
      *   invw = 2^30 / 0x1000 = 0x40000
-     * B=(0x800,0,0): clip x = 0x1800 -> sx = 5120, same sy/depth
-     * C=(0,0x800,0x800): clip = (0x1000, 0x2800, -0x2800, 0x1000)
-     *   sx = 0x2000/2 = 4096, sy = ((0x1000-0x2800)*3072)/0x2000 = -2304
-     *   depth = -0x2800
+     * B=(0x800,0,0): clip x = 0xC00 -> sx = 3584, same sy/depth
+     * C=(0,0x800,0x400): clip = (0x400, 0xC00, -0x400, 0x1000)
+     *   sx = 2560, sy = ((0x1000-0xC00)*3072)/0x2000 = 384
+     *   depth = -0x400
      */
     static Gx gx;
     const uint32_t viewport = (0u) | (0u << 8) | (255u << 16) | (191u << 24);
@@ -144,54 +146,55 @@ static void test_transform_and_viewport(void)
     gx_fifo_write(&gx, 0x10); gx_fifo_write(&gx, 1);  /* MTX_MODE pos */
     gx_fifo_write(&gx, 0x15);
     gx_fifo_write(&gx, 0x1C);                          /* MTX_TRANS */
-    gx_fifo_write(&gx, 0x00001000);
-    gx_fifo_write(&gx, 0x00002000);
-    gx_fifo_write(&gx, (uint32_t)-0x3000);
+    gx_fifo_write(&gx, 0x00000400);
+    gx_fifo_write(&gx, 0x00000400);
+    gx_fifo_write(&gx, (uint32_t)-0x800);
     gx_fifo_write(&gx, 0x60); gx_fifo_write(&gx, viewport);
     gx_fifo_write(&gx, 0x29); gx_fifo_write(&gx, attr);
     gx_fifo_write(&gx, 0x40); gx_fifo_write(&gx, 0);   /* BEGIN triangles */
-    gx_fifo_write(&gx, 0x23); gx_fifo_write(&gx, 0x00000400); gx_fifo_write(&gx, 0);
+    gx_fifo_write(&gx, 0x23); gx_fifo_write(&gx, 0x00000000); gx_fifo_write(&gx, 0);
     gx_fifo_write(&gx, 0x23); gx_fifo_write(&gx, 0x00000800); gx_fifo_write(&gx, 0);
-    gx_fifo_write(&gx, 0x23); gx_fifo_write(&gx, 0x08000000u); gx_fifo_write(&gx, 0x800);
+    gx_fifo_write(&gx, 0x23); gx_fifo_write(&gx, 0x08000000u); gx_fifo_write(&gx, 0x400);
     gx_fifo_write(&gx, 0x41);                          /* END */
 
     check32("T6 polygon captured", n_captured, 1);
     if (n_captured != 1)
         return;
 
-    check32("T6 A sx", captured.v[0].sx, 4608);
-    check32("T6 A sy", captured.v[0].sy, -1536);
-    check32("T6 A depth", captured.v[0].depth, -0x3000);
+    check32("T6 A sx", captured.v[0].sx, 2560);
+    check32("T6 A sy", captured.v[0].sy, 1152);
+    check32("T6 A depth", captured.v[0].depth, -0x800);
     check32("T6 A invw", captured.v[0].invw, 0x40000);
-    check32("T6 B sx", captured.v[1].sx, 5120);
-    check32("T6 B sy", captured.v[1].sy, -1536);
-    check32("T6 C sx", captured.v[2].sx, 4096);
-    check32("T6 C sy", captured.v[2].sy, -2304);
-    check32("T6 C depth", captured.v[2].depth, -0x2800);
+    check32("T6 B sx", captured.v[1].sx, 3584);
+    check32("T6 B sy", captured.v[1].sy, 1152);
+    check32("T6 C sx", captured.v[2].sx, 2560);
+    check32("T6 C sy", captured.v[2].sy, 384);
+    check32("T6 C depth", captured.v[2].depth, -0x400);
 
-    /* T7: culling.  area2 of A,B,C = 512*(-768) = -393216 < 0 -> back face.
-     * front-only must cull it, back-only must draw it. */
+    /* T7: culling (clip-space normal over (x,y,w), melonDS SubmitPolygon;
+     * dot < 0 here -> back face).  Screen-space area2 of A,B,C =
+     * 1024*(-768) = -786432 (kept as a raster-winding sanity check). */
     {
         int64_t area2;
         GxPolygon p = captured;
         area2 = gx_poly_area2(&p);
-        check_true("T7 area2 negative (back face)", area2 == -393216);
+        check_true("T7 area2 negative (back face)", area2 == -786432);
     }
     gx_fifo_write(&gx, 0x29);
     gx_fifo_write(&gx, (1u << 6) | (31u << 16)); /* front only */
     gx_fifo_write(&gx, 0x40); gx_fifo_write(&gx, 0);
-    gx_fifo_write(&gx, 0x23); gx_fifo_write(&gx, 0x00000400); gx_fifo_write(&gx, 0);
+    gx_fifo_write(&gx, 0x23); gx_fifo_write(&gx, 0x00000000); gx_fifo_write(&gx, 0);
     gx_fifo_write(&gx, 0x23); gx_fifo_write(&gx, 0x00000800); gx_fifo_write(&gx, 0);
-    gx_fifo_write(&gx, 0x23); gx_fifo_write(&gx, 0x08000000u); gx_fifo_write(&gx, 0x800);
+    gx_fifo_write(&gx, 0x23); gx_fifo_write(&gx, 0x08000000u); gx_fifo_write(&gx, 0x400);
     gx_fifo_write(&gx, 0x41);
     check32("T7 back face culled (front-only)", n_captured, 1);
 
     gx_fifo_write(&gx, 0x29);
     gx_fifo_write(&gx, (1u << 7) | (31u << 16)); /* back only */
     gx_fifo_write(&gx, 0x40); gx_fifo_write(&gx, 0);
-    gx_fifo_write(&gx, 0x23); gx_fifo_write(&gx, 0x00000400); gx_fifo_write(&gx, 0);
+    gx_fifo_write(&gx, 0x23); gx_fifo_write(&gx, 0x00000000); gx_fifo_write(&gx, 0);
     gx_fifo_write(&gx, 0x23); gx_fifo_write(&gx, 0x00000800); gx_fifo_write(&gx, 0);
-    gx_fifo_write(&gx, 0x23); gx_fifo_write(&gx, 0x08000000u); gx_fifo_write(&gx, 0x800);
+    gx_fifo_write(&gx, 0x23); gx_fifo_write(&gx, 0x08000000u); gx_fifo_write(&gx, 0x400);
     gx_fifo_write(&gx, 0x41);
     check32("T7 back face drawn (back-only)", n_captured, 2);
 }

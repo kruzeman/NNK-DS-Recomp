@@ -90,10 +90,85 @@ int gx_tex_lookup(const GxTexMem *mem, uint32_t texparam, uint32_t texpal,
         *alpha = (pixel == 0) ? alpha0 : 31;
         return 1;
 
-    case 5: /* 4x4-texel compressed — STUB: visible magenta marker */
-        *color = 0x7C1F;
-        *alpha = 31;
-        return 1;
+    case 5: { /* 4x4-texel compressed (melonDS TextureLookup case 5).
+               * Layout: 4 bytes of 2-bit texel indices per 4x4 block in
+               * slot 0/2/3, one 16-bit palette-info word per block in the
+               * companion "slot 1" table region (addr/2 + 0x20000 base). */
+        uint32_t blockaddr, slot1addr, palbase, paloffset, palinfo;
+        uint32_t r, g, b;
+        uint8_t val, mode;
+        uint16_t color0, color1;
+
+        blockaddr = vramaddr + (uint32_t)(t & 0x3FC) * (uint32_t)(width >> 2) +
+                    (uint32_t)(s & 0x3FC) + (uint32_t)(t & 0x3);
+        blockaddr &= 0x7FFFF; /* address wraps after slot 3 (melonDS) */
+
+        slot1addr = 0x20000 + ((blockaddr & 0x1FFFC) >> 1);
+        if (blockaddr >= 0x40000)
+            slot1addr += 0x10000;
+
+        if (blockaddr >= 0x20000 && blockaddr < 0x40000) {
+            val = 0; /* reading slot 1 for texels always reads 0 (melonDS) */
+        } else {
+            if (blockaddr >= mem->vram_size) return 0;
+            val = (uint8_t)(mem->vram[blockaddr] >> (2 * (s & 0x3)));
+        }
+
+        if (slot1addr + 1 >= mem->vram_size) return 0;
+        palinfo = (uint32_t)mem->vram[slot1addr] |
+                  ((uint32_t)mem->vram[slot1addr + 1] << 8);
+        paloffset = (palinfo & 0x3FFF) << 2;
+        palbase = texpal << 4;
+        mode = (uint8_t)(palinfo >> 14);
+
+        switch (val & 0x3) {
+        case 0:
+            *color = pal_fetch(mem, palbase + paloffset);
+            *alpha = 31;
+            return 1;
+        case 1:
+            *color = pal_fetch(mem, palbase + paloffset + 2);
+            *alpha = 31;
+            return 1;
+        case 2:
+            if (mode == 1 || mode == 3) {
+                color0 = pal_fetch(mem, palbase + paloffset);
+                color1 = pal_fetch(mem, palbase + paloffset + 2);
+                if (mode == 1) {
+                    r = ((color0 & 0x001F) + (color1 & 0x001F)) >> 1;
+                    g = (((color0 & 0x03E0) + (color1 & 0x03E0)) >> 1) & 0x03E0;
+                    b = (((color0 & 0x7C00) + (color1 & 0x7C00)) >> 1) & 0x7C00;
+                } else {
+                    r = ((color0 & 0x001F) * 5 + (color1 & 0x001F) * 3) >> 3;
+                    g = (((color0 & 0x03E0) * 5 + (color1 & 0x03E0) * 3) >> 3) & 0x03E0;
+                    b = (((color0 & 0x7C00) * 5 + (color1 & 0x7C00) * 3) >> 3) & 0x7C00;
+                }
+                *color = (uint16_t)(r | g | b);
+            } else {
+                *color = pal_fetch(mem, palbase + paloffset + 4);
+            }
+            *alpha = 31;
+            return 1;
+        case 3:
+            if (mode == 2) {
+                *color = pal_fetch(mem, palbase + paloffset + 6);
+                *alpha = 31;
+            } else if (mode == 3) {
+                color0 = pal_fetch(mem, palbase + paloffset);
+                color1 = pal_fetch(mem, palbase + paloffset + 2);
+                r = ((color0 & 0x001F) * 3 + (color1 & 0x001F) * 5) >> 3;
+                g = (((color0 & 0x03E0) * 3 + (color1 & 0x03E0) * 5) >> 3) & 0x03E0;
+                b = (((color0 & 0x7C00) * 3 + (color1 & 0x7C00) * 5) >> 3) & 0x7C00;
+                *color = (uint16_t)(r | g | b);
+                *alpha = 31;
+            } else {
+                *color = 0;
+                *alpha = 0;
+            }
+            return 1;
+        }
+        return 0;
+    }
 
     case 6: /* A5I3 */
         vramaddr += (uint32_t)(t * width + s);

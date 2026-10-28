@@ -106,62 +106,117 @@ submission order).  Output .raw has the .fb layout (byte-comparable).
 delta, alpha-vs-color mismatch split and coverage on both sides (DQ8
 compare_frames.py conventions extended).
 
-## 4. First diff report (exploratory — NOT the final numbers)
+## 4. Canonical capture and FINAL diff report
 
-Slice units 43540–43545 (real 3D street scene) replayed starting mid-stream
-at unit 43440 (pipeline state warm-from-wrong-point):
+Canonical deterministic capture (input-fix build, patch v2), kept as
+traces/canonB (gitignored):
 
-    A=traces/slice3d units=6
-    B=traces/slice3d_out
-    compared=294912 differing_pixels=294382 (99.820%) max_channel_delta=63
-    exact_match_avg=0.18%
-    VERDICT: DIFFERENT (99.82% of pixels differ)
+    SDL_AUDIODRIVER=dummy DISPLAY=:99 \
+    MELONDS_GXLOG_DIR=traces/canonB MELONDS_GXLOG_FRAMES=48000 \
+    MELONDS_GXLOG_FBDUMP=1 MELONDS_GXLOG_FBEVERY=1 \
+    MELONDS_GXLOG_TEXEVERY=1 MELONDS_GXLOG_TEXFROM=33000 \
+    MELONDS_GXLOG_PACE=60 \
+    MELONDS_GXLOG_PRESS='14500:touch:128,70;14530:touch:up;14700:touch:128,85;
+    14730:touch:up;14900:touch:128,100;14930:touch:up;16000:touch:128,85;
+    16030:touch:up;16500:touch:220,175;16530:touch:up;17000:touch:130,175;
+    17030:touch:up' \
+    xvfb-run -a /home/hermes/tools/melonDS/build/melonDS "/home/hermes/NiNoKuni/Ni No Kuni.nds"
 
-Per frame: melonDS coverage 100% (full-screen background), replay coverage
-40.8%.
+Determinism: units 0-14499 (before the first injected input) are
+byte-identical to the earlier traces/schedA run (md5-verified at 12 sampled
+units).  Timeline: title screen from ~unit 101, "New Game" tapped at 14500,
+notice/dialog taps 16000-17000, real 3D (Morton Street: textured shops,
+characters, car) from unit 19589 through 48000 (vtx/fmt5 traffic in every
+other unit, [geometry unit][SWAP unit] cadence).
 
-Visual triptych analysis (traces diff PNGs, unit 43540) CONFIRMS two
-renderer gaps — the transform/vertex/raster pipeline itself works (street
-geometry, a character model and building shells come out in the right
-screen positions):
-1. **4x4-texel compressed textures render as the solid magenta stub** — the
-   scene's large surfaces (wall/floor/awning polygons) are texture format 5;
-   this is the single biggest color diff and matches the task's predicted
-   gap list.  NOT yet implemented (needs gx_tex.c format-5 decode mirrored
-   from melonDS TextureLookup + the palette-swap table at texpal 0x20000).
-2. **Screen-covering background geometry is dropped** (black where melonDS
-   shows street+sky): consistent with the near-plane-only clip + ±512 px
-   coordinate clamp in gx_fifo.c fill_ras_vertex on very large quads; needs
-   full frustum clipping or clamp-free raster bounds.
+Two capture fixes were required (root causes found this phase):
 
-Also unmeasured-but-captured: fog, edge marking, shadow/polyID masking
-(gxrender has no attr buffer) — quantified only after the two gaps above are
-fixed, since they dominate the pixel diff today.
+1. **Input injection was being clobbered**: melonDS's frontend EmuThread
+   re-applies its own input state every emu-loop iteration
+   (qt_sdl/EmuThread.cpp SetKeyMask/TouchScreen/ReleaseScreen), undoing
+   MELONDS_GXLOG_PRESS events within the same frame (evidence: traces/schedA
+   — identical attract cycle before/after the taps, zero VTX in 48000
+   units).  Patch v2 locks input to the schedule while one is active
+   (GXLog::InputLocked gate in NDS::SetKeyMask/TouchScreen/ReleaseScreen).
+2. **Tap coordinates**: the "New Game" button occupies DS (52,72)-(208,97)
+   (measured from window screenshots); the designed tap (128,70) misses its
+   top edge by ~2px.  The canonical schedule taps (128,85) with fallbacks.
+
+### FINAL diff (replay FROM UNIT 0, tools/gx_replay + tools/gx_tracediff)
+
+    ./build/gx_replay traces/canonB traces/canonB_out \
+        --render 11000-11005 --render 12000-12005 --render 13000-13005 \
+        --render 14000-14005 --render 33000-33009 --render 36000-36004 \
+        --render 40000-40004 --render 44000-44004
+    python3 tools/gx_tracediff.py traces/canonB traces/canonB_out --units 10000-14999
+    python3 tools/gx_tracediff.py traces/canonB traces/canonB_out --units 33000-47999
+
+| Set | Units | exact | differ | max delta | cov mel / rep | verdict |
+|-----|-------|-------|--------|-----------|---------------|---------|
+| title screen (2D-only 3D layer) | 11000-14005 (24) | **100.00%** | 0.000% | 0 | 0.0% / 0.0% | IDENTICAL |
+| real 3D slice | 33000-33009, 36000-36004, 40000-40004, 44000-44004 (25) | **90.29%** | 9.71% | 56 | 100.0% / 100.0% | DIFFERENT |
+
+Per-unit 3D exact% (honest numbers, stable across the window):
+33000: 89.62->90.33 (see CSV), 36000: 90.25, 40000: 90.30, 44000: 90.30;
+min 90.25%, max 90.33%, diff pixels 4751-4793 of 49152, max channel delta
+55-56.  The full per-unit table is reproducible with the commands above
+(CSV via --csv).  For comparison, the pre-fix exploratory number (mid-stream
+slice start) was 0.18% exact / 99.82% differ / 40.8% replay coverage.
+
+What the residual 9.7% is (triptych analysis of unit 44000):
+1. **fog** — the dense fully-mismatched band along the top of the frame is
+   the distant building/roofline area; the game enables fog (DISP3DCNT
+   0x203b, fog regs captured) and gxrender still stubs it;
+2. **edge marking** — red pixels form the OUTLINES of characters and scene
+   objects (interiors match), i.e. melonDS's 1px edge-marking outlines;
+3. minor edge/interpolation rounding (melonDS's 8/9-bit factor
+   interpolation vs our exact barycentric, see GX_COVERAGE.md).
+
+4x4-compressed textures decode correctly on real scene data (the earlier
+magenta stub is gone; storefront/awning textures render in place).
 
 ## 5. Gaps found / fixed / remaining
 
 Fixed in this phase:
-- capture fidelity: raw GX FIFO words alone are NOT enough — this game uses
-  the direct command ports (04000440h+) for most single-param commands and
-  splits multi-param commands across ports and FIFO words; the trace records
-  both plus all render-relevant MMIO writes (two-pass latch model).
-- gxrender API: gx_cmd_entry() for direct-port replay (src/gx_fifo.c).
+- **capture/input**: PRESS schedule now owns emulated input while active
+  (see §4); 0x04000610 (ZeroDotWLimit) is captured as well.
+- **4x4-texel compressed textures (fmt 5)**: implemented in gx_tex.c,
+  mirroring melonDS TextureLookup case 5 exactly (slot-1 palette-info table
+  at vram 0x20000+(addr&0x1FFFC)/2, all four interpolation modes, slot-1
+  texel-read-0 quirk, texpal<<4 base).  17 hand-computed unit checks
+  (tests/test_tex.c T8).
+- **coverage gap (40.8% -> 100%)** — three compounding root causes:
+  1. mid-stream replay starts zero the latched env regs: the slice replay
+     had clear_attr2=0 -> clearz=511, depth-failing every polygon with
+     z/w >= 0.125 in our (z/w<<12) depth scale.  Replaying FROM UNIT 0
+     restores the real clear (clear_attr2=0x7FFF, clearz=0xFFFFFF);
+  2. culling/clipping semantics: we culled in SCREEN space after clamping
+     unclipped coordinates to +/-512px and clipped only w>=1/64.  Now
+     mirroring melonDS GPU3D.cpp SubmitPolygon/ClipPolygon exactly:
+     culling in CLIP space on (x,y,w) before clipping, full
+     Sutherland-Hodgman against z=±w, y=±w, x=±w, far-plane reject
+     (POLYGON_ATTR bit 12), W truncated to 24 bits with the w==0
+     degenerate rule;
+  3. the top-left fill rule only counted axis-aligned edges as
+     top/left, so diagonal shared edges (this isometric scene is full of
+     them) dropped on-edge pixels on both sides — 1px black seams and
+     "glitched" small models.  Now any up-running edge is a left edge.
 
-Open (pending diff evidence on full-stream replay):
-- 4x4-texel compressed textures (gxrender stub = magenta marker)
-- fog (regs captured; renderer stub)
-- edge marking, antialiasing, shadow volumes / polygon-ID masking
-  (no attr/polyid buffer in gxrender's rasterizer — captured traces will
-  quantify the pixel cost)
-- near-clip precision and off-screen coordinate handling (see hypothesis 2)
+Open (measured, dominating the residual diff):
+- fog (regs captured; renderer stub) — top-band color deltas
+- edge marking / antialiasing / shadow volumes, polygon-ID masking (no
+  attr buffer) — outline deltas around characters and objects
+- melonDS's 8/9-bit factor interpolation and depth-test tie/variant rules
+  (DepthTest_Equal_Z/W for translucent-over-opaque) vs our exact barycentric
+  interpolation — small edge-rounding deltas
+- ZeroDotW check not implemented in the submit path (register now captured;
+  default limit 0xFFFFFF makes it a no-op unless the game writes 0x610)
 
 ## 6. Remaining work (next run)
 
-1. Canonical capture with MELONDS_GXLOG_PRESS schedule
-   (`14500:touch:128,70;14530:touch:up;16000:touch:128,70;16030:touch:up;
-   17000:touch:128,70;17030:touch:up`), FRAMES≈48000, TEXFROM≈33000,
-   TEXEVERY=1 over the 3D window.
-2. Replay FROM UNIT 0 and diff the 3D window (root-cause §4 hypotheses).
-3. Close the gaps the diffs reveal (4x4 tex / fog / edge / toon) or
-   document precisely why not; re-diff to show deltas.
-4. Update GX_COVERAGE.md to match measured reality.
+1. fog + edge marking implementation (the two named residual classes).
+2. W-buffer depth alignment with melonDS's per-polygon 16-bit-normalized W
+   if a W-buffered scene shows occlusion deltas (all sampled scene polygons
+   are Z-buffered; ordering is monotonic-equivalent there).
+3. Extend the final table with a walk-around slice (needs a PRESS
+   d-pad schedule) once fog/edge marking land.

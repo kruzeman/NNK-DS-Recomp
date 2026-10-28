@@ -76,6 +76,7 @@ typedef struct Gx {
 
     /* stats */
     uint32_t n_verts, n_polys, n_polys_drawn, n_unknown_cmds;
+    uint32_t n_culled_front, n_culled_back, n_drop_clip, n_drop_degenerate;
 } Gx;
 
 void gx_init(Gx *gx, uint32_t *color, uint32_t *depth, int w, int h);
