@@ -1,0 +1,328 @@
+diff --git a/src/GPU3D.cpp b/src/GPU3D.cpp
+index 3272a349..40e74131 100644
+--- a/src/GPU3D.cpp
++++ b/src/GPU3D.cpp
+@@ -17,8 +17,11 @@
+ */
+ 
+ #include <stdio.h>
++#include <stdlib.h>
+ #include <string.h>
++#include <time.h>
+ #include <algorithm>
++#include <vector>
+ #include "NDS.h"
+ #include "GPU.h"
+ #include "FIFO.h"
+@@ -31,6 +34,218 @@ namespace melonDS
+ using Platform::Log;
+ using Platform::LogLevel;
+ 
++// ---------------------------------------------------------------------------
++// GX FIFO command-stream / frame capture (gxrender trace tooling).
++// Controlled by environment variables (all optional):
++//   MELONDS_GXLOG_DIR       output directory; unset -> capture disabled
++//   MELONDS_GXLOG_FRAMES    exit(0) after this many units (0 = run forever)
++//   MELONDS_GXLOG_FBDUMP    1 = dump f%05u.fb per unit (default 1)
++//   MELONDS_GXLOG_FBEVERY   dump the framebuffer every Nth unit (default 1)
++//   MELONDS_GXLOG_TEXEVERY  dump texture memory every Nth unit (default 1)
++//   MELONDS_GXLOG_TEXFROM   first unit to dump texture memory for (default 0)
++//   MELONDS_GXLOG_PACE      cap capture at N units/second (0 = unthrottled)
++//   MELONDS_GXLOG_PRESS     deterministic input schedule, semicolon-separated:
++//                             "1200:keys:fffb"    KEYINPUT mask at unit 1200
++//                             "1300:touch:128,96" touch screen at unit 1300
++//                             "1320:touch:up"     release touch at unit 1320
++//                           events are applied at the VBlank starting that
++//                           unit (unit 0 events at the first VBlank)
++// A "unit" is one emulated frame worth of GX traffic, delimited by VBlank().
++// Record format of f%05u.gx (little-endian):
++//   01 <u32 word>                       raw GX FIFO word
++//   02 <u8 width> <u32 addr> <u32 val>  3D MMIO write (width 1/2/4)
++//   03 <u8 cmd> <u32 param>             direct command-port write (440h-5CCh)
++// f%05u.fb      = 256*192 u32 pixels (r|g<<8|b<<16|a<<24, 6-bit rgb)
++// f%05u.texvram = 512 KiB flat texture VRAM
++// f%05u.texpal  = 128 KiB flat texture palette RAM
++// ---------------------------------------------------------------------------
++namespace GXLog
++{
++
++struct PressEvent
++{
++    int Unit;
++    int Type; // 0 = keys, 1 = touch, 2 = release touch
++    u32 A, B;
++};
++
++static bool Inited = false;
++static bool On = false;
++static char Dir[1024] = {};
++static std::vector<u8> RecBuf;
++static std::vector<PressEvent> Events;
++static size_t NextEvent = 0;
++static int Unit = 0;
++static int PendingFB = -1;
++static long FrameBudget = 0;
++static int FbDump = 1;
++static int FbEvery = 1;
++static int TexEvery = 1;
++static int TexFrom = 0;
++static long Pace = 0;
++
++static void Init() noexcept
++{
++    Inited = true;
++    const char* dir = getenv("MELONDS_GXLOG_DIR");
++    if (!dir || !dir[0]) return;
++    snprintf(Dir, sizeof(Dir), "%s", dir);
++    const char* s;
++    if ((s = getenv("MELONDS_GXLOG_FRAMES")))   FrameBudget = atol(s);
++    if ((s = getenv("MELONDS_GXLOG_FBDUMP")))   FbDump = atoi(s);
++    if ((s = getenv("MELONDS_GXLOG_FBEVERY")))  FbEvery = atoi(s) > 0 ? atoi(s) : 1;
++    if ((s = getenv("MELONDS_GXLOG_TEXEVERY"))) TexEvery = atoi(s) > 0 ? atoi(s) : 1;
++    if ((s = getenv("MELONDS_GXLOG_TEXFROM")))  TexFrom = atoi(s);
++    if ((s = getenv("MELONDS_GXLOG_PACE")))     Pace = atol(s);
++    if ((s = getenv("MELONDS_GXLOG_PRESS")))
++    {
++        char buf[4096];
++        snprintf(buf, sizeof(buf), "%s", s);
++        for (char* tok = strtok(buf, ";"); tok; tok = strtok(nullptr, ";"))
++        {
++            PressEvent ev = {};
++            char kind[16] = {};
++            char arg[64] = {};
++            if (sscanf(tok, "%d:%15[^:]:%63s", &ev.Unit, kind, arg) != 3)
++                continue;
++            if (!strcmp(kind, "keys"))
++            {
++                ev.Type = 0;
++                ev.A = (u32)strtoul(arg, nullptr, 16) & 0xFFF;
++            }
++            else if (!strcmp(kind, "touch"))
++            {
++                if (!strcmp(arg, "up")) ev.Type = 2;
++                else
++                {
++                    unsigned x = 0, y = 0;
++                    if (sscanf(arg, "%u,%u", &x, &y) != 2) continue;
++                    ev.Type = 1;
++                    ev.A = x;
++                    ev.B = y;
++                }
++            }
++            else continue;
++            Events.push_back(ev);
++        }
++        std::stable_sort(Events.begin(), Events.end(),
++            [](const PressEvent& a, const PressEvent& b) { return a.Unit < b.Unit; });
++    }
++    RecBuf.reserve(1 << 20);
++    On = true;
++}
++
++bool Active() noexcept { if (!Inited) Init(); return On; }
++int PendingUnit() noexcept { return PendingFB; }
++
++void Word(u32 val) noexcept
++{
++    if (!Active()) return;
++    RecBuf.push_back(0x01);
++    for (int i = 0; i < 4; i++) RecBuf.push_back((u8)(val >> (i * 8)));
++}
++
++void RegWrite(u32 addr, u32 val, int width) noexcept
++{
++    if (!Active()) return;
++    if (addr >= 0x04000440 && addr < 0x040005CC)
++    {
++        if (width != 4) return; // direct ports are 32-bit only
++        RecBuf.push_back(0x03);
++        RecBuf.push_back((u8)((addr & 0x1FC) >> 2));
++        for (int i = 0; i < 4; i++) RecBuf.push_back((u8)(val >> (i * 8)));
++        return;
++    }
++    if (addr != 0x04000060 && (addr < 0x04000330 || addr >= 0x040003FF))
++        return; // not render-relevant
++    RecBuf.push_back(0x02);
++    RecBuf.push_back((u8)width);
++    for (int i = 0; i < 4; i++) RecBuf.push_back((u8)(addr >> (i * 8)));
++    for (int i = 0; i < 4; i++) RecBuf.push_back((u8)(val >> (i * 8)));
++}
++
++void CloseUnit(melonDS::NDS& nds) noexcept
++{
++    if (!Active()) return;
++    char path[1200];
++    snprintf(path, sizeof(path), "%s/f%05d.gx", Dir, Unit);
++    FILE* f = fopen(path, "wb");
++    if (f)
++    {
++        if (!RecBuf.empty()) fwrite(RecBuf.data(), 1, RecBuf.size(), f);
++        fclose(f);
++    }
++    RecBuf.clear();
++    PendingFB = Unit;
++    Unit++;
++
++    // input events due at (the VBlank starting) this new unit
++    while (NextEvent < Events.size() && Events[NextEvent].Unit <= Unit)
++    {
++        const PressEvent& ev = Events[NextEvent++];
++        switch (ev.Type)
++        {
++        case 0: nds.SetKeyMask(ev.A); break;
++        case 1: nds.TouchScreen((u16)ev.A, (u16)ev.B); break;
++        case 2: nds.ReleaseScreen(); break;
++        }
++    }
++
++    if (Pace > 0)
++    {
++        static long long next = 0;
++        struct timespec ts;
++        clock_gettime(CLOCK_MONOTONIC, &ts);
++        long long now = (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec;
++        if (next == 0) next = now;
++        next += 1000000000LL / Pace;
++        if (next > now)
++        {
++            struct timespec sl;
++            sl.tv_sec = (time_t)((next - now) / 1000000000LL);
++            sl.tv_nsec = (long)((next - now) % 1000000000LL);
++            nanosleep(&sl, nullptr);
++        }
++        else
++            next = now; // fell behind; resync
++    }
++
++    if (FrameBudget > 0 && Unit >= FrameBudget)
++    {
++        fflush(nullptr);
++        exit(0);
++    }
++}
++
++void DumpFramebuffer(const u32* color, int stride, int firstpix, int w, int h) noexcept
++{
++    if (!Active() || !FbDump || PendingFB < 0) return;
++    if (FbEvery > 1 && (PendingFB % FbEvery) != 0) return;
++    char path[1200];
++    snprintf(path, sizeof(path), "%s/f%05d.fb", Dir, PendingFB);
++    FILE* f = fopen(path, "wb");
++    if (!f) return;
++    for (int y = 0; y < h; y++)
++        fwrite(&color[firstpix + y * stride], 4, w, f);
++    fclose(f);
++}
++
++void DumpTextureMem(const u8* texvram, u32 texsize, const u8* texpal, u32 palsize) noexcept
++{
++    if (!Active() || PendingFB < 0 || PendingFB < TexFrom) return;
++    if (TexEvery > 1 && (PendingFB % TexEvery) != 0) return;
++    char path[1200];
++    snprintf(path, sizeof(path), "%s/f%05d.texvram", Dir, PendingFB);
++    FILE* f = fopen(path, "wb");
++    if (f) { fwrite(texvram, 1, texsize, f); fclose(f); }
++    snprintf(path, sizeof(path), "%s/f%05d.texpal", Dir, PendingFB);
++    f = fopen(path, "wb");
++    if (f) { fwrite(texpal, 1, palsize, f); fclose(f); }
++}
++
++}
++
++
+ // 3D engine notes
+ //
+ // vertex/polygon RAM is filled when a complete polygon is defined, after it's been culled and clipped
+@@ -2424,6 +2639,7 @@ bool YSort(Polygon* a, Polygon* b)
+ 
+ void GPU3D::VBlank() noexcept
+ {
++    GXLog::CloseUnit(NDS);
+     if (GeometryEnabled)
+     {
+         if (RenderingEnabled)
+@@ -2510,6 +2726,7 @@ void GPU3D::SetRenderXPos(u16 xpos, u16 mask) noexcept
+ 
+ void GPU3D::WriteToGXFIFO(u32 val) noexcept
+ {
++    GXLog::Word(val);
+     if (NumCommands == 0)
+     {
+         NumCommands = 4;
+@@ -2687,6 +2904,7 @@ void GPU3D::Write8(u32 addr, u8 val) noexcept
+ {
+     if (!RenderingEnabled && addr >= 0x04000320 && addr < 0x04000400) return;
+     if (!GeometryEnabled  && addr >= 0x04000400 && addr < 0x04000700) return;
++    GXLog::RegWrite(addr, val, 1);
+ 
+     switch (addr)
+     {
+@@ -2737,6 +2955,7 @@ void GPU3D::Write16(u32 addr, u16 val) noexcept
+ {
+     if (!RenderingEnabled && addr >= 0x04000320 && addr < 0x04000400) return;
+     if (!GeometryEnabled  && addr >= 0x04000400 && addr < 0x04000700) return;
++    GXLog::RegWrite(addr, val, 2);
+ 
+     switch (addr)
+     {
+@@ -2824,6 +3043,7 @@ void GPU3D::Write32(u32 addr, u32 val) noexcept
+ {
+     if (!RenderingEnabled && addr >= 0x04000320 && addr < 0x04000400) return;
+     if (!GeometryEnabled  && addr >= 0x04000400 && addr < 0x04000700) return;
++    GXLog::RegWrite(addr, val, 4);
+ 
+     switch (addr)
+     {
+diff --git a/src/GPU3D.h b/src/GPU3D.h
+index 73eff2ff..079f0e90 100644
+--- a/src/GPU3D.h
++++ b/src/GPU3D.h
+@@ -85,6 +85,24 @@ struct Polygon
+ class Renderer3D;
+ class NDS;
+ 
++// --- GX FIFO command-stream / frame capture (gxrender trace tooling) --------
++// Enabled by the MELONDS_GXLOG_DIR environment variable; entirely no-op when
++// that variable is unset.  Records, per emulated frame ("unit", delimited by
++// GPU3D::VBlank): the raw GX FIFO words, 3D MMIO register writes and direct
++// command-port writes, plus the rasterized 3D layer and flat texture memory.
++// Optional deterministic input injection (MELONDS_GXLOG_PRESS) and frame
++// pacing (MELONDS_GXLOG_PACE) support reproducible capture sessions.
++namespace GXLog
++{
++bool Active() noexcept;
++int PendingUnit() noexcept; // unit index whose render is in flight, -1 if none
++void Word(u32 val) noexcept; // raw GX FIFO word (WriteToGXFIFO)
++void RegWrite(u32 addr, u32 val, int width) noexcept; // 3D MMIO write
++void CloseUnit(melonDS::NDS& nds) noexcept; // called from GPU3D::VBlank
++void DumpFramebuffer(const u32* color, int stride, int firstpix, int w, int h) noexcept;
++void DumpTextureMem(const u8* texvram, u32 texsize, const u8* texpal, u32 palsize) noexcept;
++}
++
+ class GPU3D
+ {
+ public:
+diff --git a/src/GPU3D_Soft.cpp b/src/GPU3D_Soft.cpp
+index e6202700..6dece380 100644
+--- a/src/GPU3D_Soft.cpp
++++ b/src/GPU3D_Soft.cpp
+@@ -1741,6 +1741,9 @@ void SoftRenderer3D::FinishRendering()
+ {
+     if (RenderThreadRunning.load(std::memory_order_relaxed) && !GPU3D.AbortFrame)
+         Platform::Semaphore_Wait(Sema_RenderDone);
++
++    if (!GPU3D.AbortFrame)
++        GXLog::DumpFramebuffer(ColorBuffer, ScanlineWidth, FirstPixelOffset, 256, 192);
+ }
+ 
+ void SoftRenderer3D::RenderFrame()
+@@ -1751,6 +1754,9 @@ void SoftRenderer3D::RenderFrame()
+     bool textureChanged = GPU.MakeVRAMFlat_TextureCoherent(textureDirty);
+     bool texPalChanged = GPU.MakeVRAMFlat_TexPalCoherent(texPalDirty);
+ 
++    GXLog::DumpTextureMem(GPU.VRAMFlat_Texture, sizeof(GPU.VRAMFlat_Texture),
++                          GPU.VRAMFlat_TexPal, sizeof(GPU.VRAMFlat_TexPal));
++
+     FrameIdentical = !(textureChanged || texPalChanged) && GPU3D.RenderFrameIdentical;
+ 
+     if (RenderThreadRunning.load(std::memory_order_relaxed))

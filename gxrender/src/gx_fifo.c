@@ -800,3 +800,8 @@ void gx_fifo_write_block(Gx *gx, const uint32_t *words, size_t n)
     for (i = 0; i < n; i++)
         gx_fifo_write(gx, words[i]);
 }
+
+void gx_cmd_entry(Gx *gx, uint8_t cmd, uint32_t param)
+{
+    gx_exec(gx, cmd, param);
+}

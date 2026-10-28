@@ -66,7 +66,7 @@ hit-test commands (BOX/POS/VEC_TEST), which do not affect rendering.**
 | 2   | 4-color (2bpp paletted)     | implemented | palette base = texpal<<3 |
 | 3   | 16-color (4bpp paletted)    | implemented | used by golden test |
 | 4   | 256-color (8bpp paletted)   | implemented | |
-| 5   | 4x4-texel compressed        | stub        | renders solid magenta marker |
+| 5   | 4x4-texel compressed        | stub        | renders solid magenta marker; CONFIRMED as the dominant real-game diff (Ni no Kuni street scene uses format 5 for large surfaces — see GX_TRACES.md §4) |
 | 6   | A5I3                        | implemented | |
 | 7   | direct 15bpp (BGR555+A)     | implemented | bit15 = alpha (0/31) |
 
@@ -136,6 +136,10 @@ color/depth buffers and PPM output.  Verified:
     make golden     # compare against tests/golden/cube.ppm
     make gl-smoke   # SDL2+GL smoke test under xvfb-run
     make check      # all of the above
+
+Real-game validation (melonDS trace capture + replay + per-pixel diff) is
+documented in GX_TRACES.md; the tooling is tools/gx_replay.c and
+tools/gx_tracediff.py and the capture patch is ref/melonds-gxfifo-log.patch.
 
 Unit tests (tests/test_matrix.c, tests/test_tex.c, tests/test_shade.c) pin
 matrix ops, the transform/viewport mapping, culling, lighting, FIFO command

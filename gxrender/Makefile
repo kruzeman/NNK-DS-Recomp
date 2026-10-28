@@ -11,7 +11,7 @@ OBJ := $(BUILD)/gx_matrix.o $(BUILD)/gx_tex.o $(BUILD)/gx_raster.o $(BUILD)/gx_f
 GL_OBJ := $(BUILD)/gx_gl.o
 
 TESTS := $(BUILD)/test_matrix $(BUILD)/test_tex $(BUILD)/test_shade
-TOOLS := $(BUILD)/gx_cube_test $(BUILD)/gx_gl_smoke
+TOOLS := $(BUILD)/gx_cube_test $(BUILD)/gx_gl_smoke $(BUILD)/gx_replay
 
 all: $(LIB) $(GL_OBJ) $(TESTS) $(TOOLS)
 
@@ -39,8 +39,11 @@ $(BUILD)/test_shade: tests/test_shade.c $(LIB)
 $(BUILD)/gx_cube_test: tools/gx_cube_test.c tools/gx_scene.h $(LIB)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ tools/gx_cube_test.c $(LIB)
 
-$(BUILD)/gx_gl_smoke: tools/gx_gl_smoke.c tools/gx_scene.h $(LIB) $(GL_OBJ)
+$(BUILD)/gx_gl_smoke: tools/gx_gl_smoke.c tools/gx_scene.h $(GL_OBJ) $(LIB)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(SDL_CFLAGS) -o $@ tools/gx_gl_smoke.c $(GL_OBJ) $(LIB) $(SDL_LIBS)
+
+$(BUILD)/gx_replay: tools/gx_replay.c $(LIB)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ tools/gx_replay.c $(LIB)
 
 # unit tests + golden determinism test (3 in-process runs + 3 separate runs)
 test: all

@@ -87,4 +87,9 @@ void gx_set_disp_cnt(Gx *gx, uint32_t disp_cnt);
 void gx_fifo_write(Gx *gx, uint32_t word);
 void gx_fifo_write_block(Gx *gx, const uint32_t *words, size_t n);
 
+/* Execute one command entry (command byte + one parameter) directly, as the
+ * hardware direct command ports (4000440h-40005CCh) do; the parameter
+ * accumulation for multi-param commands is shared with gx_fifo_write. */
+void gx_cmd_entry(Gx *gx, uint8_t cmd, uint32_t param);
+
 #endif /* GX_FIFO_H */
