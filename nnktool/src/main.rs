@@ -5,6 +5,15 @@
 //   inspect [--full] <rom>   header + FNT/FAT + overlay tables
 //   fnt     [--full] <rom>   file name table listing (default: top-level only)
 //   extract <rom> <out_dir>  ARM9 / ARM7 / ARM9 overlay binaries
+//   disasm <image> [--base A] [--start A] [--end A] [--mode arm|thumb] [--count N]
+//   decompile <image> <out_dir> [--base A] [--entry A] [--max-insns N] [--max-funcs N]
+//   recompile-entry <image> <out.c> [--base A] [--entry A] [--max-insns N]
+
+mod decode;
+mod recover;
+mod recompile;
+
+use decode::{decode_arm, decode_thumb, set_image, thumb_fetch};
 
 use std::env;
 use std::fs;
@@ -261,10 +270,65 @@ fn load(rom: &str) -> Vec<u8> {
 
 fn usage() -> ! {
     eprintln!(
-        "usage:\n  nnktool inspect [--full] <rom>\n  nnktool fnt [--full] <rom>\n  nnktool extract <rom> <out_dir>"
+        "usage:\n  nnktool inspect [--full] <rom>\n  nnktool fnt [--full] <rom>\n  nnktool extract <rom> <out_dir>\
+         \n  nnktool disasm <image> [--base 0xADDR] [--start 0xADDR] [--end 0xADDR] [--mode arm|thumb] [--count N]\
+         \n  nnktool decompile <image> <out_dir> [--base 0xADDR] [--entry 0xADDR] [--max-insns N] [--max-funcs N]\
+         \n  nnktool recompile-entry <image> <out.c> [--base 0xADDR] [--entry 0xADDR] [--max-insns N]"
     );
     exit(2);
 }
+
+/// Value of `--key <value>` in args, if present.
+fn opt(args: &[String], key: &str) -> Option<String> {
+    args.iter().position(|a| a == key).and_then(|i| args.get(i + 1)).cloned()
+}
+
+/// Split argv into positionals, `--key value` options and the --full flag.
+fn split_args(args: &[String]) -> (Vec<String>, Vec<String>, bool) {
+    const VALUE_FLAGS: [&str; 9] = [
+        "--base", "--start", "--end", "--mode", "--count", "--entry", "--entry-mode",
+        "--max-insns", "--max-funcs",
+    ];
+    let mut pos: Vec<String> = Vec::new();
+    let mut flat: Vec<String> = Vec::new(); // key, value, key, value... for opt()
+    let mut full = false;
+    let mut it = args.iter(); // args[0] is the subcommand and stays a positional
+    while let Some(a) = it.next() {
+        if a == "--full" {
+            full = true;
+        } else if VALUE_FLAGS.contains(&a.as_str()) {
+            flat.push(a.clone());
+            if let Some(v) = it.next() {
+                flat.push(v.clone());
+            }
+        } else if let Some((k, v)) = a.split_once('=') {
+            if k.starts_with("--") {
+                flat.push(k.to_string());
+                flat.push(v.to_string());
+            } else {
+                pos.push(a.clone());
+            }
+        } else if a.starts_with("--") {
+            flat.push(a.clone());
+        } else {
+            pos.push(a.clone());
+        }
+    }
+    (pos, flat, full)
+}
+
+fn parse_addr(s: &str) -> u32 {
+    let t = s.trim();
+    let v = if let Some(h) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        u32::from_str_radix(h, 16)
+    } else {
+        t.parse::<u32>()
+    };
+    v.unwrap_or_else(|_| die(&format!("bad address/number: {}", s)))
+}
+
+const ARM9_BASE: u32 = 0x0200_0000;
+const ARM9_ENTRY: u32 = 0x0200_0800;
 
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -272,9 +336,9 @@ fn main() {
         usage();
     }
     let cmd = args[0].as_str();
-    let flags: Vec<&String> = args.iter().filter(|a| a.starts_with("--")).collect();
-    let pos: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
-    let full = flags.iter().any(|f| *f == "--full");
+    let (pos_vec, flags, full) = split_args(&args);
+    let pos: Vec<&String> = pos_vec.iter().collect();
+    let _ = &flags;
 
     match cmd {
         "inspect" => {
@@ -315,8 +379,181 @@ fn main() {
             let rom = load(pos[1]);
             extract(&rom, Path::new(pos[2]));
         }
+        "disasm" => {
+            if pos.len() != 2 {
+                usage();
+            }
+            let image = load(pos[1]);
+            let base = opt(&args, "--base").map(|s| parse_addr(&s)).unwrap_or(ARM9_BASE);
+            let mode = opt(&args, "--mode").unwrap_or_else(|| "arm".into());
+            let count = opt(&args, "--count").map(|s| parse_addr(&s) as usize).unwrap_or(64);
+            let start = opt(&args, "--start").map(|s| parse_addr(&s)).unwrap_or(base);
+            let end = opt(&args, "--end").map(|s| parse_addr(&s));
+            cmd_disasm(&image, base, start, end, &mode, count);
+        }
+        "decompile" => {
+            if pos.len() != 3 {
+                usage();
+            }
+            let image = load(pos[1]);
+            let base = opt(&args, "--base").map(|s| parse_addr(&s)).unwrap_or(ARM9_BASE);
+            let entry = opt(&args, "--entry").map(|s| parse_addr(&s)).unwrap_or(ARM9_ENTRY);
+            let entry_thumb = opt(&args, "--entry-mode").map(|s| s == "thumb").unwrap_or(false);
+            let max_insns = opt(&args, "--max-insns").map(|s| parse_addr(&s) as usize).unwrap_or(20_000);
+            let max_funcs = opt(&args, "--max-funcs").map(|s| parse_addr(&s) as usize).unwrap_or(20_000);
+            cmd_decompile(&image, base, entry, entry_thumb, Path::new(pos[2]), max_insns, max_funcs);
+        }
+        "recompile-entry" => {
+            if pos.len() != 3 {
+                usage();
+            }
+            let image = load(pos[1]);
+            let base = opt(&args, "--base").map(|s| parse_addr(&s)).unwrap_or(ARM9_BASE);
+            let entry = opt(&args, "--entry").map(|s| parse_addr(&s)).unwrap_or(ARM9_ENTRY);
+            let max_insns = opt(&args, "--max-insns").map(|s| parse_addr(&s) as usize).unwrap_or(20_000);
+            cmd_recompile_entry(&image, base, entry, Path::new(pos[2]), max_insns);
+        }
         _ => usage(),
     }
+}
+
+// ----------------------------------------------------------------- disasm ---
+
+fn cmd_disasm(image: &[u8], base: u32, start: u32, end: Option<u32>, mode: &str, count: usize) {
+    set_image(image, base);
+    let text_end = base.wrapping_add(image.len() as u32);
+    let stop = end.unwrap_or_else(|| text_end.min(start.wrapping_add((count as u32) * 4)));
+    if stop <= start {
+        die("empty disassembly range");
+    }
+    let mut addr = start;
+    let mut n = 0usize;
+    while addr < stop && addr < text_end {
+        match mode {
+            "arm" => {
+                if addr as usize + 4 > base as usize + image.len() {
+                    break;
+                }
+                let off = (addr - base) as usize;
+                let w = u32::from_le_bytes(image[off..off + 4].try_into().unwrap());
+                let insn = decode_arm(w, addr);
+                println!("  {:08x}:\t{:08x} \t{}", addr, w, insn.text);
+                addr = addr.wrapping_add(4);
+                n += 1;
+            }
+            "thumb" => {
+                let Some((h, h2, size)) = thumb_fetch(image, base, addr) else {
+                    break;
+                };
+                let insn = decode_thumb(h, h2, addr, size);
+                // binutils prints a Thumb BL/BLX pair as one line whose word
+                // column is the first halfword and whose text starts with the
+                // second: `f7ff fffe \tbl 0x...`.
+                if size == 4 {
+                    println!("  {:08x}:\t{:04x} {:04x} \t{}", addr, h, h2, insn.text);
+                } else {
+                    println!("  {:08x}:\t{:<9} \t{}", addr, format!("{:04x}", h), insn.text);
+                }
+                addr = addr.wrapping_add(size as u32);
+                n += 1;
+            }
+            _ => die("--mode must be arm or thumb"),
+        }
+    }
+    eprintln!("# {} instructions 0x{:08X}..0x{:08X} ({})", n, start, addr, mode);
+}
+
+// -------------------------------------------------------------- decompile ---
+
+fn cmd_decompile(
+    image: &[u8],
+    base: u32,
+    entry: u32,
+    entry_thumb: bool,
+    out_dir: &Path,
+    max_insns: usize,
+    max_funcs: usize,
+) {
+    set_image(image, base);
+    let text_end = base.wrapping_add(image.len() as u32);
+    let entry_mode = if entry_thumb { recover::Mode::Thumb } else { recover::Mode::Arm };
+    let key = recover::FuncKey { addr: entry & !1, mode: entry_mode };
+    let rec = recover::recover(image, base, text_end, key, max_insns, max_funcs);
+    let total = rec.funcs.len();
+    let arm = rec.funcs.keys().filter(|k| k.mode == recover::Mode::Arm).count();
+    let thumb = total - arm;
+    let bytes = recover::coverage_bytes(&rec.funcs);
+
+    fs::create_dir_all(out_dir).unwrap_or_else(|e| die(&format!("mkdir {}: {}", out_dir.display(), e)));
+
+    // function table
+    let mut tsv = String::from("entry\tmode\tinsns\tbytes\tblocks\tcalls\tindirects\tundef\n");
+    let mut listing = String::new();
+    listing.push_str(&format!(
+        "# nnktool decompile — reachability-guided ARM/Thumb recovery from entry 0x{:08X}\n# image 0x{:08X} + 0x{:X} bytes; recovered {} functions ({} arm, {} thumb)\n\n",
+        entry, base, image.len(), total, arm, thumb
+    ));
+    for (k, f) in &rec.funcs {
+        tsv.push_str(&format!(
+            "0x{:08X}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            k.addr,
+            k.mode.name(),
+            f.lines.len(),
+            f.bytes(),
+            f.blocks.len(),
+            f.calls.len(),
+            f.indirects.len(),
+            u8::from(f.hit_undef)
+        ));
+        listing.push_str(&format!(
+            "== sub_{:08X}_{} — {} insns, {} bytes, {} blocks, {} calls ==\n",
+            k.addr,
+            k.mode.name(),
+            f.lines.len(),
+            f.bytes(),
+            f.blocks.len(),
+            f.calls.len()
+        ));
+        for (addr, (words, text)) in &f.lines {
+            let enc: Vec<String> = words.iter().map(|w| format!("{:08x}", w)).collect();
+            listing.push_str(&format!("  {:08x}: {:<10} {}\n", addr, enc.join(" "), text));
+        }
+        for (addr, why) in &f.indirects {
+            listing.push_str(&format!("  ; indirect 0x{:08X}: {}\n", addr, why));
+        }
+        for c in &f.calls {
+            listing.push_str(&format!("  ; calls 0x{:08X}_{}\n", c.addr, c.mode.name()));
+        }
+        listing.push('\n');
+    }
+
+    let tsv_path = out_dir.join("arm9_functions.tsv");
+    fs::write(&tsv_path, &tsv).unwrap_or_else(|e| die(&format!("write {}: {}", tsv_path.display(), e)));
+    let list_path = out_dir.join("arm9_decompile.txt");
+    fs::write(&list_path, &listing).unwrap_or_else(|e| die(&format!("write {}: {}", list_path.display(), e)));
+
+    println!("recovered {} functions from entry 0x{:08X} ({} arm, {} thumb)", total, entry, arm, thumb);
+    println!("instruction bytes in recovered bodies: {} of 0x{:X} image bytes ({:.2}%)",
+        bytes, image.len(), 100.0 * bytes as f64 / image.len() as f64);
+    println!("truncated: {}", rec.truncated);
+    println!("wrote {} and {}", tsv_path.display(), list_path.display());
+}
+
+// -------------------------------------------------------- recompile-entry ---
+
+fn cmd_recompile_entry(image: &[u8], base: u32, entry: u32, out_c: &Path, max_insns: usize) {
+    set_image(image, base);
+    let stats = recompile::recompile_entry(image, base, entry, out_c, max_insns)
+        .unwrap_or_else(|e| die(&e));
+    // Also drop the guest image next to the C so the compiled binary can load it.
+    let img_out = out_c.with_extension("image.bin");
+    fs::write(&img_out, image).unwrap_or_else(|e| die(&format!("write {}: {}", img_out.display(), e)));
+    println!(
+        "generated {} ({} entry insns, {} call shims, {} indirect sites, {} halt sites, {} bytes C)",
+        out_c.display(), stats.insns, stats.calls_shimmed, stats.indirects, stats.halts, stats.bytes
+    );
+    println!("wrote guest image copy {}", img_out.display());
+    println!("build: cc -O2 -o entry_recompiled {} && ./entry_recompiled {}", out_c.display(), img_out.display());
 }
 
 fn inspect(rom: &[u8], full: bool) {
