@@ -161,6 +161,9 @@ void gxd_load_2d_state(Gxd *g, const uint8_t *image);
  * content is maintained from VRAM writes; this overrides it for replay. */
 void gxd_load_tex(Gxd *g, const uint8_t *texvram, uint32_t vram_size,
                   const uint16_t *texpal, uint32_t pal_count);
+/* Override the 3D layer fed to the compositor with a captured f%05u.fb
+ * buffer (256*192 u32, fb layout); NULL restores the rendered layer. */
+void gxd_load_fb3d(Gxd *g, const uint32_t *fb);
 
 /* Diagnostics. */
 uint32_t gxd_unhandled_io(const Gxd *g);
