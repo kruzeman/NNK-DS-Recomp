@@ -11,7 +11,7 @@ OBJ := $(BUILD)/gx_matrix.o $(BUILD)/gx_tex.o $(BUILD)/gx_raster.o $(BUILD)/gx_f
 GL_OBJ := $(BUILD)/gx_gl.o
 
 TESTS := $(BUILD)/test_matrix $(BUILD)/test_tex $(BUILD)/test_shade $(BUILD)/test_post $(BUILD)/test_2d
-TOOLS := $(BUILD)/gx_cube_test $(BUILD)/gx_gl_smoke $(BUILD)/gx_replay $(BUILD)/gx_2dreplay $(BUILD)/gx_2d_golden
+TOOLS := $(BUILD)/gx_cube_test $(BUILD)/gx_gl_smoke $(BUILD)/gx_replay $(BUILD)/gx_glreplay $(BUILD)/gx_2dreplay $(BUILD)/gx_gl2dreplay $(BUILD)/gx_2d_golden
 
 all: $(LIB) $(GL_OBJ) $(TESTS) $(TOOLS)
 
@@ -22,6 +22,9 @@ $(BUILD)/%.o: src/%.c | $(BUILD)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
 
 $(BUILD)/gx_gl.o: src/gx_gl.c | $(BUILD)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(SDL_CFLAGS) -c -o $@ $<
+
+$(BUILD)/gx_gl3d.o: src/gx_gl3d.c | $(BUILD)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(SDL_CFLAGS) -c -o $@ $<
 
 $(LIB): $(OBJ)
@@ -42,6 +45,9 @@ $(BUILD)/test_post: tests/test_post.c $(LIB)
 $(BUILD)/test_2d: tests/test_2d.c $(LIB)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ tests/test_2d.c $(LIB)
 
+$(BUILD)/test_gl2d: tests/test_gl2d.c $(BUILD)/gx_gl2d.o $(LIB)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(SDL_CFLAGS) -o $@ tests/test_gl2d.c $(BUILD)/gx_gl2d.o $(LIB) $(SDL_LIBS)
+
 $(BUILD)/gx_2dreplay: tools/gx_2dreplay.c $(LIB)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ tools/gx_2dreplay.c $(LIB)
 
@@ -56,6 +62,12 @@ $(BUILD)/gx_gl_smoke: tools/gx_gl_smoke.c tools/gx_scene.h $(GL_OBJ) $(LIB)
 
 $(BUILD)/gx_replay: tools/gx_replay.c $(LIB)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ tools/gx_replay.c $(LIB)
+
+$(BUILD)/gx_glreplay: tools/gx_glreplay.c $(BUILD)/gx_gl3d.o $(LIB)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(SDL_CFLAGS) -o $@ tools/gx_glreplay.c $(BUILD)/gx_gl3d.o $(LIB) $(SDL_LIBS)
+
+$(BUILD)/gx_gl2dreplay: tools/gx_gl2dreplay.c $(BUILD)/gx_gl2d.o $(LIB)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(SDL_CFLAGS) -o $@ tools/gx_gl2dreplay.c $(BUILD)/gx_gl2d.o $(LIB) $(SDL_LIBS)
 
 # unit tests + golden determinism test (3 in-process runs + 3 separate runs)
 test: all
@@ -87,9 +99,13 @@ gl-smoke: $(BUILD)/gx_gl_smoke
 	mkdir -p tests/out
 	xvfb-run -a $(BUILD)/gx_gl_smoke --out tests/out/cube_gl.ppm
 
-check: test golden golden2d gl-smoke
+check: test golden golden2d gl-smoke gl-tests
 
 clean:
 	rm -rf $(BUILD) tests/out
 
-.PHONY: all test golden golden2d gl-smoke check clean
+.PHONY: all test golden golden2d gl-smoke gl-tests check clean
+
+# GPU engine differential tests + GL 2D compositor (under xvfb/llvmpipe)
+gl-tests: $(BUILD)/test_gl2d $(BUILD)/gx_gl2dreplay
+	xvfb-run -a $(BUILD)/test_gl2d

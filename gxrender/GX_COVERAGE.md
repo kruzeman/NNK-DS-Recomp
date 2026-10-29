@@ -164,16 +164,100 @@ Known residual vs melonDS on the canonical 3D capture: 1.30% of pixels
 (see GX_TRACES.md §4-§5) — AA second-layer/coverage divergence on dense
 character meshes and two translucent shadow quads.
 
-## GL backend skeleton (src/gx_gl.c)
+## GL backend (src/gx_gl.c skeleton; src/gx_gl3d.c + src/gx_gl2d.c GPU engines)
 
-Status: SKELETON.  SDL2 window + GL compatibility context; draws the same
-decoded GxPolygon stream the software rasterizer receives (proven by
-tools/gx_gl_smoke.c: the GX stream's polygons reach the GL draw callback and
-cover exactly the same 8970 pixels as the software rasterizer).  Fidelity is
-lower by design: vertex color x texture modulation (no toon/highlight
-emulation), approximate depth normalization.  Under Xvfb the GL renderer is
-llvmpipe (software GL); on a display with GPU drivers the same code runs on
-real hardware.
+Status: 3D engine USABLE/validated (99.43% exact on canonB), 2D engine
+VALIDATED on synthetic cases and real captures (canon2d: 820/820 units
+byte-identical vs the software reference).  GL 4.3 core (image
+load/store); validated on Mesa llvmpipe 25.2 under Xvfb.  Per-unit diff
+tables for both canonical sets (with repro commands) live in
+GX_GL_DIFF.md.
+
+### 3D engine (src/gx_gl3d.c)
+
+Architecture: GL rasterizes the GxPolygon triangles; the fragment shader is
+a 1:1 port of the software rasterizer's per-pixel body against image
+load/store buffers (top layer + AA second layer, packed col/depth/attr):
+depth_pass tie rules (LessThan_FrontFacing / Equal_Z|W band),
+plot_translucent + alpha_blend (translucent polygon-ID skip, fog-flag
+inheritance, bit-11 depth write), gx_shade_pixel (modulate/decal/toon/
+highlight, 1-bit alpha, wireframe alpha 31), AA push-down + depth-fail
+second-layer fallthrough, and the gx_post_pass trio (edge marking incl.
+the break-AA-coverage write, fog incl. second-layer fog, AA final blend).
+Texture formats: all 8 DS formats decoded on the CPU through the shared
+gx_tex.c lookup (exact integer semantics incl. 4x4-compressed) into RGBA8UI
+(r6,g6,b6,a5) cached per (texparam,texpal); the shader does the DS-exact
+wrap math (TEXIMAGE_PARAM bits 16-19) + texelFetch, so indexed/direct/
+compressed formats share one exact path.  Fill semantics: per-row span
+parameters (spans, edge flags, accumulated AA coverage) are recorded by
+gx_raster_span_params() — the SAME slope state machine as the software fill
+(gx_raster.c) — and the shader replicates the 3-part fill loop exactly.
+Per-scanline sampling is corrected to the software's integer-pixel sample
+points via dFdx/dFdy half-pixel offsets.
+
+Validation (tools/gx_glreplay, same frame model as gx_replay via the shared
+tools/gx_replay_common.h; tools/gl_vs_soft.py classes R1/R2/R3/BIG):
+canonB canonical set (49 units, the accepted software baseline windows):
+title 24u byte-IDENTICAL (0 diff px of 1,179,648); real-3D 25u **13,822
+diff px of 1,228,800 (1.12% differing, 98.875% exact), max channel delta
+53, alpha mismatches 0**; combined 49u = 13,822 px of 2,408,448 (0.57%
+differing, 99.43% exact).  Residual classes (over the 13,822 px):
+R1(<=1)=753 R2(<=3)=2938 R3(<=15)=6650 BIG(>15)=3481.  Residual
+is spatially confined to the two dense character meshes (diff-map verified):
+float perspective-correct interpolation + GL pixel-center fill vs the DS
+8/9-bit perspective-factor quantization and the melonDS X-major edge
+row-offset quirk — texel selection differs on small textured triangles.
+Known divergences (classified, not yet closed): (a) interpolation model as
+above; (b) GL fills sliver edge pixels the software span fill drops (and
+vice versa) at ties; (c) zero-area collinear polygons (1186 of 10470 over
+the 49 units) are skipped by GL — the software fills 1px spans for them;
+(d) flat (1-row) polygons are rasterized as 1px quads with min/max-x vertex
+attributes; (e) shadow-volume/mask polygons render as ordinary translucent
+(same as the software path's documented stub).
+
+### 2D engine (src/gx_gl2d.c)
+
+Architecture: per-pixel GLSL port of the validated gx_2d.c scanline model:
+pass 1 replicates draw_sprites + draw_sprite_pixel's competition (objline
+winner + OBJ-window) per pixel; pass 2 replicates draw_scanline_bgobj
+(candidate stack: backdrop, BG3..BG0 / 3D layer at each priority, sprite
+winner interleaved after the BGs of its priority, draw_pixel push-down,
+top-two pixels) + color_composite + the display tail.  Window x/y latches,
+BG/OBJ mosaic latches and affine ref counters run through the same
+PreDraw/PostDraw/UpdateWindows model on the CPU (per-line data texture).
+All DS 2D features are ported: BG modes 0-7 (text/affine/extended/large),
+sprites (normal + rotscale + double-size, 1D/2D, flips, 16/256/bitmap,
+semitransparent, OBJ-window, Y/X mosaic), windows, color effects, sub-
+screen, 3D+2D blend, master brightness.
+
+Validation (tools/gx_gl2dreplay diffs GL vs the software reference AND vs
+the melonDS .scr golden in-process): tests/test_gl2d.c — 7 synthetic
+differential cases (text 16-color + transparency, engine-B 256-color
+extended palette, sprite priority interleave, window + alpha blend +
+brightness, affine + mosaic, mode-5 extended bitmap with stale BG3 ref
+latch [unit-9020 register mix], 16-color text with palette bank >= 1
+[unit-21010 register class]) all byte-exact vs the software path.  REAL
+capture status: canon2d full set (820 units, 80,609,280 px): GL-vs-
+SOFTWARE **byte-identical — 100.0000% exact, 0 differing px, max delta
+0**; GL-vs-melonDS golden differs only on unit 14444 (65,024 px, 0.08%),
+which is the software path's own accepted 2D residual class (software-
+vs-melonDS canon2d baseline 99.92%) — not a GL divergence.  Two real-
+capture bugs were found and fixed this round, both invisible to the
+earlier synthetic tests and now pinned by C6/C7: (1) the compositor
+shader passed BG3's ref-latch texel (lat0.z/lat0.w) to BG2's extended/
+affine/large evaluators instead of lat0.x/lat0.y — with BG3 disabled its
+latch never advances (layer-enable gate), so BG2 rendered one bitmap row
+across the whole screen (the "flat wrong color" class, misattributed to
+the title units in the round-1 handoff; the failing units were the
+6000s/9000s mode-5 screens); (2) the 16-color text path used the palette
+bank offset bank*16 as a byte offset instead of bank*32, so banks >= 1
+read wrong palette entries (the 21000s class).  Per-unit tables for both
+canonical sets: GX_GL_DIFF.md.
+
+### Old GL skeleton (src/gx_gl.c)
+
+SDL2 window + GL 1.1 fixed-pipeline smoke test (tools/gx_gl_smoke): proves
+the GX stream reaches a GL draw callback.  Kept for the presentation smoke.
 
 ## Determinism
 

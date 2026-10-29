@@ -1062,6 +1062,168 @@ void gx_raster_polygon(GxSurface *sf, const GxPolygon *poly,
     }
 }
 
+/* ---- span parameter recorder for GPU backends (see gx_raster.h) ----
+ * Mirrors the prologue + x-flow of render_polygon_scanline() exactly
+ * (same static slope state machine), recording what the fill loops would
+ * do without touching any buffer. */
+
+static void record_span_row(GxSpanRow *out, GxRPoly *rp, int32_t y,
+                            const GxPolygon *polygon, const GxRasterEnv *env)
+{
+    int polyalpha = (int)((polygon->attr >> 16) & 0x1F);
+    int wireframe = (polyalpha == 0);
+    int aa = env->aa_enable;
+    int32_t xstart, xend;
+    int l_filledge, r_filledge, swapped = 0;
+    int32_t l_edgelen = 0, r_edgelen = 0, l_edgecov = 0, r_edgecov = 0;
+    int yedge;
+    int32_t x, xlimit;
+
+    if (wireframe) polyalpha = 31;
+
+    if (rp->ytop != rp->ybot) {
+        if (y >= polygon->v[rp->next_vl].sy && rp->cur_vl != rp->vbot)
+            setup_left_edge(rp, y);
+        if (y >= polygon->v[rp->next_vr].sy && rp->cur_vr != rp->vbot)
+            setup_right_edge(rp, y);
+    }
+
+    xstart = rp->XL;
+    xend = rp->XR;
+
+    /* right vertical edges are pushed 1px to the left as long as either:
+     * the left edge slope is not 0, or the span is not 0 pixels wide, and
+     * it is not at the leftmost pixel of the screen */
+    if (rp->slope_r.Increment == 0 &&
+        (rp->slope_l.Increment != 0 || xstart != xend) && (xend != 0))
+        xend--;
+
+    if (xstart > xend) {
+        const GxRasVertex *vnL = &polygon->v[rp->next_vr];
+        const GxRasVertex *vnR = &polygon->v[rp->next_vl];
+        int32_t tmp;
+
+        slope_edge_params(&rp->slope_r, 1, 1, &l_edgelen, &l_edgecov);
+        slope_edge_params(&rp->slope_l, 0, 1, &r_edgelen, &r_edgecov);
+
+        tmp = xstart; xstart = xend; xend = tmp;
+        swapped = 1;
+
+        if (aa || env->edge_enable ||
+            ((polyalpha < 31) && env->alpha_blend) || wireframe) {
+            l_filledge = 1;
+            r_filledge = 1;
+        } else {
+            l_filledge = (rp->slope_r.Negative || !rp->slope_r.XMajor)
+                || ((y == rp->ybot - 1) && rp->slope_r.XMajor &&
+                   (vnL->sx != vnR->sx));
+            r_filledge = (!rp->slope_l.Negative && rp->slope_l.XMajor)
+                || (!(rp->slope_l.Negative && rp->slope_l.XMajor) &&
+                    rp->slope_r.Increment == 0)
+                || ((y == rp->ybot - 1) && rp->slope_l.XMajor &&
+                   (vnL->sx != vnR->sx));
+        }
+    } else {
+        const GxRasVertex *vnL = &polygon->v[rp->next_vl];
+        const GxRasVertex *vnR = &polygon->v[rp->next_vr];
+
+        slope_edge_params(&rp->slope_l, 0, 0, &l_edgelen, &l_edgecov);
+        slope_edge_params(&rp->slope_r, 1, 0, &r_edgelen, &r_edgecov);
+
+        if (aa || env->edge_enable ||
+            ((polyalpha < 31) && env->alpha_blend) || wireframe) {
+            l_filledge = 1;
+            r_filledge = 1;
+        } else {
+            l_filledge = ((rp->slope_l.Negative || !rp->slope_l.XMajor)
+                || ((y == rp->ybot - 1) && rp->slope_l.XMajor &&
+                   (vnL->sx != vnR->sx)))
+                || ((rp->slope_l.Increment == rp->slope_r.Increment) &&
+                    (xstart + l_edgelen == xend + 1));
+            r_filledge = (!rp->slope_r.Negative && rp->slope_r.XMajor) ||
+                (rp->slope_r.Increment == 0)
+                || ((y == rp->ybot - 1) && rp->slope_r.XMajor &&
+                   (vnL->sx != vnR->sx));
+        }
+    }
+    (void)swapped;
+
+    yedge = 0;
+    if (y == rp->ytop)        yedge = 0x4;
+    else if (y == rp->ybot - 1) yedge = 0x8;
+
+    x = xstart;
+    if (x < 0) x = 0;
+
+    /* part 1: left edge */
+    xlimit = xstart + l_edgelen;
+    if (xlimit > xend + 1) xlimit = xend + 1;
+    if (xlimit > 256) xlimit = 256;
+    out->a_lo = x;
+    out->a_hi = l_filledge ? xlimit : x;
+    if (l_edgecov & (1 << 31)) {
+        out->l_mode = 1;
+        out->l_cov0 = (l_edgecov >> 12) & 0x3FF;
+        if (out->l_cov0 == 0x3FF) out->l_cov0 = 0;
+        out->l_incr = l_edgecov & 0x3FF;
+    } else {
+        out->l_mode = 0;
+        out->l_cov0 = l_edgecov & 0x1F;
+        out->l_incr = 0;
+    }
+    x = xlimit;
+
+    /* part 2: polygon inside */
+    xlimit = xend - r_edgelen + 1;
+    if (xlimit > xend + 1) xlimit = xend + 1;
+    if (xlimit > 256) xlimit = 256;
+    out->b_lo = x;
+    if (wireframe && !yedge) {
+        out->b_hi = x;
+        if (x < xlimit) x = xlimit;
+    } else {
+        out->b_hi = (x < xlimit) ? xlimit : x;
+        if (x < xlimit) x = xlimit;
+    }
+
+    /* part 3: right edge */
+    xlimit = xend + 1;
+    if (xlimit > 256) xlimit = 256;
+    out->c_lo = x;
+    out->c_hi = (r_filledge && x < xlimit) ? xlimit : x;
+    if (r_edgecov & (1 << 31)) {
+        out->r_mode = 1;
+        out->r_cov0 = (r_edgecov >> 12) & 0x3FF;
+        if (out->r_cov0 == 0x3FF) out->r_cov0 = 0;
+        out->r_incr = r_edgecov & 0x3FF;
+    } else {
+        out->r_mode = 0;
+        out->r_cov0 = r_edgecov & 0x1F;
+        out->r_incr = 0;
+    }
+}
+
+int gx_raster_span_params(const GxPolygon *poly, const GxRasterEnv *env,
+                          GxSpanRow *rows, int max_rows)
+{
+    GxRPoly rp;
+    int32_t y;
+
+    setup_polygon(&rp, poly);
+    if (rp.ytop == rp.ybot) {
+        if (rp.ytop >= 0 && rp.ytop < max_rows)
+            record_span_row(&rows[rp.ytop], &rp, rp.ytop, poly, env);
+        return rp.ytop;
+    }
+    for (y = rp.ytop; y < rp.ybot; y++) {
+        if (y >= 0 && y < max_rows)
+            record_span_row(&rows[y], &rp, y, poly, env);
+        rp.XL = slope_step(&rp.slope_l);
+        rp.XR = slope_step(&rp.slope_r);
+    }
+    return rp.ytop;
+}
+
 /* ------------------------------------------------------------------ */
 /* frame post pass: edge marking + fog + antialiasing                  */
 

@@ -112,6 +112,32 @@ uint32_t gx_shade_pixel(const GxPolygon *poly, uint8_t vr, uint8_t vg,
  * maintained by the rasterizer; color-only surfaces are left untouched. */
 void gx_post_pass(GxSurface *sf, const GxPostEnv *env);
 
+/* Per-row span parameters for GPU backends replicating the fill semantics.
+ * gx_raster_span_params() walks the exact same slope state machine as
+ * gx_raster_polygon() and records what render_polygon_scanline() would fill
+ * for each row y in [ytop, ybot):
+ *   part 1 (left edge)   pixels [a_lo, a_hi), edge flag 0x1|yedge
+ *   part 2 (interior)    pixels [b_lo, b_hi), edge flag yedge
+ *   part 3 (right edge)  pixels [c_lo, c_hi), edge flag 0x2|yedge
+ * AA coverage for opaque plots (attr bits 8-12):
+ *   part 1: mode 0 -> constant l_cov0 (0..31); mode 1 -> accumulated
+ *           clamp((l_cov0 + (x - a_lo) * l_incr) >> 5, 0, 31)
+ *   part 2: 31 when yedge != 0 (and then a push-down happens), else 0
+ *   part 3: mode 0 -> constant r_cov0; mode 1 ->
+ *           clamp(31 - ((r_cov0 + (x - c_lo) * r_incr) >> 5), 0, 31)
+ * yedge: 0x4 on the top row, 0x8 on the bottom row, else 0 (software:
+ * y == ytop ? 0x4 : y == ybot-1 ? 0x8 : 0).
+ * rows must hold at least (poly row count) entries; rows are addressed by
+ * absolute screen y (only ytop..ybot-1 are written).  Returns ytop. */
+typedef struct {
+    int32_t a_lo, a_hi, b_lo, b_hi, c_lo, c_hi;
+    int32_t l_cov0, l_incr, l_mode;
+    int32_t r_cov0, r_incr, r_mode;
+} GxSpanRow;
+
+int gx_raster_span_params(const GxPolygon *poly, const GxRasterEnv *env,
+                          GxSpanRow *rows, int max_rows);
+
 /* Fog density lookup (melonDS CalculateFogDensity, GPU3D_Soft.cpp:1414-1451).
  * Exported for unit tests. */
 uint32_t gx_fog_density(const uint8_t density[34], uint32_t fog_offset,
