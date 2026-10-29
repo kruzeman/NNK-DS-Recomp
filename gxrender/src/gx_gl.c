@@ -26,9 +26,37 @@ struct GxGl {
     SDL_Window *window;
     SDL_GLContext ctx;
     int w, h;
+    int vp_w, vp_h;    /* GL viewport backing the 256x192 target */
+    int external;      /* window/context owned by the caller */
     GlTexCacheEntry cache[GL_TEX_CACHE];
     int cache_next;
 };
+
+static GxGl *gl_alloc(void)
+{
+    GxGl *g = (GxGl *)calloc(1, sizeof(GxGl));
+    if (g) {
+        g->w = GX_SCREEN_W;
+        g->h = GX_SCREEN_H;
+        g->vp_w = GX_SCREEN_W;
+        g->vp_h = GX_SCREEN_H;
+    }
+    return g;
+}
+
+static void gl_setup_target(GxGl *g)
+{
+    glViewport(0, 0, g->vp_w, g->vp_h);
+    glMatrixMode(GL_PROJECTION);
+    glLoadIdentity();
+    /* screen coords: x right, y down (row 0 = top), depth z in [-1, 1] */
+    glOrtho(0, GX_SCREEN_W, GX_SCREEN_H, 0, -1, 1);
+    glMatrixMode(GL_MODELVIEW);
+    glLoadIdentity();
+    glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_LEQUAL);
+    glEnable(GL_TEXTURE_2D);
+}
 
 GxGl *gx_gl_open(int scale)
 {
@@ -42,10 +70,10 @@ GxGl *gx_gl_open(int scale)
     SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
     SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
 
-    g = (GxGl *)calloc(1, sizeof(GxGl));
+    g = gl_alloc();
     if (!g) return NULL;
-    g->w = GX_SCREEN_W;
-    g->h = GX_SCREEN_H;
+    g->vp_w = GX_SCREEN_W * scale;
+    g->vp_h = GX_SCREEN_H * scale;
 
     g->window = SDL_CreateWindow("gxrender",
                                  SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
@@ -64,17 +92,21 @@ GxGl *gx_gl_open(int scale)
         return NULL;
     }
     SDL_GL_MakeCurrent(g->window, g->ctx);
+    gl_setup_target(g);
+    return g;
+}
 
-    glViewport(0, 0, GX_SCREEN_W * scale, GX_SCREEN_H * scale);
-    glMatrixMode(GL_PROJECTION);
-    glLoadIdentity();
-    /* screen coords: x right, y down (row 0 = top), depth z in [-1, 1] */
-    glOrtho(0, GX_SCREEN_W, GX_SCREEN_H, 0, -1, 1);
-    glMatrixMode(GL_MODELVIEW);
-    glLoadIdentity();
-    glEnable(GL_DEPTH_TEST);
-    glDepthFunc(GL_LEQUAL);
-    glEnable(GL_TEXTURE_2D);
+GxGl *gx_gl_open_external(SDL_Window *window, SDL_GLContext ctx)
+{
+    GxGl *g;
+    if (!window || !ctx) return NULL;
+    g = gl_alloc();
+    if (!g) return NULL;
+    g->window = window;
+    g->ctx = ctx;
+    g->external = 1;
+    SDL_GL_MakeCurrent(g->window, g->ctx);
+    gl_setup_target(g);
     return g;
 }
 
@@ -85,9 +117,11 @@ void gx_gl_close(GxGl *g)
     for (i = 0; i < GL_TEX_CACHE; i++)
         if (g->cache[i].in_use)
             glDeleteTextures(1, &g->cache[i].tex);
-    if (g->ctx) SDL_GL_DeleteContext(g->ctx);
-    if (g->window) SDL_DestroyWindow(g->window);
-    SDL_Quit();
+    if (!g->external) {
+        if (g->ctx) SDL_GL_DeleteContext(g->ctx);
+        if (g->window) SDL_DestroyWindow(g->window);
+        SDL_Quit();
+    }
     free(g);
 }
 
@@ -109,11 +143,17 @@ const char *gx_gl_version(GxGl *g)
 
 void gx_gl_begin_frame(GxGl *g, uint32_t clear_color6)
 {
+    gx_gl_begin_frame_a(g, clear_color6, 1.0f);
+}
+
+void gx_gl_begin_frame_a(GxGl *g, uint32_t clear_color6, float clear_alpha)
+{
     float r = gx_c6_to_c8((uint8_t)(clear_color6 & 0x3F)) / 255.0f;
     float gg = gx_c6_to_c8((uint8_t)((clear_color6 >> 8) & 0x3F)) / 255.0f;
     float b = gx_c6_to_c8((uint8_t)((clear_color6 >> 16) & 0x3F)) / 255.0f;
     (void)g;
-    glClearColor(r, gg, b, 1.0f);
+    gl_setup_target(g);
+    glClearColor(r, gg, b, clear_alpha);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 }
 
@@ -175,18 +215,22 @@ void gx_gl_draw_polygon(GxGl *g, const GxPolygon *poly, const GxTexMem *tex)
         glBindTexture(GL_TEXTURE_2D, 0);
     }
 
-    /* depth normalization: Z mode stores z/w in 12.12 (range 0..0x1000),
-     * W mode stores clip w (approximate scale). */
-    dscale = ((poly->attr >> 14) & 1) ? (float)(1 << 22) : (float)GX_FX_ONE;
+    /* depth normalization (approximate): GxRasVertex.depth is the melonDS
+     * FinalZ scale -- 24-bit Z (0..0xFFFFFF, smaller = nearer) in Z mode,
+     * 16-bit-normalized W (smaller = nearer) in W mode.  Map to GL z in
+     * [-1,1] with -1 = nearest. */
+    dscale = ((poly->attr >> 14) & 1) ? 65535.0f : 16777215.0f;
 
     glBegin(GL_TRIANGLES);
     for (i = 0; i < ntri; i++) {
         int k;
         for (k = 0; k < 3; k++) {
             const GxRasVertex *v = &poly->v[tri[i][k]];
-            float r = v->r / 31.0f, gg = v->g / 31.0f, b = v->b / 31.0f;
+            /* FinalColor: 9-bit scale ((c<<4)+0xF, 0 stays 0), 0..511 */
+            float r = v->cr / 511.0f, gg = v->cg / 511.0f, b = v->cb / 511.0f;
+            float pa = ((poly->attr >> 16) & 0x1F) / 31.0f;
             float s = v->s / 16.0f, t = v->t / 16.0f;
-            float z = 1.0f - 2.0f * ((float)v->depth / dscale);
+            float z = 2.0f * ((float)v->depth / dscale) - 1.0f;
             if (z < -1.0f) z = -1.0f;
             if (z > 1.0f) z = 1.0f;
             if (textured) {
@@ -194,8 +238,8 @@ void gx_gl_draw_polygon(GxGl *g, const GxPolygon *poly, const GxTexMem *tex)
                 t /= (float)h;
             }
             glTexCoord2f(s, t);
-            glColor3f(r, gg, b);
-            glVertex3f(v->sx / (float)GX_SCREEN_ONE, v->sy / (float)GX_SCREEN_ONE, z);
+            glColor4f(r, gg, b, pa);
+            glVertex3f((float)v->sx, (float)v->sy, z);
         }
     }
     glEnd();

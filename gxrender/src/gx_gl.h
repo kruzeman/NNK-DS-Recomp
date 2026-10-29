@@ -9,12 +9,20 @@
 #ifndef GX_GL_H
 #define GX_GL_H
 
+#include <SDL2/SDL.h>
+
 #include "gx_fifo.h"
 
 typedef struct GxGl GxGl;
 
 /* Open a window (w*scale x h*scale) + GL context.  NULL on failure. */
 GxGl *gx_gl_open(int scale);
+
+/* Open over an EXISTING SDL window + GL context (e.g. the gx_display
+ * present window).  The GL target is a 256x192 region of the current back
+ * buffer; gx_gl_close will not destroy the window/context or SDL. */
+GxGl *gx_gl_open_external(SDL_Window *window, SDL_GLContext ctx);
+
 void gx_gl_close(GxGl *g);
 
 /* GL_VENDOR / GL_RENDERER / GL_VERSION strings (for hardware-vs-software
@@ -24,6 +32,9 @@ const char *gx_gl_renderer(GxGl *g);
 const char *gx_gl_version(GxGl *g);
 
 void gx_gl_begin_frame(GxGl *g, uint32_t clear_color6);
+/* gx_gl_begin_frame with an explicit clear alpha (0..1) — the 3D layer's
+ * clear alpha is the DS clear polygon alpha and must survive readback. */
+void gx_gl_begin_frame_a(GxGl *g, uint32_t clear_color6, float clear_alpha);
 void gx_gl_draw_polygon(GxGl *g, const GxPolygon *poly, const GxTexMem *tex);
 void gx_gl_end_frame(GxGl *g);
 

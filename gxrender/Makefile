@@ -9,9 +9,10 @@ BUILD := build
 LIB := $(BUILD)/libgxrender.a
 OBJ := $(BUILD)/gx_matrix.o $(BUILD)/gx_tex.o $(BUILD)/gx_raster.o $(BUILD)/gx_fifo.o $(BUILD)/gx_2d.o
 GL_OBJ := $(BUILD)/gx_gl.o
+DISPLAY_OBJ := $(BUILD)/gx_display.o
 
-TESTS := $(BUILD)/test_matrix $(BUILD)/test_tex $(BUILD)/test_shade $(BUILD)/test_post $(BUILD)/test_2d
-TOOLS := $(BUILD)/gx_cube_test $(BUILD)/gx_gl_smoke $(BUILD)/gx_replay $(BUILD)/gx_glreplay $(BUILD)/gx_2dreplay $(BUILD)/gx_gl2dreplay $(BUILD)/gx_2d_golden
+TESTS := $(BUILD)/test_matrix $(BUILD)/test_tex $(BUILD)/test_shade $(BUILD)/test_post $(BUILD)/test_2d $(BUILD)/test_display
+TOOLS := $(BUILD)/gx_cube_test $(BUILD)/gx_gl_smoke $(BUILD)/gx_replay $(BUILD)/gx_glreplay $(BUILD)/gx_2dreplay $(BUILD)/gx_gl2dreplay $(BUILD)/gx_2d_golden $(BUILD)/gx_present
 
 all: $(LIB) $(GL_OBJ) $(TESTS) $(TOOLS)
 
@@ -25,6 +26,7 @@ $(BUILD)/gx_gl.o: src/gx_gl.c | $(BUILD)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(SDL_CFLAGS) -c -o $@ $<
 
 $(BUILD)/gx_gl3d.o: src/gx_gl3d.c | $(BUILD)
+$(BUILD)/gx_display.o: src/gx_display.c | $(BUILD)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(SDL_CFLAGS) -c -o $@ $<
 
 $(LIB): $(OBJ)
@@ -43,7 +45,13 @@ $(BUILD)/test_post: tests/test_post.c $(LIB)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ tests/test_post.c $(LIB)
 
 $(BUILD)/test_2d: tests/test_2d.c $(LIB)
-	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ tests/test_2d.c $(LIB)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $< $(LIB)
+
+$(BUILD)/test_display: tests/test_display.c $(DISPLAY_OBJ) $(GL_OBJ) $(LIB)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(SDL_CFLAGS) -o $@ $< $(DISPLAY_OBJ) $(GL_OBJ) $(LIB) $(SDL_LIBS)
+
+$(BUILD)/gx_present: tools/gx_present.c $(DISPLAY_OBJ) $(GL_OBJ) $(LIB)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(SDL_CFLAGS) -o $@ $< $(DISPLAY_OBJ) $(GL_OBJ) $(LIB) $(SDL_LIBS)
 
 $(BUILD)/test_gl2d: tests/test_gl2d.c $(BUILD)/gx_gl2d.o $(LIB)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(SDL_CFLAGS) -o $@ tests/test_gl2d.c $(BUILD)/gx_gl2d.o $(LIB) $(SDL_LIBS)
@@ -77,6 +85,7 @@ test: all
 	$(BUILD)/test_shade
 	$(BUILD)/test_post
 	$(BUILD)/test_2d
+	$(BUILD)/test_display
 	$(BUILD)/gx_cube_test --runs 3 --out tests/out/cube.ppm
 	sh tests/check_determinism.sh
 
