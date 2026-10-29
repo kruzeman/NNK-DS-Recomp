@@ -123,14 +123,20 @@ static void test_transform_and_viewport(void)
      * (|x|,|y|,|z| <= w) so full frustum clipping leaves it untouched.
      * Hand-computed for vertex A=(0,0,0):
      *   clip = (0x400, 0x400, -0x800, 0x1000)
-     *   sx = ((0x400 + 0x1000) * 256 * 16) / (2*0x1000) = 2560
-     *   sy = ((0x1000 - 0x400) * 192 * 16) / (2*0x1000) = 1152
-     *   depth(Z) = (clip_z << 12) / w = -0x800
-     *   invw = 2^30 / 0x1000 = 0x40000
-     * B=(0x800,0,0): clip x = 0xC00 -> sx = 3584, same sy/depth
+     *   integer FinalPosition (melonDS GPU3D.cpp:1317-1343):
+     *     posX = 0x400+0x1000 = 0x1400, den = 0x2000
+     *     sx = (0x1400*256)/0x2000 + 0 = 160
+     *     posY = 0x1000-0x400 = 0xC00
+     *     sy = (0xC00*192)/0x2000 + 0 = 72
+     *   depth (melonDS FinalZ, GPU3D.cpp:1541):
+     *     ((-0x800 * 0x4000)/0x1000 + 0x3FFF) * 0x200 = 0x1FFF*0x200
+     *     = 0x3FFE00
+     *   FinalW: wsize = 16 (W = 0x1000) -> wnorm = 0x1000
+     * B=(0x800,0,0): clip x = 0xC00 -> sx = 224, same sy/depth
      * C=(0,0x800,0x400): clip = (0x400, 0xC00, -0x400, 0x1000)
-     *   sx = 2560, sy = ((0x1000-0xC00)*3072)/0x2000 = 384
-     *   depth = -0x400
+     *   sx = 160, sy = (0x400*192)/0x2000 = 24
+     *   depth = ((-0x400*0x4000)/0x1000 + 0x3FFF)*0x200 = 0x2FFF*0x200
+     *     = 0x5FFE00
      */
     static Gx gx;
     const uint32_t viewport = (0u) | (0u << 8) | (255u << 16) | (191u << 24);
@@ -161,24 +167,24 @@ static void test_transform_and_viewport(void)
     if (n_captured != 1)
         return;
 
-    check32("T6 A sx", captured.v[0].sx, 2560);
-    check32("T6 A sy", captured.v[0].sy, 1152);
-    check32("T6 A depth", captured.v[0].depth, -0x800);
-    check32("T6 A invw", captured.v[0].invw, 0x40000);
-    check32("T6 B sx", captured.v[1].sx, 3584);
-    check32("T6 B sy", captured.v[1].sy, 1152);
-    check32("T6 C sx", captured.v[2].sx, 2560);
-    check32("T6 C sy", captured.v[2].sy, 384);
-    check32("T6 C depth", captured.v[2].depth, -0x400);
+    check32("T6 A sx", captured.v[0].sx, 160);
+    check32("T6 A sy", captured.v[0].sy, 72);
+    check32("T6 A depth", captured.v[0].depth, 0x3FFE00);
+    check32("T6 A wnorm", captured.v[0].wnorm, 0x1000);
+    check32("T6 B sx", captured.v[1].sx, 224);
+    check32("T6 B sy", captured.v[1].sy, 72);
+    check32("T6 C sx", captured.v[2].sx, 160);
+    check32("T6 C sy", captured.v[2].sy, 24);
+    check32("T6 C depth", captured.v[2].depth, 0x5FFE00);
 
     /* T7: culling (clip-space normal over (x,y,w), melonDS SubmitPolygon;
      * dot < 0 here -> back face).  Screen-space area2 of A,B,C =
-     * 1024*(-768) = -786432 (kept as a raster-winding sanity check). */
+     * (224-160)*(24-72) = -3072 (kept as a raster-winding sanity check). */
     {
         int64_t area2;
         GxPolygon p = captured;
         area2 = gx_poly_area2(&p);
-        check_true("T7 area2 negative (back face)", area2 == -786432);
+        check_true("T7 area2 negative (back face)", area2 == -3072);
     }
     gx_fifo_write(&gx, 0x29);
     gx_fifo_write(&gx, (1u << 6) | (31u << 16)); /* front only */

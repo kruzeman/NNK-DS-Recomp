@@ -23,8 +23,9 @@ typedef void (*GxDrawFn)(void *user, const GxPolygon *poly);
 
 typedef struct {
     int32_t clip[4];  /* clip-space position (1.19.12) */
-    int32_t s, t;     /* texcoords, 12.4 */
-    uint8_t r, g, b;  /* vertex color, 5-bit */
+    int16_t s, t;     /* texcoords, s16 (12.4) */
+    uint32_t col20[3]; /* vertex color, 12.20 scale ((c5<<12)+0xFFF),
+                        * melonDS GPU3D.cpp:1572-1574 */
 } GxClipVertex;
 
 typedef struct Gx {
@@ -45,11 +46,12 @@ typedef struct Gx {
     /* attribute state */
     uint8_t vtx_color[3];
     int16_t normal[3];
-    int32_t raw_s, raw_t, cur_s, cur_t;
+    int16_t raw_s, raw_t, cur_s, cur_t; /* s16 like melonDS TexCoords */
     int16_t cur_vtx[3];
     uint32_t polygon_attr;   /* live POLYGON_ATTR register */
     uint32_t cur_polygon_attr; /* latched at BEGIN_VTXS */
     uint32_t tex_param, tex_palette;
+    uint32_t zero_dot_w;     /* 0x04000610 ZeroDotWLimit (default 0xFFFFFF) */
     int32_t vp_x0, vp_y0, vp_w, vp_h; /* viewport in px (y0 = top row) */
 
     /* lighting */
@@ -70,6 +72,9 @@ typedef struct Gx {
     GxTexMem texmem;
     uint16_t toon[32];
     uint32_t disp_cnt;
+    int wbuffer; /* W-buffering: SWAP_BUFFERS param bit 1, latched at the
+                  * command and applied to polygons submitted after it
+                  * (melonDS GPU3D.cpp:2284, 1514) */
     GxDrawFn draw_fn;
     void *draw_user;
     int skip_software; /* 1: only draw_fn renders (GL backend path) */

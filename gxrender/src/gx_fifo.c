@@ -42,6 +42,7 @@ void gx_init(Gx *gx, uint32_t *color, uint32_t *depth, int w, int h)
 
     gx->polygon_attr = (31u << 16) | (1u << 6) | (1u << 7); /* opaque, both sides */
     gx->cur_polygon_attr = gx->polygon_attr;
+    gx->zero_dot_w = 0xFFFFFF; /* melonDS GPU3D.cpp:408 */
 
     gx->surface.color = color;
     gx->surface.depth = depth;
@@ -198,14 +199,15 @@ static void submit_vertex(Gx *gx)
     v->clip[2] = (int32_t)((p[0] * m[2] + p[1] * m[6] + p[2] * m[10] + (int64_t)GX_FX_ONE * m[14]) >> 12);
     v->clip[3] = (int32_t)((p[0] * m[3] + p[1] * m[7] + p[2] * m[11] + (int64_t)GX_FX_ONE * m[15]) >> 12);
 
-    v->r = gx->vtx_color[0];
-    v->g = gx->vtx_color[1];
-    v->b = gx->vtx_color[2];
+    v->col20[0] = (uint32_t)gx->vtx_color[0] << 12 | 0xFFF;
+    v->col20[1] = (uint32_t)gx->vtx_color[1] << 12 | 0xFFF;
+    v->col20[2] = (uint32_t)gx->vtx_color[2] << 12 | 0xFFF;
 
     if ((gx->tex_param >> 30) == 3) {
-        /* texcoords from vertex position */
-        v->s = (int32_t)(((p[0] * gx->texm[0] + p[1] * gx->texm[4] + p[2] * gx->texm[8]) >> 24) + gx->raw_s);
-        v->t = (int32_t)(((p[0] * gx->texm[1] + p[1] * gx->texm[5] + p[2] * gx->texm[9]) >> 24) + gx->raw_t);
+        /* texcoords from vertex position (result truncated to s16,
+         * melonDS GPU3D.cpp:1576-1585) */
+        v->s = (int16_t)(int32_t)(((p[0] * gx->texm[0] + p[1] * gx->texm[4] + p[2] * gx->texm[8]) >> 24) + gx->raw_s);
+        v->t = (int16_t)(int32_t)(((p[0] * gx->texm[1] + p[1] * gx->texm[5] + p[2] * gx->texm[9]) >> 24) + gx->raw_t);
     } else {
         v->s = gx->cur_s;
         v->t = gx->cur_t;
@@ -299,11 +301,14 @@ static void clip_segment(GxClipVertex *out, const GxClipVertex *vin,
             out->clip[i] = vin->clip[i] + (int32_t)(((int64_t)(voutv->clip[i] -
                 vin->clip[i]) * factor_num) / factor_den);
     out->clip[comp] = plane * out->clip[3];
-    out->s = vin->s + (int32_t)(((int64_t)(voutv->s - vin->s) * factor_num) / factor_den);
-    out->t = vin->t + (int32_t)(((int64_t)(voutv->t - vin->t) * factor_num) / factor_den);
-    out->r = (uint8_t)gx_clamp32(vin->r + (((int64_t)(voutv->r - vin->r) * factor_num) / factor_den), 0, 31);
-    out->g = (uint8_t)gx_clamp32(vin->g + (((int64_t)(voutv->g - vin->g) * factor_num) / factor_den), 0, 31);
-    out->b = (uint8_t)gx_clamp32(vin->b + (((int64_t)(voutv->b - vin->b) * factor_num) / factor_den), 0, 31);
+    out->s = (int16_t)(vin->s + (int32_t)(((int64_t)(voutv->s - vin->s) *
+                factor_num) / factor_den));
+    out->t = (int16_t)(vin->t + (int32_t)(((int64_t)(voutv->t - vin->t) *
+                factor_num) / factor_den));
+    for (i = 0; i < 3; i++)
+        out->col20[i] = (uint32_t)((int64_t)vin->col20[i] +
+            (((int64_t)voutv->col20[i] - (int64_t)vin->col20[i]) *
+            factor_num) / factor_den);
 }
 
 /* Clip one component against both planes comp = +w / -w (melonDS
@@ -356,6 +361,16 @@ static int clip_comp(Gx *gx, int comp, GxClipVertex *verts, int nverts,
         if (c >= 9)
             break;
     }
+
+    /* clipped vertex colors get re-rounded to the 12.20 format
+     * (melonDS ClipAgainstPlane, GPU3D.cpp:1108-1116) */
+    for (i = 0; i < c; i++) {
+        int k;
+        for (k = 0; k < 3; k++) {
+            verts[i].col20[k] &= ~0xFFFu;
+            verts[i].col20[k] += 0xFFFu;
+        }
+    }
     return c;
 }
 
@@ -369,94 +384,78 @@ static int clip_polygon(Gx *gx, GxClipVertex *verts, int nverts,
     return clip_comp(gx, 0, verts, nverts, temp);
 }
 
-static void fill_ras_vertex(Gx *gx, const GxClipVertex *cv, GxRasVertex *rv)
+/* Per-vertex output (melonDS GPU3D.cpp:1303-1551):
+ * - integer FinalPosition via the 32-bit divider, with the W>0xFFFF
+ *   half-shift quirk and the 9/8-bit result masks;
+ * - FinalW: W normalized so the polygon's W values fit in 16 bits
+ *   (per-polygon, 4-bit steps);
+ * - depth: Z mode clamp(((z*0x4000)/w + 0x3FFF)*0x200, 0, 0xFFFFFF),
+ *   W mode = W truncated to its top 16 bits;
+ * - FinalColor: 5-bit color expanded to 9 bits ((c<<4)+0xF). */
+static void fill_ras_vertex(Gx *gx, const GxClipVertex *cv, GxRasVertex *rv,
+                            int wsize)
 {
-    int64_t w = cv->clip[3];
-    int32_t wbuffer = (int32_t)((gx->cur_polygon_attr >> 14) & 1);
+    uint32_t w = (uint32_t)cv->clip[3];
+    uint32_t posX, posY, den;
+    int32_t wshifted;
+    int s;
 
-    /* screen mapping: clip x/y in [-w, w] -> viewport, y down (melonDS
-     * hires-position formula).  After full +/-w clipping coordinates land
-     * inside the viewport; the clamp is an overflow guard only. */
-    rv->sx = gx_clamp32((((int64_t)cv->clip[0] + w) * gx->vp_w * GX_SCREEN_ONE) / (w * 2) +
-                        (int64_t)gx->vp_x0 * GX_SCREEN_ONE, -(1 << 13), 1 << 13);
-    rv->sy = gx_clamp32((((int64_t)w - cv->clip[1]) * gx->vp_h * GX_SCREEN_ONE) / (w * 2) +
-                        (int64_t)gx->vp_y0 * GX_SCREEN_ONE, -(1 << 13), 1 << 13);
-
-    if (wbuffer) {
-        rv->depth = gx_clamp32(w, -(1 << 28), 1 << 28);
+    if (w == 0) {
+        posX = 0;
+        posY = 0;
     } else {
-        rv->depth = gx_clamp32(((int64_t)cv->clip[2] << 12) / w, -(1 << 28), 1 << 28);
+        posX = (uint32_t)cv->clip[0] + w;
+        posY = (uint32_t)(-cv->clip[1]) + w;
+        den = w;
+        if (w > 0xFFFF) {
+            posX >>= 1;
+            posY >>= 1;
+            den >>= 1;
+        }
+        den <<= 1;
+        posX = (posX * (uint32_t)gx->vp_w) / den + (uint32_t)gx->vp_x0;
+        posY = (posY * (uint32_t)gx->vp_h) / den + (uint32_t)gx->vp_y0;
     }
-    rv->invw = (int32_t)(((int64_t)1 << GX_INVW_SHIFT) / w);
-    if (rv->invw < 256) rv->invw = 256;   /* keeps I_i = invw>>8 nonzero */
-    if (rv->invw > (1 << 24)) rv->invw = 1 << 24; /* w < 1/64: bound interp */
+    rv->sx = (int32_t)(posX & 0x1FF);
+    rv->sy = (int32_t)(posY & 0xFF);
+
+    s = (wsize < 16) ? (16 - wsize) : (wsize - 16);
+    if (wsize < 16) {
+        rv->wnorm = (int32_t)(w << s);
+        wshifted = rv->wnorm >> s;
+    } else {
+        rv->wnorm = (int32_t)(w >> s);
+        wshifted = rv->wnorm << s;
+    }
+
+    if (gx->wbuffer) {
+        rv->depth = wshifted;
+    } else {
+        int64_t z = (((int64_t)cv->clip[2] * 0x4000) / cv->clip[3] + 0x3FFF) * 0x200;
+        rv->depth = (int32_t)gx_clamp32(z, 0, 0xFFFFFF);
+    }
+
+    rv->cr = (int32_t)(cv->col20[0] >> 12);
+    if (rv->cr) rv->cr = (rv->cr << 4) + 0xF;
+    rv->cg = (int32_t)(cv->col20[1] >> 12);
+    if (rv->cg) rv->cg = (rv->cg << 4) + 0xF;
+    rv->cb = (int32_t)(cv->col20[2] >> 12);
+    if (rv->cb) rv->cb = (rv->cb << 4) + 0xF;
 
     rv->s = cv->s;
     rv->t = cv->t;
-    rv->r = cv->r;
-    rv->g = cv->g;
-    rv->b = cv->b;
-}
-
-static void submit_triangle(Gx *gx, const GxClipVertex *a,
-                            const GxClipVertex *b, const GxClipVertex *c)
-{
-    GxPolygon poly;
-    int64_t area2;
-
-    memset(&poly, 0, sizeof(poly));
-    poly.nv = 3;
-    poly.attr = gx->cur_polygon_attr;
-    poly.texparam = gx->tex_param;
-    poly.texpal = gx->tex_palette;
-
-    fill_ras_vertex(gx, a, &poly.v[0]);
-    fill_ras_vertex(gx, b, &poly.v[1]);
-    fill_ras_vertex(gx, c, &poly.v[2]);
-
-    area2 = gx_poly_area2(&poly);
-    if (area2 == 0)
-        return;
-
-    gx->n_polys_drawn++;
-    if (gx->draw_fn)
-        gx->draw_fn(gx->draw_user, &poly);
-    if (!gx->skip_software)
-        gx_raster_polygon(&gx->surface, &poly, &gx->env);
-}
-
-static void submit_quad(Gx *gx, const GxClipVertex *v)
-{
-    GxPolygon poly;
-    int64_t area2;
-    int i;
-
-    memset(&poly, 0, sizeof(poly));
-    poly.nv = 4;
-    poly.attr = gx->cur_polygon_attr;
-    poly.texparam = gx->tex_param;
-    poly.texpal = gx->tex_palette;
-    for (i = 0; i < 4; i++)
-        fill_ras_vertex(gx, &v[i], &poly.v[i]);
-
-    area2 = gx_poly_area2(&poly);
-    if (area2 == 0)
-        return;
-
-    gx->n_polys_drawn++;
-    if (gx->draw_fn)
-        gx->draw_fn(gx->draw_user, &poly);
-    if (!gx->skip_software)
-        gx_raster_polygon(&gx->surface, &poly, &gx->env);
 }
 
 static void submit_polygon(Gx *gx)
 {
     GxClipVertex clipped[10], temp[10];
+    GxRasVertex rv[10];
+    GxPolygon poly;
     const GxClipVertex *v = gx->temp_vtx;
     int nv = (gx->polygon_mode == 1) ? 4 : 3;
-    int i, n;
+    int i, n, wsize;
     int64_t nx, ny, nz, dot;
+    int facing_view;
     uint32_t attr = gx->cur_polygon_attr;
 
     gx->n_polys++;
@@ -480,6 +479,7 @@ static void submit_polygon(Gx *gx)
     }
     dot = (int64_t)v[1].clip[0] * nx + (int64_t)v[1].clip[1] * ny +
           (int64_t)v[1].clip[3] * nz;
+    facing_view = (dot <= 0); /* melonDS FacingView (GPU3D.cpp:1202) */
     if (dot < 0) {
         if (!(attr & (1u << 7))) { gx->n_culled_back++; return; }
     } else if (dot > 0) {
@@ -504,12 +504,65 @@ static void submit_polygon(Gx *gx)
         }
     }
 
-    if (n == 4 && nv == 4) {
-        submit_quad(gx, clipped);
-        return;
+    /* per-polygon W normalization: the smallest multiple of 4 bits that
+     * holds every W (melonDS SubmitPolygon, GPU3D.cpp:1498-1535) */
+    wsize = 0;
+    for (i = 0; i < n; i++) {
+        uint32_t w = (uint32_t)clipped[i].clip[3];
+        while ((w >> wsize) && (wsize < 32))
+            wsize += 4;
     }
-    for (i = 1; i + 1 < n; i++)
-        submit_triangle(gx, &clipped[0], &clipped[i], &clipped[i + 1]);
+
+    for (i = 0; i < n; i++)
+        fill_ras_vertex(gx, &clipped[i], &rv[i], wsize);
+
+    /* zero-dot W check (melonDS GPU3D.cpp:1357-1390): a polygon whose
+     * vertices all land on the same screen pixel is rejected when every W
+     * is beyond the 0x04000610 threshold, unless POLYGON_ATTR bit 13 */
+    if (!(gx->cur_polygon_attr & (1u << 13))) {
+        int zerodot = 1, allbehind = 1;
+        for (i = 0; i < n; i++) {
+            if (rv[i].sx != rv[0].sx || rv[i].sy != rv[0].sy) {
+                zerodot = 0;
+                break;
+            }
+            if ((uint32_t)clipped[i].clip[3] <= gx->zero_dot_w) {
+                allbehind = 0;
+                break;
+            }
+        }
+        if (zerodot && allbehind) {
+            gx->n_drop_degenerate++;
+            return;
+        }
+    }
+
+    /* bottom bound check (melonDS GPU3D.cpp:1509) */
+    {
+        int32_t ybot = 0;
+        for (i = 0; i < n; i++)
+            if (rv[i].sy > ybot) ybot = rv[i].sy;
+        if (ybot > 192) {
+            gx->n_drop_degenerate++;
+            return;
+        }
+    }
+
+    memset(&poly, 0, sizeof(poly));
+    poly.nv = n;
+    poly.attr = gx->cur_polygon_attr;
+    poly.texparam = gx->tex_param;
+    poly.texpal = gx->tex_palette;
+    poly.wbuffer = (uint8_t)gx->wbuffer;
+    poly.facing_view = (uint8_t)facing_view;
+    for (i = 0; i < n; i++)
+        poly.v[i] = rv[i];
+
+    gx->n_polys_drawn++;
+    if (gx->draw_fn)
+        gx->draw_fn(gx->draw_user, &poly);
+    if (!gx->skip_software)
+        gx_raster_polygon(&gx->surface, &poly, &gx->env);
 }
 
 /* ------------------------------------------------------------------ */
@@ -687,14 +740,14 @@ static void exec_single(Gx *gx, uint8_t cmd, uint32_t param)
         calculate_lighting(gx);
         break;
 
-    case 0x22: /* TEXCOORD */
+    case 0x22: /* TEXCOORD (melonDS GPU3D.cpp:2132-2146: s16 semantics) */
         gx->raw_s = (int16_t)(param & 0xFFFF);
         gx->raw_t = (int16_t)(param >> 16);
         if ((gx->tex_param >> 30) == 1) {
-            gx->cur_s = (int32_t)(((int64_t)gx->raw_s * gx->texm[0] +
+            gx->cur_s = (int16_t)(int32_t)(((int64_t)gx->raw_s * gx->texm[0] +
                         (int64_t)gx->raw_t * gx->texm[4] + gx->texm[8] +
                         gx->texm[12]) >> 12);
-            gx->cur_t = (int32_t)(((int64_t)gx->raw_s * gx->texm[1] +
+            gx->cur_t = (int16_t)(int32_t)(((int64_t)gx->raw_s * gx->texm[1] +
                         (int64_t)gx->raw_t * gx->texm[5] + gx->texm[9] +
                         gx->texm[13]) >> 12);
         } else {
@@ -810,7 +863,10 @@ static void exec_single(Gx *gx, uint8_t cmd, uint32_t param)
     case 0x41: /* END_VTXS */
         break;
 
-    case 0x50: /* SWAP_BUFFERS: rendering is immediate; nothing queued */
+    case 0x50: /* SWAP_BUFFERS: rendering is immediate; nothing queued.
+                * Param bit 1 selects W-buffering for polygons submitted
+                * after this command (melonDS GPU3D.cpp:2284, 1514). */
+        gx->wbuffer = (int)((param >> 1) & 1);
         break;
 
     case 0x60: /* VIEWPORT */

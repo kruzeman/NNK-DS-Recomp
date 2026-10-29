@@ -40,7 +40,7 @@ static int render_once(uint32_t *color, uint32_t *depth)
                        gx_scene_pal, 16);
     memcpy(gx.toon, gx_scene_toon, sizeof(gx_scene_toon));
     gx_surface_clear(&gx.surface, 0x00080402u /* dark blue 6-bit (r=2,g=4,b=8) */,
-                     0x7FFFFFFFu);
+                     0x7FFFFFFFu, 0 /* clear attr */);
     gx_fifo_write_block(&gx, gx_scene_words, gx_scene_nwords);
     return (int)gx.n_polys_drawn;
 }

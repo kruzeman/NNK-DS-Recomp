@@ -207,11 +207,12 @@ static void tracker_word(Tracker *t, uint32_t val)
     }
 }
 
-/* ---- frame clear (melonDS SoftRenderer3D::ClearBuffers) ---- */
+/* ---- frame clear (melonDS SoftRenderer3D::ClearBuffers, 1623-1710) ---- */
 
 static void clear_frame(GxSurface *sf, const EnvRegs *live, const uint8_t *texvram)
 {
     uint32_t clearz = ((live->clear_attr2 & 0x7FFF) * 0x200) + 0x1FF;
+    uint32_t polyid = live->clear_attr1 & 0x3F008000; /* clear polygon ID */
 
     if (live->disp_cnt & (1u << 14)) {
         /* clear-image mode: bitmap in texture VRAM at 40000h/60000h */
@@ -229,6 +230,8 @@ static void clear_frame(GxSurface *sf, const EnvRegs *live, const uint8_t *texvr
                 uint32_t a = (val2 & 0x8000) ? 0x1F000000 : 0;
                 sf->color[y * FB_W + x] = r | (g << 8) | (b << 16) | a;
                 sf->depth[y * FB_W + x] = ((val3 & 0x7FFF) * 0x200) + 0x1FF;
+                if (sf->attr)
+                    sf->attr[y * FB_W + x] = polyid | (val3 & 0x8000);
                 xoff++;
             }
             yoff++;
@@ -238,7 +241,9 @@ static void clear_frame(GxSurface *sf, const EnvRegs *live, const uint8_t *texvr
         uint32_t g = (live->clear_attr1 >> 4) & 0x3E; if (g) g++;
         uint32_t b = (live->clear_attr1 >> 9) & 0x3E; if (b) b++;
         uint32_t a = (live->clear_attr1 >> 16) & 0x1F;
-        gx_surface_clear(sf, r | (g << 8) | (b << 16) | (a << 24), clearz);
+        polyid |= (live->clear_attr1 & 0x8000); /* clear fog flag */
+        gx_surface_clear(sf, r | (g << 8) | (b << 16) | (a << 24), clearz,
+                         polyid);
     }
 }
 
@@ -246,17 +251,15 @@ static void clear_frame(GxSurface *sf, const EnvRegs *live, const uint8_t *texvr
 
 static int poly_sortkey(const GxPolygon *p)
 {
-    /* melonDS SortKey = (ybot << 8) | ytop in bottom-up pixel space;
-     * our sy is 1/16 px top-down, so y_mds = 191 - (sy >> 4). */
+    /* melonDS SortKey = (ybot << 8) | ytop on FinalPosition Y rows
+     * (GPU3D.cpp:1511); opaque polygons with lower bottom Y come first */
     int i, ymin = 1 << 30, ymax = -(1 << 30);
     for (i = 0; i < p->nv; i++) {
-        int y = p->v[i].sy >> 4;
+        int y = p->v[i].sy;
         if (y < ymin) ymin = y;
         if (y > ymax) ymax = y;
     }
-    int ytop = 191 - ymax;
-    int ybot = 191 - ymin;
-    return (ybot << 8) | ytop;
+    return (ymax << 8) | ymin;
 }
 
 static int poly_translucent(const GxPolygon *p)
@@ -293,18 +296,31 @@ static void build_render_order(int sort_opaque_only)
     }
     int opaque_n = scratch.n;
     if (sort_opaque_only) {
+        /* SWAP sort mode 1 (FlushAttributes bit 0): only the opaque
+         * region is Y-sorted, translucents keep submission order
+         * (GPU3D.cpp:2669-2671 sorts [0, NumOpaquePolygons)) */
         for (i = 0; i < current.n; i++)
             if (poly_translucent(&current.poly[i]))
                 list_push(&scratch, &current.poly[i]);
     } else {
-        /* SWAP sort mode 0: Y-sort everything (translucent mixed in) */
+        /* SWAP sort mode 0: Y-sort the translucent region too.  melonDS
+         * stable_sorts the whole list (GPU3D.cpp:2669-2671) but its
+         * SortKey |= 0x10000 for translucent polygons
+         * (GPU3D.cpp:1511-1512), so translucents always stay behind
+         * every opaque polygon and are only ordered among themselves --
+         * sorting the translucent region in place (bounded at opaque_n)
+         * reproduces that exactly.  The previous loop started at
+         * opaque_n+1 with an unbounded j: the first translucent polygon
+         * was never inserted and later ones could bubble INTO the opaque
+         * region whenever their (ybot<<8|ytop) key was lower than an
+         * opaque polygon's key (no translucent bit in poly_sortkey). */
         for (i = 0; i < current.n; i++)
             if (poly_translucent(&current.poly[i]))
                 list_push(&scratch, &current.poly[i]);
         for (i = opaque_n + 1; i < scratch.n; i++) {
             GxPolygon tmp = scratch.poly[i];
             int j = i - 1;
-            while (j >= 0 && cmp_sortkey(&scratch.poly[j], &tmp) > 0) {
+            while (j >= opaque_n && cmp_sortkey(&scratch.poly[j], &tmp) > 0) {
                 scratch.poly[j + 1] = scratch.poly[j];
                 j--;
             }
@@ -319,6 +335,11 @@ static uint8_t texvram[TEXVRAM_SIZE];
 static uint16_t texpal[TEXPAL_SIZE / 2];
 static uint32_t colorbuf[FB_W * FB_H];
 static uint32_t depthbuf[FB_W * FB_H];
+static uint32_t attrbuf[FB_W * FB_H];
+static uint32_t colorbuf2[FB_W * FB_H]; /* AA second layer (persists across
+                                         * frames like melonDS's buffers) */
+static uint32_t depthbuf2[FB_W * FB_H];
+static uint32_t attrbuf2[FB_W * FB_H];
 
 int main(int argc, char **argv)
 {
@@ -357,8 +378,11 @@ int main(int argc, char **argv)
     memset(&live, 0, sizeof(live));
     memset(&latched, 0, sizeof(latched));
     live.disp_cnt = latched.disp_cnt = 0x9;
+    uint32_t latched_sort = 0; /* SWAP_BUFFERS param & 3 (FlushAttributes) */
 
-    GxSurface sf = { colorbuf, depthbuf, FB_W, FB_H };
+    GxSurface sf = { .color = colorbuf, .depth = depthbuf, .attr = attrbuf,
+                     .color2 = colorbuf2, .depth2 = depthbuf2, .attr2 = attrbuf2,
+                     .w = FB_W, .h = FB_H };
 
     long units = 0, rendered = 0, total_polys = 0;
     for (int unit = start_unit;; unit++) {
@@ -401,6 +425,7 @@ int main(int argc, char **argv)
                 memcpy(&val, data + off + 5, 4);
                 off += 9;
                 apply_reg(&live, addr, width, val);
+                gx.zero_dot_w = live.zero_dot_w;
             } else if (type == 0x03 && off + 5 <= len) {
                 uint8_t cmd = data[off];
                 uint32_t val;
@@ -419,6 +444,7 @@ int main(int argc, char **argv)
 
         if (tr.saw_swap) {
             latched = live;
+            latched_sort = tr.last_swap_param & 3;
             if (pending.n > 0) {
                 PolyList tmp = current;
                 current = pending;
@@ -466,14 +492,65 @@ int main(int argc, char **argv)
             env.tex_enable = (latched.disp_cnt >> 0) & 1;
             env.highlight = (latched.disp_cnt >> 1) & 1;
             env.alpha_blend = (latched.disp_cnt >> 3) & 1;
+            env.aa_enable = (int)((latched.disp_cnt >> 4) & 1);
+            env.edge_enable = (int)((latched.disp_cnt >> 5) & 1);
             env.alpha_ref = (latched.disp_cnt & 4) ? (int)latched.alpha_ref_val : 0;
 
+            /* post pass env: edge table + fog regs (melonDS latch,
+             * GPU3D.cpp:2690-2701: FogOffset scaled *0x200, the 32-entry
+             * fog table mapped into RenderFogDensityTable[34] as
+             * [0]=reg[0], [1..32]=reg[0..31], [33]=reg[31]) */
+            GxPostEnv post;
+            memset(&post, 0, sizeof(post));
+            post.edge = latched.edge_table;
+            post.clear_attr = latched.clear_attr1 & 0x3F008000;
+            post.clear_depth = ((latched.clear_attr2 & 0x7FFF) * 0x200) + 0x1FF;
+            post.fog_color = latched.fog_color;
+            post.fog_offset = latched.fog_offset * 0x200;
+            post.fog_density[0] = latched.fog_density[0];
+            memcpy(&post.fog_density[1], latched.fog_density, 32);
+            post.fog_density[33] = latched.fog_density[31];
+            post.fog_shift = (int)((latched.disp_cnt >> 8) & 0xF);
+            post.edge_enable = (int)((latched.disp_cnt >> 5) & 1);
+            post.fog_enable = (int)((latched.disp_cnt >> 7) & 1);
+            post.fog_alpha_only = (int)((latched.disp_cnt >> 6) & 1);
+            post.aa_enable = (int)((latched.disp_cnt >> 4) & 1);
+
             clear_frame(&sf, &latched, texvram);
-            build_render_order(1); /* sort opaque only (SWAP bit0=1);
-                                      bit0=0 (sort all) is close enough for
-                                      translucent-order diffs to show up */
+            /* SWAP sort mode bit0=1: sort opaque only; bit0=0: Y-sort all
+             * (translucent SortKeys carry 0x10000, GPU3D.cpp:2657-2671) */
+            build_render_order((int)(latched_sort & 1));
+            if (getenv("GX_POLY_DUMP")) {
+                /* debug: dump the retained polygon set for this unit
+                 * (env GX_POLY_DUMP=<prefix>, writes <prefix>.<unit>.txt) */
+                char pdpath[1200];
+                snprintf(pdpath, sizeof(pdpath), "%s.%d.txt",
+                         getenv("GX_POLY_DUMP"), unit);
+                FILE *pd = fopen(pdpath, "w");
+                if (pd) {
+                    for (i = 0; i < scratch.n; i++) {
+                        const GxPolygon *p = &scratch.poly[i];
+                        int j;
+                        uint32_t a = p->attr;
+                        fprintf(pd, "poly %d attr=%08x alpha=%u polyid=%u "
+                                "shadow=%d mask=%d blendmode=%u nv=%d "
+                                "texfmt=%u texparam=%08x\n",
+                                i, a, (a >> 16) & 0x1F, (a >> 24) & 0x3F,
+                                ((a & 0x30) == 0x30) && (((a >> 16) & 0x1F) != 0),
+                                ((a & 0x3F000030) == 0x30),
+                                (a >> 4) & 0x3, p->nv,
+                                (p->texparam >> 26) & 0x7, p->texparam);
+                        for (j = 0; j < p->nv; j++)
+                            fprintf(pd, "  v%d sx=%d sy=%d depth=%08x w=%d\n",
+                                    j, p->v[j].sx, p->v[j].sy,
+                                    (uint32_t)p->v[j].depth, p->v[j].wnorm);
+                    }
+                    fclose(pd);
+                }
+            }
             for (i = 0; i < scratch.n; i++)
                 gx_raster_polygon(&sf, &scratch.poly[i], &env);
+            gx_post_pass(&sf, &post);
 
             snprintf(path, sizeof(path), "%s/f%05d.raw", out_dir, unit);
             FILE *o = fopen(path, "wb");
