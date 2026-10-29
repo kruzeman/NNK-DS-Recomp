@@ -999,9 +999,19 @@ void gxd_io_write(Gxd *g, uint32_t addr, uint32_t val, int width)
     if (width < 1) width = 1;
     if (width > 4) width = 4;
 
-    /* 2D engine register blocks */
+    /* 2D engine register blocks.  NOTE: DISP3DCNT (0x04000060) lives INSIDE
+     * the engine A block but is a 3D register (melonDS GPU3D::Write16); the
+     * GPU-level registers (DISPCAPCNT, MASTER_BRIGHT) are not per-engine. */
     if (addr >= 0x04000000 && addr < 0x04000070) {
         uint32_t off = addr - 0x04000000;
+        if (off == 0x60) {
+            gxd_write_3d(g, addr, val, width);
+            return;
+        }
+        if (off == 0x64 || off == 0x66 || off == 0x6C) {
+            global_write(g, addr, val, width);
+            return;
+        }
         g->bulk_win = 0;
         if (width == 1) eng_write8(g, 0, off, val);
         else if (width == 2) eng_write16(g, 0, off, val & 0xFFFF);
@@ -1013,6 +1023,10 @@ void gxd_io_write(Gxd *g, uint32_t addr, uint32_t val, int width)
     }
     if (addr >= 0x04001000 && addr < 0x04001070) {
         uint32_t off = addr - 0x04001000;
+        if (off == 0x6C) {
+            global_write(g, addr, val, width);
+            return;
+        }
         g->bulk_win = 0;
         if (width == 1) eng_write8(g, 1, off, val);
         else if (width == 2) eng_write16(g, 1, off, val & 0xFFFF);
