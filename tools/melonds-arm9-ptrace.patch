@@ -1,0 +1,104 @@
+diff --git a/src/ARM.cpp b/src/ARM.cpp
+index 3937a994..951bda22 100644
+--- a/src/ARM.cpp
++++ b/src/ARM.cpp
+@@ -17,6 +17,7 @@
+ */
+ 
+ #include <stdio.h>
++#include <stdlib.h>
+ #include <assert.h>
+ #include <algorithm>
+ #include "NDS.h"
+@@ -34,6 +35,73 @@ namespace melonDS
+ using Platform::Log;
+ using Platform::LogLevel;
+ 
++// ---------------------------------------------------------------------------
++// ARM9 boot PC trace (Ni no Kuni DS static-recompilation verification).
++// Env-gated, interpreter-only, ARM9 (ARMv5) only; completely inactive unless
++// MELONDS_ARM9TRACE_PATH is set:
++//   MELONDS_ARM9TRACE_PATH  output file (unset -> disabled)
++//   MELONDS_ARM9TRACE_N     PCs to log (default 1000)
++//   MELONDS_ARM9TRACE_LO    window start (default 0x02000000)
++//   MELONDS_ARM9TRACE_HI    window end   (default 0x02400000, main RAM)
++//   MELONDS_ARM9TRACE_EXIT  1 = exit(0) once N PCs are logged (default)
++// Format: one "0x%08x" line per executed in-window instruction PC; an
++// executed SWI adds a following "# swi <state> imm=0x<..> at 0x<..>" comment.
++// ---------------------------------------------------------------------------
++namespace ARM9Trace
++{
++static FILE* FP = nullptr;
++static bool Tried = false;
++static long Limit = 1000;
++static long Count = 0;
++static bool ExitAtEnd = true;
++static u32 Lo = 0x02000000;
++static u32 Hi = 0x02400000;
++
++static void Init() noexcept
++{
++    Tried = true;
++    const char* p = getenv("MELONDS_ARM9TRACE_PATH");
++    if (!p || !p[0]) return;
++    FP = fopen(p, "w");
++    if (!FP) return;
++    const char* s;
++    if ((s = getenv("MELONDS_ARM9TRACE_N")))    Limit = atol(s);
++    if ((s = getenv("MELONDS_ARM9TRACE_LO")))   Lo = (u32)strtoul(s, nullptr, 0);
++    if ((s = getenv("MELONDS_ARM9TRACE_HI")))   Hi = (u32)strtoul(s, nullptr, 0);
++    if ((s = getenv("MELONDS_ARM9TRACE_EXIT"))) ExitAtEnd = atoi(s) != 0;
++    if (Limit < 1) Limit = 1;
++    setvbuf(FP, nullptr, _IOLBF, 0);
++    fprintf(FP, "# ARM9 trace window 0x%08X..0x%08X limit %ld\n", Lo, Hi, Limit);
++}
++
++static void PC(u32 addr, u32 instr, bool thumb) noexcept
++{
++    if (!Tried) Init();
++    if (!FP) return;
++    if (addr < Lo || addr >= Hi) return;
++    if (Count >= Limit) return;
++
++    fprintf(FP, "0x%08x\n", addr);
++    bool swi = thumb ? ((instr & 0xFF00) == 0xDF00)
++                     : ((instr & 0x0F000000) == 0x0F000000);
++    if (swi)
++        fprintf(FP, "# swi %s imm=0x%06X at 0x%08x\n", thumb ? "thumb" : "arm",
++                thumb ? (instr & 0xFF) : (instr & 0xFFFFFF), addr);
++
++    if (++Count >= Limit)
++    {
++        fflush(FP);
++        fclose(FP);
++        FP = nullptr;
++        if (ExitAtEnd)
++        {
++            fflush(stderr);
++            exit(0);
++        }
++    }
++}
++}
++
+ #ifdef GDBSTUB_ENABLED
+ void ARM::GdbCheckA()
+ {
+@@ -670,6 +738,8 @@ void ARMv5::Execute()
+                 else             NextInstr[1] = CodeRead32(R[15], false);
+ 
+                 // actually execute
++                // Thumb state: R[15] reads as instruction address + 4 here.
++                ARM9Trace::PC(R[15] - 4, CurInstr, true);
+                 u32 icode = (CurInstr >> 6) & 0x3FF;
+                 ARMInterpreter::THUMBInstrTable[icode](this);
+             }
+@@ -685,6 +755,8 @@ void ARMv5::Execute()
+                 NextInstr[1] = CodeRead32(R[15], false);
+ 
+                 // actually execute
++                // ARM state: R[15] reads as instruction address + 8 here.
++                ARM9Trace::PC(R[15] - 8, CurInstr, false);
+                 if (CheckCondition(CurInstr >> 28))
+                 {
+                     u32 icode = ((CurInstr >> 4) & 0xF) | ((CurInstr >> 16) & 0xFF0);

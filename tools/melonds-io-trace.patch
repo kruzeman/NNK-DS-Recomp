@@ -1,0 +1,113 @@
+--- a/src/NDS.cpp	2026-10-29 07:23:48.909179817 +0200
++++ b/src/NDS.cpp	2026-10-29 07:26:08.796865564 +0200
+@@ -55,6 +55,53 @@
+ {
+ using namespace Platform;
+ 
++#include <stdlib.h>
++
++// ---------------------------------------------------------------------------
++// ARM9 IO bus trace (Ni no Kuni DS static-recompilation verification).
++// Env-gated, completely inactive unless MELONDS_IOTRACE_PATH is set:
++//   MELONDS_IOTRACE_PATH  output file (unset -> disabled)
++//   MELONDS_IOTRACE_N     accesses to log (default 200000)
++// Format: one line per ARM9 IO bus access (0x04000000..0x04FFFFFF):
++//   R8|R16|R32 0x<addr> 0x<value> pc=0x<ARM9 PC-8/-4>
++//   W8|W16|W32 0x<addr> 0x<value> pc=0x<...>
++// The PC is the executed instruction (R[15]-8 ARM state / R[15]-4 Thumb),
++// same convention as the ARM9 PC trace hook in ARM.cpp.
++// ---------------------------------------------------------------------------
++namespace ARM9IOTrace
++{
++static FILE* FP = nullptr;
++static bool Tried = false;
++static long Limit = 200000;
++static long Count = 0;
++
++static inline bool Active() noexcept
++{
++    if (!Tried)
++    {
++        Tried = true;
++        const char* p = getenv("MELONDS_IOTRACE_PATH");
++        if (p && p[0])
++        {
++            FP = fopen(p, "w");
++            const char* s;
++            if (FP && (s = getenv("MELONDS_IOTRACE_N"))) Limit = atol(s);
++            if (Limit < 1) Limit = 1;
++            if (FP) setvbuf(FP, nullptr, _IOLBF, 0);
++        }
++    }
++    return FP != nullptr;
++}
++
++static void Log(const char* rw, u32 addr, u32 val, u32 pc) noexcept
++{
++    if (!Active()) return;
++    if (Count >= Limit) return;
++    fprintf(FP, "%s 0x%08X 0x%08X pc=0x%08X\n", rw, addr, val, pc);
++    if (++Count >= Limit) { fflush(FP); fclose(FP); FP = nullptr; }
++}
++}
++
+ const s32 kMaxIterationCycles = 64;
+ const s32 kIterationCycleMargin = 8;
+ 
+@@ -2006,7 +2053,9 @@
+ 
+     case 0x04000000:
+         // Specifically want to call the NDS version, not a subclass
+-        return NDS::ARM9IORead8(addr);
++        { u8 _v = NDS::ARM9IORead8(addr);
++          ARM9IOTrace::Log("R8", addr, _v, ARM9.R[15] - ((ARM9.CPSR & 0x20) ? 4 : 8));
++          return _v; }
+ 
+     case 0x05000000:
+         if (!(PowerControl9 & ((addr & 0x400) ? (1<<9) : (1<<1)))) return 0;
+@@ -2066,7 +2115,9 @@
+         }
+ 
+     case 0x04000000:
+-        return NDS::ARM9IORead16(addr);
++        { u16 _v = NDS::ARM9IORead16(addr);
++          ARM9IOTrace::Log("R16", addr, _v, ARM9.R[15] - ((ARM9.CPSR & 0x20) ? 4 : 8));
++          return _v; }
+ 
+     case 0x05000000:
+         if (!(PowerControl9 & ((addr & 0x400) ? (1<<9) : (1<<1)))) return 0;
+@@ -2126,7 +2177,9 @@
+         }
+ 
+     case 0x04000000:
+-        return NDS::ARM9IORead32(addr);
++        { u32 _v = NDS::ARM9IORead32(addr);
++          ARM9IOTrace::Log("R32", addr, _v, ARM9.R[15] - ((ARM9.CPSR & 0x20) ? 4 : 8));
++          return _v; }
+ 
+     case 0x05000000:
+         if (!(PowerControl9 & ((addr & 0x400) ? (1<<9) : (1<<1)))) return 0;
+@@ -2182,6 +2235,7 @@
+         return;
+ 
+     case 0x04000000:
++        ARM9IOTrace::Log("W8", addr, val, ARM9.R[15] - ((ARM9.CPSR & 0x20) ? 4 : 8));
+         NDS::ARM9IOWrite8(addr, val);
+         return;
+ 
+@@ -2223,6 +2277,7 @@
+         return;
+ 
+     case 0x04000000:
++        ARM9IOTrace::Log("W16", addr, val, ARM9.R[15] - ((ARM9.CPSR & 0x20) ? 4 : 8));
+         NDS::ARM9IOWrite16(addr, val);
+         return;
+ 
+@@ -2283,6 +2338,7 @@
+         return;
+ 
+     case 0x04000000:
++        ARM9IOTrace::Log("W32", addr, val, ARM9.R[15] - ((ARM9.CPSR & 0x20) ? 4 : 8));
+         NDS::ARM9IOWrite32(addr, val);
+         return;
+ 

@@ -606,7 +606,13 @@ pub fn decode_arm(w: u32, addr: u32) -> Insn {
         let pre = w & (1 << 24) != 0;
         let up = w & (1 << 23) != 0;
         let imm_form = w & (1 << 22) != 0;
-        let wb = w & (1 << 21) != 0;
+        // ARM ARM single/extra data transfer: with P=0 (post-indexed) the base
+        // is ALWAYS written back; W=1 in that form selects the unprivileged (T)
+        // access, which this model does not distinguish.  Reading W alone (as
+        // before) dropped the writeback of `ldr rd, [rn], #imm` and made every
+        // post-indexed loop spin forever on the same element (the Phase-3A
+        // init-array walker at 0x02000A14 hit exactly this).
+        let wb = !pre || w & (1 << 21) != 0;
         let rn = ((w >> 16) & 15) as u8;
         let rd = ((w >> 12) & 15) as u8;
         let ea = if imm_form {
@@ -637,7 +643,9 @@ pub fn decode_arm(w: u32, addr: u32) -> Insn {
         let pre = w & (1 << 24) != 0;
         let up = w & (1 << 23) != 0;
         let byte = w & (1 << 22) != 0;
-        let wb = w & (1 << 21) != 0;
+        // See the extra load/store path: post-indexed (P=0) always writes the
+        // base back; W selects the unprivileged form, not the writeback.
+        let wb = !pre || w & (1 << 21) != 0;
         let rn = ((w >> 16) & 15) as u8;
         let rd = ((w >> 12) & 15) as u8;
         let ea = if w & (1 << 25) != 0 {
@@ -1205,7 +1213,9 @@ pub fn arm_flow(addr: u32, insn: &Insn) -> Flow {
         }
         Kind::Dp { rd: 15, .. } => Flow::Indirect(None),
         Kind::LdmStm { load: true, list, .. } if list & 0x8000 != 0 => Flow::Indirect(None),
-        Kind::Svc { .. } => Flow::Halt,
+        // SWI: HLE executes the call and returns to the next instruction, so
+        // the CFG walk continues through it.
+        Kind::Svc { .. } => Flow::Next,
         Kind::Undef => Flow::Halt,
         _ => Flow::Next,
     }
@@ -1233,7 +1243,7 @@ pub fn thumb_flow(addr: u32, insn: &Insn) -> Flow {
         Kind::Mem { load: true, rd: 15, .. } => Flow::Indirect(None),
         Kind::LdmStm { load: true, list, .. } if list & 0x8000 != 0 => Flow::Indirect(None),
         Kind::Dp { rd: 15, .. } => Flow::Indirect(None),
-        Kind::Svc { .. } => Flow::Halt,
+        Kind::Svc { .. } => Flow::Next,
         Kind::Undef => Flow::Halt,
         _ => Flow::Next,
     }

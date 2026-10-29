@@ -28,6 +28,7 @@ pub struct FuncKey {
     pub mode: Mode,
 }
 
+#[derive(Clone)]
 pub struct Func {
     pub key: FuncKey,
     /// addr -> (encoded words, disassembly text)
@@ -38,6 +39,8 @@ pub struct Func {
     pub calls: BTreeSet<FuncKey>,
     /// Unresolved indirect control-flow sites: (addr, description).
     pub indirects: Vec<(u32, String)>,
+    /// Jump tables statically expanded at this function (site count).
+    pub jump_tables: usize,
     /// True when the walk stopped on an undefined instruction.
     pub hit_undef: bool,
 }
@@ -51,6 +54,194 @@ impl Func {
     }
 }
 
+/// A statically expanded jump table site.
+pub struct JumpTable {
+    pub desc: String,
+    /// Addresses to walk as new block starts.
+    pub slots: Vec<u32>,
+    /// True when the indirect site itself is unconditional (cond == 0xE).
+    pub cond_al: bool,
+}
+
+fn lit_at(addr: u32) -> Option<u32> {
+    lit_value(addr)
+}
+
+/// Bound on a jump table: the `cmp rM, #N` that guards the dispatch, else a
+/// conservative default scan length.
+fn table_bound(lines: &BTreeMap<u32, (Vec<u32>, String)>, addr: u32, idx: u8) -> usize {
+    let mut seen = 0usize;
+    for (&a, (words, _)) in lines.range(0..addr).rev() {
+        if seen >= 24 {
+            break;
+        }
+        seen += 1;
+        let insn = decode_arm(words[0], a);
+        match &insn.kind {
+            Kind::Dp { op: 10 | 11, rn, src: Operand::Imm(v), .. } if *rn == idx && *v < 4096 => {
+                return (*v as usize) + 1;
+            }
+            // a redefinition of the index register ends the search
+            Kind::Dp { op: 13, rd, .. } if *rd == idx => break,
+            Kind::Mem { load: true, rd, .. } if *rd == idx => break,
+            _ => {}
+        }
+    }
+    16
+}
+
+/// Value of `rn` immediately before `addr`, for the few PC-relative /
+/// literal forms a jump-table base register is built from.
+fn reg_def_value(
+    lines: &BTreeMap<u32, (Vec<u32>, String)>,
+    addr: u32,
+    rn: u8,
+) -> Option<u32> {
+    let mut seen = 0usize;
+    for (&a, (words, _)) in lines.range(0..addr).rev() {
+        if seen >= 24 {
+            break;
+        }
+        seen += 1;
+        let insn = decode_arm(words[0], a);
+        match &insn.kind {
+            Kind::Dp { op: 4, rd, rn: 15, src: Operand::Imm(v), .. } if *rd == rn => {
+                return Some(a.wrapping_add(8).wrapping_add(*v));
+            }
+            Kind::Dp { op: 2, rd, rn: 15, src: Operand::Imm(v), .. } if *rd == rn => {
+                return Some(a.wrapping_add(8).wrapping_sub(*v));
+            }
+            Kind::Dp { op: 13, rd, src: Operand::Imm(v), .. } if *rd == rn => return Some(*v),
+            Kind::Mem { load: true, rd, rn: 15, ea: Ea::Imm { off, pre: true, wb: false, .. }, .. }
+                if *rd == rn =>
+            {
+                let pc = a.wrapping_add(8);
+                let lit = if *off >= 0 {
+                    pc.wrapping_add(*off as u32)
+                } else {
+                    pc.wrapping_sub(-(*off) as u32)
+                };
+                return lit_at(lit);
+            }
+            Kind::Dp { rd, .. } | Kind::Mem { load: true, rd, .. } if *rd == rn => return None,
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Statically expand a jump-table indirect site inside `lines`.
+///
+/// Two ARM shapes are recognised (both are what GCC emits for a switch):
+///   * `add pc, pc, rM, lsl #2`  — control enters the table at `addr+8`; each
+///     slot is an ARM `b` instruction, so the slots themselves are code;
+///   * `ldr pc, [rN, rM, lsl #2]` — each slot word is the absolute target.
+/// Anything else stays an unresolved indirect site (recorded with its
+/// address by the caller).
+pub fn expand_jump_table(
+    _data: &[u8],
+    base: u32,
+    text_end: u32,
+    addr: u32,
+    insn: &Insn,
+    lines: &BTreeMap<u32, (Vec<u32>, String)>,
+) -> Option<JumpTable> {
+    let w = lines.get(&addr)?.0[0];
+    let cond_al = (w >> 28) == 0xE;
+    match &insn.kind {
+        Kind::Dp {
+            op: 4,
+            rd: 15,
+            rn: 15,
+            src: Operand::Reg { rm, kind: 0, amount: 2, by_reg: false },
+            ..
+        } => {
+            let slot0 = addr.wrapping_add(8);
+            let bound = table_bound(lines, addr, *rm);
+            let mut slots = Vec::new();
+            for i in 0..bound {
+                let sa = slot0.wrapping_add(4 * i as u32);
+                if sa < base || sa.wrapping_add(4) > text_end {
+                    break;
+                }
+                let Some(sw) = lit_at(sa) else { break };
+                let s = decode_arm(sw, sa);
+                match s.kind {
+                    Kind::B { link: false, target, cond: 14 }
+                        if target >= base && target < text_end =>
+                    {
+                        slots.push(sa);
+                    }
+                    _ => break,
+                }
+            }
+            if slots.is_empty() {
+                return None;
+            }
+            Some(JumpTable {
+                desc: format!(
+                    "add pc,pc,r{},lsl #2 at 0x{:08X} -> {} ARM branch slots from 0x{:08X} (bound {})",
+                    rm,
+                    addr,
+                    slots.len(),
+                    slot0,
+                    bound
+                ),
+                slots,
+                cond_al,
+            })
+        }
+        Kind::Mem {
+            load: true,
+            rd: 15,
+            rn,
+            ea:
+                Ea::Reg {
+                    rm: idx,
+                    kind: 0,
+                    amount: 2,
+                    pre: true,
+                    wb: false,
+                    up: true,
+                },
+            ..
+        } => {
+            let tbl = reg_def_value(lines, addr, *rn)?;
+            if tbl < base || tbl >= text_end {
+                return None;
+            }
+            let bound = table_bound(lines, addr, *idx);
+            let mut slots = Vec::new();
+            for i in 0..bound {
+                let ea = tbl.wrapping_add(4 * i as u32);
+                let Some(t) = lit_at(ea) else { break };
+                // only ARM-state, in-image code addresses are walkable here
+                if t & 1 != 0 || t < base || t >= text_end || t & 3 != 0 {
+                    break;
+                }
+                slots.push(t);
+            }
+            if slots.is_empty() {
+                return None;
+            }
+            Some(JumpTable {
+                desc: format!(
+                    "ldr pc,[r{},r{},lsl #2] at 0x{:08X} -> table 0x{:08X}, {} absolute targets (bound {})",
+                    rn,
+                    idx,
+                    addr,
+                    tbl,
+                    slots.len(),
+                    bound
+                ),
+                slots,
+                cond_al,
+            })
+        }
+        _ => None,
+    }
+}
+
 /// Walk one function's CFG.  `limit` caps instructions per function.
 pub fn trace_function(data: &[u8], base: u32, text_end: u32, key: FuncKey, limit: usize) -> Func {
     set_image(data, base);
@@ -60,6 +251,7 @@ pub fn trace_function(data: &[u8], base: u32, text_end: u32, key: FuncKey, limit
         blocks: Vec::new(),
         calls: BTreeSet::new(),
         indirects: Vec::new(),
+        jump_tables: 0,
         hit_undef: false,
     };
     let mut work: Vec<u32> = vec![key.addr];
@@ -131,10 +323,24 @@ pub fn trace_function(data: &[u8], base: u32, text_end: u32, key: FuncKey, limit
                                     addr,
                                     format!(
                                         "veneer -> {} 0x{:08X}",
-                                        if thumb { "thumb" } else { "arm" },
+                                        k.mode.name(),
                                         k.addr
                                     ),
                                 ));
+                            } else if let Some(exp) = expand_jump_table(data, base, text_end, addr, &insn, &f.lines)
+                            {
+                                f.jump_tables += 1;
+                                f.indirects
+                                    .push((addr, format!("jump table resolved: {}", exp.desc)));
+                                for s in &exp.slots {
+                                    work.push(*s);
+                                }
+                                // a conditional indirect still falls through
+                                if exp.cond_al {
+                                    // unconditional: no fall-through
+                                } else if addr.wrapping_add(4) < text_end {
+                                    work.push(addr.wrapping_add(4));
+                                }
                             } else {
                                 f.indirects.push((addr, "indirect branch (unresolved)".into()));
                             }
@@ -214,8 +420,23 @@ pub fn recover(
     limit_per_fn: usize,
     max_funcs: usize,
 ) -> Recovered {
+    recover_seeds(data, base, text_end, &[entry], limit_per_fn, max_funcs)
+}
+
+/// Recovery seeded from an explicit entry list (the ARM9 entry plus every
+/// Ghidra function entry), then extended by direct calls from each seed.
+/// Jumps tables and statically resolvable veneers are expanded as during a
+/// single-root walk; every other indirect site is recorded with its address.
+pub fn recover_seeds(
+    data: &[u8],
+    base: u32,
+    text_end: u32,
+    seeds: &[FuncKey],
+    limit_per_fn: usize,
+    max_funcs: usize,
+) -> Recovered {
     let mut funcs: BTreeMap<FuncKey, Func> = BTreeMap::new();
-    let mut pending: Vec<FuncKey> = vec![entry];
+    let mut pending: Vec<FuncKey> = seeds.to_vec();
     let mut truncated = false;
     while let Some(key) = pending.pop() {
         if funcs.contains_key(&key) {
@@ -230,13 +451,19 @@ pub fn recover(
             continue;
         }
         for c in &f.calls {
-            if !funcs.contains_key(c) {
+            if !funcs.contains_key(c) && !pending.contains(c) {
                 pending.push(*c);
             }
         }
         funcs.insert(key, f);
     }
     Recovered { funcs, truncated }
+}
+
+/// Seeds that produced no instructions (their address did not decode): a seed
+/// key never makes it into `funcs` when its body comes out empty.
+pub fn missing_seeds(seeds: &[FuncKey], funcs: &BTreeMap<FuncKey, Func>) -> Vec<FuncKey> {
+    seeds.iter().filter(|k| !funcs.contains_key(k)).copied().collect()
 }
 
 /// Total distinct byte coverage of the recovered function bodies.

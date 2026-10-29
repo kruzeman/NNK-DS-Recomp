@@ -272,8 +272,9 @@ fn usage() -> ! {
     eprintln!(
         "usage:\n  nnktool inspect [--full] <rom>\n  nnktool fnt [--full] <rom>\n  nnktool extract <rom> <out_dir>\
          \n  nnktool disasm <image> [--base 0xADDR] [--start 0xADDR] [--end 0xADDR] [--mode arm|thumb] [--count N]\
-         \n  nnktool decompile <image> <out_dir> [--base 0xADDR] [--entry 0xADDR] [--max-insns N] [--max-funcs N]\
-         \n  nnktool recompile-entry <image> <out.c> [--base 0xADDR] [--entry 0xADDR] [--max-insns N]"
+         \n  nnktool decompile <image> <out_dir> [--base 0xADDR] [--entry 0xADDR] [--seeds <ghidra.tsv>] [--max-insns N] [--max-funcs N]\
+         \n  nnktool recompile-entry <image> <out.c> [--base 0xADDR] [--entry 0xADDR] [--max-insns N]\
+         \n  nnktool recompile-all <image> <out.c> [--base 0xADDR] [--entry 0xADDR] [--seeds <ghidra.tsv>] [--max-insns N] [--max-funcs N]"
     );
     exit(2);
 }
@@ -285,9 +286,9 @@ fn opt(args: &[String], key: &str) -> Option<String> {
 
 /// Split argv into positionals, `--key value` options and the --full flag.
 fn split_args(args: &[String]) -> (Vec<String>, Vec<String>, bool) {
-    const VALUE_FLAGS: [&str; 9] = [
+    const VALUE_FLAGS: [&str; 10] = [
         "--base", "--start", "--end", "--mode", "--count", "--entry", "--entry-mode",
-        "--max-insns", "--max-funcs",
+        "--max-insns", "--max-funcs", "--seeds",
     ];
     let mut pos: Vec<String> = Vec::new();
     let mut flat: Vec<String> = Vec::new(); // key, value, key, value... for opt()
@@ -401,7 +402,8 @@ fn main() {
             let entry_thumb = opt(&args, "--entry-mode").map(|s| s == "thumb").unwrap_or(false);
             let max_insns = opt(&args, "--max-insns").map(|s| parse_addr(&s) as usize).unwrap_or(20_000);
             let max_funcs = opt(&args, "--max-funcs").map(|s| parse_addr(&s) as usize).unwrap_or(20_000);
-            cmd_decompile(&image, base, entry, entry_thumb, Path::new(pos[2]), max_insns, max_funcs);
+            let seeds = opt(&args, "--seeds");
+            cmd_decompile(&image, base, entry, entry_thumb, Path::new(pos[2]), max_insns, max_funcs, seeds);
         }
         "recompile-entry" => {
             if pos.len() != 3 {
@@ -412,6 +414,18 @@ fn main() {
             let entry = opt(&args, "--entry").map(|s| parse_addr(&s)).unwrap_or(ARM9_ENTRY);
             let max_insns = opt(&args, "--max-insns").map(|s| parse_addr(&s) as usize).unwrap_or(20_000);
             cmd_recompile_entry(&image, base, entry, Path::new(pos[2]), max_insns);
+        }
+        "recompile-all" => {
+            if pos.len() != 3 {
+                usage();
+            }
+            let image = load(pos[1]);
+            let base = opt(&args, "--base").map(|s| parse_addr(&s)).unwrap_or(ARM9_BASE);
+            let entry = opt(&args, "--entry").map(|s| parse_addr(&s)).unwrap_or(ARM9_ENTRY);
+            let max_insns = opt(&args, "--max-insns").map(|s| parse_addr(&s) as usize).unwrap_or(20_000);
+            let max_funcs = opt(&args, "--max-funcs").map(|s| parse_addr(&s) as usize).unwrap_or(50_000);
+            let seeds = opt(&args, "--seeds");
+            cmd_recompile_all(&image, base, entry, seeds, Path::new(pos[2]), max_insns, max_funcs);
         }
         _ => usage(),
     }
@@ -473,16 +487,39 @@ fn cmd_decompile(
     out_dir: &Path,
     max_insns: usize,
     max_funcs: usize,
+    seeds_file: Option<String>,
 ) {
     set_image(image, base);
     let text_end = base.wrapping_add(image.len() as u32);
     let entry_mode = if entry_thumb { recover::Mode::Thumb } else { recover::Mode::Arm };
     let key = recover::FuncKey { addr: entry & !1, mode: entry_mode };
-    let rec = recover::recover(image, base, text_end, key, max_insns, max_funcs);
+    let mut seed_list: Vec<recover::FuncKey> = vec![key];
+    let mut from_tsv = 0usize;
+    if let Some(p) = &seeds_file {
+        for k in load_seeds(p) {
+            from_tsv += 1;
+            if !seed_list.contains(&k) {
+                seed_list.push(k);
+            }
+        }
+    }
+    let rec = recover::recover_seeds(image, base, text_end, &seed_list, max_insns, max_funcs);
     let total = rec.funcs.len();
     let arm = rec.funcs.keys().filter(|k| k.mode == recover::Mode::Arm).count();
     let thumb = total - arm;
     let bytes = recover::coverage_bytes(&rec.funcs);
+    let jt: usize = rec.funcs.values().map(|f| f.jump_tables).sum();
+    let unresolved: usize = rec
+        .funcs
+        .values()
+        .map(|f| {
+            f.indirects
+                .iter()
+                .filter(|(_, d)| d.starts_with("indirect branch (unresolved)"))
+                .count()
+        })
+        .sum();
+    let missing = recover::missing_seeds(&seed_list, &rec.funcs);
 
     fs::create_dir_all(out_dir).unwrap_or_else(|e| die(&format!("mkdir {}: {}", out_dir.display(), e)));
 
@@ -490,8 +527,20 @@ fn cmd_decompile(
     let mut tsv = String::from("entry\tmode\tinsns\tbytes\tblocks\tcalls\tindirects\tundef\n");
     let mut listing = String::new();
     listing.push_str(&format!(
-        "# nnktool decompile — reachability-guided ARM/Thumb recovery from entry 0x{:08X}\n# image 0x{:08X} + 0x{:X} bytes; recovered {} functions ({} arm, {} thumb)\n\n",
-        entry, base, image.len(), total, arm, thumb
+        "# nnktool decompile — {} recovery from entry 0x{:08X}{}\n# image 0x{:08X} + 0x{:X} bytes; recovered {} functions ({} arm, {} thumb); {} jump tables expanded\n\n",
+        if from_tsv > 0 { "seeded" } else { "reachability-guided" },
+        entry,
+        if from_tsv > 0 {
+            format!(" + {} seeds from {}", from_tsv, seeds_file.as_deref().unwrap_or("?"))
+        } else {
+            String::new()
+        },
+        base,
+        image.len(),
+        total,
+        arm,
+        thumb,
+        jt
     ));
     for (k, f) in &rec.funcs {
         tsv.push_str(&format!(
@@ -533,10 +582,137 @@ fn cmd_decompile(
     fs::write(&list_path, &listing).unwrap_or_else(|e| die(&format!("write {}: {}", list_path.display(), e)));
 
     println!("recovered {} functions from entry 0x{:08X} ({} arm, {} thumb)", total, entry, arm, thumb);
+    if from_tsv > 0 {
+        println!(
+            "seeds: {} from {} + entry -> {} unique; seeds with an empty body: {}",
+            from_tsv,
+            seeds_file.as_deref().unwrap_or("?"),
+            seed_list.len(),
+            missing.len()
+        );
+        if !missing.is_empty() && missing.len() <= 12 {
+            println!(
+                "  empty seeds: {}",
+                missing
+                    .iter()
+                    .map(|k| format!("0x{:08X}_{}", k.addr, k.mode.name()))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+    }
+    println!("jump tables expanded: {}; unresolved indirect sites: {}", jt, unresolved);
     println!("instruction bytes in recovered bodies: {} of 0x{:X} image bytes ({:.2}%)",
         bytes, image.len(), 100.0 * bytes as f64 / image.len() as f64);
     println!("truncated: {}", rec.truncated);
     println!("wrote {} and {}", tsv_path.display(), list_path.display());
+}
+
+/// Seed keys from Ghidra's exported function table (columns:
+/// `entry, name, body_bytes, is_thunk, cc, insn_len`).  `insn_len == 2`
+/// marks a Thumb entry; everything else is ARM.
+fn load_seeds(path: &str) -> Vec<recover::FuncKey> {
+    let text = fs::read_to_string(path)
+        .unwrap_or_else(|e| die(&format!("cannot read seed file {}: {}", path, e)));
+    let mut seen: Vec<recover::FuncKey> = Vec::new();
+    for (i, line) in text.lines().enumerate() {
+        let line = line.trim_end();
+        if line.is_empty() {
+            continue;
+        }
+        let mut it = line.split('\t');
+        let entry = it.next().unwrap_or("");
+        if i == 0 && entry.eq_ignore_ascii_case("entry") {
+            continue;
+        }
+        let _name = it.next();
+        let _body = it.next();
+        let _thunk = it.next();
+        let _cc = it.next();
+        let insn_len = it.next().unwrap_or("4").trim().to_string();
+        let hex = entry.trim().trim_start_matches("0x");
+        let addr = u32::from_str_radix(hex, 16)
+            .unwrap_or_else(|_| die(&format!("bad seed entry address {:?} in {}", entry, path)));
+        let mode = if insn_len == "2" { recover::Mode::Thumb } else { recover::Mode::Arm };
+        let k = recover::FuncKey { addr: addr & !1, mode };
+        if !seen.contains(&k) {
+            seen.push(k);
+        }
+    }
+    seen
+}
+
+// ------------------------------------------------------- recompile-all ---
+
+fn cmd_recompile_all(
+    image: &[u8],
+    base: u32,
+    entry: u32,
+    seeds_file: Option<String>,
+    out_c: &Path,
+    max_insns: usize,
+    max_funcs: usize,
+) {
+    set_image(image, base);
+    let mut seed_list: Vec<recover::FuncKey> = vec![recover::FuncKey {
+        addr: entry & !1,
+        mode: recover::Mode::Arm,
+    }];
+    let mut from_tsv = 0usize;
+    if let Some(p) = &seeds_file {
+        for k in load_seeds(p) {
+            from_tsv += 1;
+            if !seed_list.contains(&k) {
+                seed_list.push(k);
+            }
+        }
+    }
+    let stats = recompile::recompile_all(
+        image,
+        base,
+        &seed_list,
+        entry,
+        out_c,
+        max_insns,
+        max_funcs,
+    )
+    .unwrap_or_else(|e| die(&e));
+    let img_out = out_c.with_extension("image.bin");
+    fs::write(&img_out, image).unwrap_or_else(|e| die(&format!("write {}: {}", img_out.display(), e)));
+
+    println!(
+        "recompile-all: {} seeds ({} from {}) -> {} functions ({} arm, {} thumb), {} cases, {} bytes C",
+        stats.seeds, from_tsv, seeds_file.as_deref().unwrap_or("-"),
+        stats.funcs, stats.funcs_arm, stats.funcs_thumb, stats.insns, stats.bytes
+    );
+    println!(
+        "cases: {} direct calls, {} returns, {} runtime-indirect dispatches, {} duplicate addresses skipped",
+        stats.calls, stats.returns, stats.indirects, stats.dup_cases
+    );
+    println!(
+        "jump tables expanded: {}; unresolved indirect sites: {}; thumb instructions NOT translated: {}",
+        stats.jump_tables, stats.unresolved_sites, stats.thumb_insns
+    );
+    if stats.swi_sites == 0 {
+        println!("SWI sites in the recovered set: 0 (the HLE dispatcher is present but reports no SWI instruction)");
+    } else {
+        println!(
+            "SWI sites in the recovered set: {} -> {}",
+            stats.swi_sites,
+            stats
+                .swis
+                .iter()
+                .map(|(i, a)| format!("svc 0x{:06X} @0x{:08X}", i, a))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    println!("wrote {} and {}", out_c.display(), img_out.display());
+    println!(
+        "build: cc -O2 -o arm9_all {} && ./arm9_all {}",
+        out_c.display(),
+        img_out.display()
+    );
 }
 
 // -------------------------------------------------------- recompile-entry ---

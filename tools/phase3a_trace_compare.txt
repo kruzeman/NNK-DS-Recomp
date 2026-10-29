@@ -1,0 +1,12 @@
+# Phase-3A melonDS-vs-native ARM9 PC-trace comparison
+# generated: tools/cmp_pc_traces.py
+# melonDS: build-ptrace + tools/melonds-arm9-ptrace.patch, MELONDS_ARM9TRACE_N=10000, FreeBIOS, real ROM
+# native : work/phase3a/arm9_all_fixed.c (post-index writeback fix) built -O0, run on work/phase3a/arm9_stored_padded.bin (stored ARM9 image, zero-padded to IMAGE_LEN)
+#
+melonDS trace : 10000 PCs
+native  trace : 3000000 PCs
+
+1) strict common prefix        : 10000 / 10000 melonDS PCs (100.0%)
+   melonDS trace fully reproduced
+2) window-filtered prefix      : 10000 / 10000 (window 0x02000000..0x02400000)
+3) in-order matched after resync: 10000 / 10000 melonDS PCs (100.0%)
