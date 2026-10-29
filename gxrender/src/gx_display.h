@@ -39,6 +39,9 @@ typedef struct {
                           *     byte-deterministic) */
     int scale;           /* window pixels per DS pixel (1..4) */
     int layout;          /* GXD_LAYOUT_SIDE or GXD_LAYOUT_STACK */
+    int win_w, win_h;    /* initial window size in host pixels (0 = natural
+                          * layout size; the window is resizable and the
+                          * screens letterbox inside it) */
     const char *title;   /* window title (NULL = "gxrender") */
 } GxdConfig;
 
@@ -102,6 +105,12 @@ void gxd_gx_cmd(Gxd *g, uint8_t cmd, uint32_t param);
  * raster, edge/fog/AA post pass), composites both 2D screens from the live
  * register/VRAM state, presents them (windowed) and pumps SDL events. */
 void gxd_frame(Gxd *g);
+
+/* Advance the frame model one unit (SWAP_BUFFERS env latch + retained-set
+ * swap) WITHOUT rendering.  Replay tools feed long captures and render
+ * only selected units (mid-stream skips do not accumulate state); the
+ * runtime never needs this. */
+void gxd_advance(Gxd *g);
 
 /* Nonzero once the user asked to close the window (or SDL quit). */
 int gxd_should_quit(const Gxd *g);

@@ -429,6 +429,9 @@ struct Gxd {
     GxGl *gl3d;
     GLuint scr_tex[2];
     int have_tex;
+    uint8_t *win_shot;     /* back-buffer capture of the last presented
+                            * frame (GL_FRONT reads are unreliable) */
+    int win_shot_w, win_shot_h;
     int quit;
     unsigned frames;
     uint32_t unhandled;
@@ -1267,6 +1270,20 @@ static void present(Gxd *g)
         glTexCoord2f(0, 1); glVertex2f(x0, y1);
         glEnd();
     }
+
+    /* capture the composed window image from the BACK buffer before the
+     * swap (glReadBuffer(GL_FRONT) after swap is unreliable) */
+    {
+        size_t n = (size_t)g->win_w * g->win_h * 4;
+        uint8_t *cap = (uint8_t *)realloc(g->win_shot, n);
+        if (cap) {
+            g->win_shot = cap;
+            g->win_shot_w = g->win_w;
+            g->win_shot_h = g->win_h;
+            glReadPixels(0, 0, g->win_w, g->win_h, GL_RGBA, GL_UNSIGNED_BYTE,
+                         g->win_shot);
+        }
+    }
     SDL_GL_SwapWindow(g->win);
 }
 
@@ -1339,7 +1356,7 @@ static void pump_events(Gxd *g)
 
 Gxd *gxd_open(const GxdConfig *cfg)
 {
-    static const GxdConfig def = { 0, 0, 1, GXD_LAYOUT_SIDE, NULL };
+    static const GxdConfig def = { 0, 0, 1, GXD_LAYOUT_SIDE, 0, 0, NULL };
     Gxd *g;
 
     if (!cfg) cfg = &def;
@@ -1377,7 +1394,8 @@ Gxd *gxd_open(const GxdConfig *cfg)
     if (g->windowed) {
         int nat_w = (g->layout == GXD_LAYOUT_SIDE) ? 512 : 256;
         int nat_h = (g->layout == GXD_LAYOUT_SIDE) ? 192 : 384;
-        int ww = nat_w * g->scale, wh = nat_h * g->scale;
+        int ww = cfg->win_w > 0 ? cfg->win_w : nat_w * g->scale;
+        int wh = cfg->win_h > 0 ? cfg->win_h : nat_h * g->scale;
 
         if (SDL_Init(SDL_INIT_VIDEO) != 0) {
             fprintf(stderr, "gx_display: SDL_Init: %s\n", SDL_GetError());
@@ -1442,6 +1460,7 @@ void gxd_close(Gxd *g)
     if (g->pctx) SDL_GL_DeleteContext(g->pctx);
     if (g->win) SDL_DestroyWindow(g->win);
     if (g->windowed) SDL_Quit();
+    free(g->win_shot);
     free(g->pending.poly);
     free(g->current.poly);
     free(g->scratch.poly);
@@ -1449,10 +1468,10 @@ void gxd_close(Gxd *g)
     free(g);
 }
 
-void gxd_frame(Gxd *g)
+static void latch_unit(Gxd *g)
 {
-    /* 1. frame model: SWAP_BUFFERS latches the env and swaps the retained
-     * polygon set (melonDS GPU3D::VBlank). */
+    /* SWAP_BUFFERS latches the env and swaps the retained polygon set
+     * (melonDS GPU3D::VBlank). */
     if (g->tracker.saw_swap) {
         g->latched = g->live;
         g->latched_sort = g->tracker.last_swap_param & 3;
@@ -1462,8 +1481,22 @@ void gxd_frame(Gxd *g)
             g->pending = tmp;
             g->pending.n = 0;
         }
-        g->tracker.saw_swap = 0;
     }
+    /* the unit's command tracker ends here -- gx_replay uses one Tracker
+     * per unit (tools/gx_replay.c), so the word-decode state resets at
+     * every unit boundary; match that exactly for byte-identical output */
+    memset(&g->tracker, 0, sizeof(g->tracker));
+}
+
+void gxd_advance(Gxd *g)
+{
+    latch_unit(g);
+}
+
+void gxd_frame(Gxd *g)
+{
+    /* 1. frame model: SWAP_BUFFERS latch + retained-set swap */
+    latch_unit(g);
 
     /* 2. 3D layer */
     if (g->windowed && g->gl3d) render_3d_gl(g);
@@ -1546,30 +1579,20 @@ int gxd_write_screen_ppm(const Gxd *g, int which, const char *path)
 
 int gxd_write_window_ppm(Gxd *g, const char *path)
 {
-    uint8_t *rgba;
     FILE *f;
     int x, y;
 
-    if (!g->windowed || !g->win) return -1;
-    SDL_GL_MakeCurrent(g->win, g->pctx);
-    rgba = (uint8_t *)malloc((size_t)g->win_w * g->win_h * 4);
-    if (!rgba) return -1;
-    glReadBuffer(GL_FRONT);
-    glReadPixels(0, 0, g->win_w, g->win_h, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+    if (!g->windowed || !g->win || !g->win_shot) return -1;
     f = fopen(path, "wb");
-    if (!f) {
-        free(rgba);
-        return -1;
-    }
-    fprintf(f, "P6\n%d %d\n255\n", g->win_w, g->win_h);
-    for (y = g->win_h - 1; y >= 0; y--) {   /* GL reads bottom-up */
-        for (x = 0; x < g->win_w; x++) {
-            const uint8_t *p = &rgba[((size_t)y * g->win_w + x) * 4];
+    if (!f) return -1;
+    fprintf(f, "P6\n%d %d\n255\n", g->win_shot_w, g->win_shot_h);
+    for (y = g->win_shot_h - 1; y >= 0; y--) {   /* GL reads bottom-up */
+        for (x = 0; x < g->win_shot_w; x++) {
+            const uint8_t *p = &g->win_shot[((size_t)y * g->win_shot_w + x) * 4];
             fwrite(p, 1, 3, f);
         }
     }
     fclose(f);
-    free(rgba);
     return 0;
 }
 

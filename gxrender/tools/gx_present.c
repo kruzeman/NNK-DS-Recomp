@@ -196,7 +196,8 @@ int main(int argc, char **argv)
     int shots_every = 0, win_w = 0, win_h = 0;
     long shots[64];
     int n_shots = 0;
-    long range_a = -1, range_b = -1;
+    long ranges[16][2];
+    int n_ranges = 0;
     int i;
 
     state_image = malloc(GX2D_STATE_SIZE);
@@ -236,10 +237,15 @@ int main(int argc, char **argv)
         } else if (!strcmp(argv[i], "--csv") && i + 1 < argc) {
             csv_path = argv[++i];
         } else if (!strcmp(argv[i], "--units") && i + 1 < argc) {
-            if (sscanf(argv[++i], "%ld-%ld", &range_a, &range_b) != 2) {
+            long a, b;
+            if (sscanf(argv[++i], "%ld-%ld", &a, &b) != 2 ||
+                n_ranges >= 16) {
                 fprintf(stderr, "gx_present: bad --units range\n");
                 return 2;
             }
+            ranges[n_ranges][0] = a;
+            ranges[n_ranges][1] = b;
+            n_ranges++;
         } else if (!trace_dir) trace_dir = argv[i];
         else if (!out_dir) out_dir = argv[i];
         else {
@@ -287,7 +293,6 @@ int main(int argc, char **argv)
             if (sscanf(de->d_name, "f%05ld.%c", &u, &suf) != 2) continue;
             snprintf(expect, sizeof(expect), have_2d ? "f%05ld.2d" : "f%05ld.gx", u);
             if (strcmp(de->d_name, expect) != 0) continue;
-            if (range_a >= 0 && (u < range_a || u > range_b)) continue;
             if (n == cap) {
                 cap *= 2;
                 units = realloc(units, (size_t)cap * sizeof(long));
@@ -319,6 +324,8 @@ int main(int argc, char **argv)
             cfg.gl_3d = gl3d;
             cfg.scale = scale > 0 ? scale : 1;
             cfg.layout = layout;
+            cfg.win_w = win_w;
+            cfg.win_h = win_h;
             cfg.title = "gx_present (DS screens)";
             g = gxd_open(&cfg);
             if (!g) {
@@ -347,19 +354,37 @@ int main(int argc, char **argv)
                 long u = units[k];
                 char p[1024];
                 int do_shot = 0;
+                int in_range = 1;
+                if (n_ranges > 0) {
+                    int r;
+                    in_range = 0;
+                    for (r = 0; r < n_ranges; r++)
+                        if (u >= ranges[r][0] && u <= ranges[r][1])
+                            in_range = 1;
+                }
 
-                /* 2D state */
+                /* 2D state (delta chain advances for every dumped unit) */
                 snprintf(p, sizeof(p), "%s/f%05ld.2d", trace_dir, u);
                 if (load_2d_container(p) == 0) {
                     memcpy(state_image, state_next, GX2D_STATE_SIZE);
                     gxd_load_2d_state(g, state_image);
                 }
 
-                /* 3D traffic */
+                /* 3D traffic is fed for EVERY unit so the frame model
+                 * accumulates state exactly like gx_replay (mid-stream
+                 * starts are wrong, GX_TRACES.md section 5) */
                 if (feed3d == 1) {
                     snprintf(p, sizeof(p), "%s/f%05ld.gx", trace_dir, u);
                     if (feed_gx(g, p) < 0) return 1;
+                    if (!in_range) {
+                        gxd_advance(g);
+                        continue;
+                    }
+                } else if (!in_range) {
+                    continue;
+                }
 
+                if (feed3d == 1) {
                     snprintf(p, sizeof(p), "%s/f%05ld.texvram", trace_dir, u);
                     {
                         uint8_t *tv = load_file(p, 512 * 1024);
@@ -374,6 +399,7 @@ int main(int argc, char **argv)
                         }
                     }
                     gxd_load_fb3d(g, NULL);
+                    gxd_frame(g);
                 } else {
                     uint32_t *fb;
                     snprintf(p, sizeof(p), "%s/f%05ld.fb", trace_dir, u);
@@ -383,12 +409,11 @@ int main(int argc, char **argv)
                         gxd_frame(g);
                         free(fb);
                         gxd_load_fb3d(g, NULL);
-                        goto after_frame;
+                    } else {
+                        gxd_load_fb3d(g, NULL);
+                        gxd_frame(g);
                     }
-                    gxd_load_fb3d(g, NULL);
                 }
-                gxd_frame(g);
-            after_frame:
 
                 if (feed3d == 1) {
                     snprintf(p, sizeof(p), "%s/f%05ld.raw", out_dir, u);
