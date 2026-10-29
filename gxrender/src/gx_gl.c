@@ -175,18 +175,21 @@ void gx_gl_draw_polygon(GxGl *g, const GxPolygon *poly, const GxTexMem *tex)
         glBindTexture(GL_TEXTURE_2D, 0);
     }
 
-    /* depth normalization: Z mode stores z/w in 12.12 (range 0..0x1000),
-     * W mode stores clip w (approximate scale). */
-    dscale = ((poly->attr >> 14) & 1) ? (float)(1 << 22) : (float)GX_FX_ONE;
+    /* depth normalization (approximate): GxRasVertex.depth is the melonDS
+     * FinalZ scale -- 24-bit Z (0..0xFFFFFF, smaller = nearer) in Z mode,
+     * 16-bit-normalized W (smaller = nearer) in W mode.  Map to GL z in
+     * [-1,1] with -1 = nearest. */
+    dscale = ((poly->attr >> 14) & 1) ? 65535.0f : 16777215.0f;
 
     glBegin(GL_TRIANGLES);
     for (i = 0; i < ntri; i++) {
         int k;
         for (k = 0; k < 3; k++) {
             const GxRasVertex *v = &poly->v[tri[i][k]];
-            float r = v->r / 31.0f, gg = v->g / 31.0f, b = v->b / 31.0f;
+            /* FinalColor: 9-bit scale ((c<<4)+0xF, 0 stays 0), 0..511 */
+            float r = v->cr / 511.0f, gg = v->cg / 511.0f, b = v->cb / 511.0f;
             float s = v->s / 16.0f, t = v->t / 16.0f;
-            float z = 1.0f - 2.0f * ((float)v->depth / dscale);
+            float z = 2.0f * ((float)v->depth / dscale) - 1.0f;
             if (z < -1.0f) z = -1.0f;
             if (z > 1.0f) z = 1.0f;
             if (textured) {
@@ -195,7 +198,7 @@ void gx_gl_draw_polygon(GxGl *g, const GxPolygon *poly, const GxTexMem *tex)
             }
             glTexCoord2f(s, t);
             glColor3f(r, gg, b);
-            glVertex3f(v->sx / (float)GX_SCREEN_ONE, v->sy / (float)GX_SCREEN_ONE, z);
+            glVertex3f((float)v->sx, (float)v->sy, z);
         }
     }
     glEnd();
