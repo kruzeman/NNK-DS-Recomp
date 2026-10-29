@@ -7,11 +7,11 @@ SDL_LIBS := $(shell pkg-config --libs sdl2 2>/dev/null) -lGL
 
 BUILD := build
 LIB := $(BUILD)/libgxrender.a
-OBJ := $(BUILD)/gx_matrix.o $(BUILD)/gx_tex.o $(BUILD)/gx_raster.o $(BUILD)/gx_fifo.o
+OBJ := $(BUILD)/gx_matrix.o $(BUILD)/gx_tex.o $(BUILD)/gx_raster.o $(BUILD)/gx_fifo.o $(BUILD)/gx_2d.o
 GL_OBJ := $(BUILD)/gx_gl.o
 
-TESTS := $(BUILD)/test_matrix $(BUILD)/test_tex $(BUILD)/test_shade
-TOOLS := $(BUILD)/gx_cube_test $(BUILD)/gx_gl_smoke $(BUILD)/gx_replay
+TESTS := $(BUILD)/test_matrix $(BUILD)/test_tex $(BUILD)/test_shade $(BUILD)/test_post $(BUILD)/test_2d
+TOOLS := $(BUILD)/gx_cube_test $(BUILD)/gx_gl_smoke $(BUILD)/gx_replay $(BUILD)/gx_2dreplay $(BUILD)/gx_2d_golden
 
 all: $(LIB) $(GL_OBJ) $(TESTS) $(TOOLS)
 
@@ -34,7 +34,19 @@ $(BUILD)/test_tex: tests/test_tex.c $(LIB)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $< $(LIB)
 
 $(BUILD)/test_shade: tests/test_shade.c $(LIB)
-	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $< $(LIB)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ tests/test_shade.c $(LIB)
+
+$(BUILD)/test_post: tests/test_post.c $(LIB)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ tests/test_post.c $(LIB)
+
+$(BUILD)/test_2d: tests/test_2d.c $(LIB)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ tests/test_2d.c $(LIB)
+
+$(BUILD)/gx_2dreplay: tools/gx_2dreplay.c $(LIB)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ tools/gx_2dreplay.c $(LIB)
+
+$(BUILD)/gx_2d_golden: tools/gx_2d_golden.c $(LIB)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ tools/gx_2d_golden.c $(LIB)
 
 $(BUILD)/gx_cube_test: tools/gx_cube_test.c tools/gx_scene.h $(LIB)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ tools/gx_cube_test.c $(LIB)
@@ -51,6 +63,8 @@ test: all
 	$(BUILD)/test_matrix
 	$(BUILD)/test_tex
 	$(BUILD)/test_shade
+	$(BUILD)/test_post
+	$(BUILD)/test_2d
 	$(BUILD)/gx_cube_test --runs 3 --out tests/out/cube.ppm
 	sh tests/check_determinism.sh
 
@@ -60,14 +74,22 @@ golden: all
 	$(BUILD)/gx_cube_test --runs 1 --out tests/out/cube.ppm
 	cmp tests/golden/cube.ppm tests/out/cube.ppm && echo "golden match"
 
+# 2D compositor golden + determinism (gx_2d_golden vs tests/golden/scene2d.ppm)
+golden2d: $(BUILD)/gx_2d_golden
+	mkdir -p tests/out
+	$(BUILD)/gx_2d_golden --out tests/out/scene2d.ppm
+	$(BUILD)/gx_2d_golden --out tests/out/scene2d_b.ppm
+	cmp tests/out/scene2d.ppm tests/out/scene2d_b.ppm && echo "2D determinism match"
+	cmp tests/golden/scene2d.ppm tests/out/scene2d.ppm && echo "2D golden match"
+
 # GL backend smoke test (software GL via Xvfb is fine; see GX_COVERAGE.md)
 gl-smoke: $(BUILD)/gx_gl_smoke
 	mkdir -p tests/out
 	xvfb-run -a $(BUILD)/gx_gl_smoke --out tests/out/cube_gl.ppm
 
-check: test golden gl-smoke
+check: test golden golden2d gl-smoke
 
 clean:
 	rm -rf $(BUILD) tests/out
 
-.PHONY: all test golden gl-smoke check clean
+.PHONY: all test golden golden2d gl-smoke check clean

@@ -76,25 +76,48 @@ and palette-RAM lookups follow melonDS TextureLookup() arithmetic exactly.
 
 ## Rasterizer / shading status
 
-Implemented (software path, deterministic):
-- barycentric scanline fill with the top-left rule; pixel centers in 1/16 px
-  (on-edge pixels count on top edges — horizontal, running right — and left
-  edges — any up-running edge, incl. diagonal — so shared edges are gapless)
-- perspective-correct attributes (1/w) for color and texture coords
+Implemented (software path, deterministic; faithful port of the melonDS
+scanline rasterizer, replacing the earlier barycentric fill):
+- Slope + Interpolator with 8/9-bit perspective-factor attribute
+  interpolation and the X-major edge interpolation-offset quirk
+  (GPU3D_Soft.h:74-431); integer screen positions (melonDS FinalPosition,
+  GPU3D.cpp:1317-1343 incl. the W>0xFFFF divider quirk)
+- span fill: left edge / interior / right edge with the hardware edge-fill
+  rules (edges always filled when AA or edge marking is on), AA coverage
+  stepping per edge, and the AA second pixel layer
+  (GPU3D_Soft.cpp:940-1395); opaque plot with push-down (top layer only,
+  melonDS `pixeladdr < BufferSize`), translucent
+  PlotTranslucentPixel with the translucent-polygon-ID skip rule
+  (GPU3D_Soft.cpp:565-601) and the underneath-depth-test fallback.
+  Layout: melonDS keeps the second layer at `pixeladdr + BufferSize` in
+  unified 2*w*h buffers (GPU3D_Soft.h:475-477); GxSurface keeps separate
+  per-layer w*h arrays (color2/depth2/attr2 at base addr) and the raster
+  code routes layer writes through plane pointers accordingly
+  (t_23498a08 — before that the depth-fail path used unified indexing
+  against the separate arrays, corrupting the wrong buffer)
+- depth: melonDS FinalZ ((z*0x4000)/w + 0x3FFF)*0x200 clamped 24-bit
+  (GPU3D.cpp:1537-1547) or W-buffer via SWAP_BUFFERS param bit 1 with
+  per-polygon 16-bit-normalized W (1516-1551); depth tests
+  Equal_Z / Equal_W (POLYGON_ATTR bit 14) and LessThan /
+  LessThan_FrontFacing tie rule (GPU3D_Soft.cpp:385-425); bit 11 =
+  translucent depth write
 - backface culling in clip space (melonDS (x,y,w)-normal dot test, before
-  clipping); POLYGON_ATTR bits 6/7 render front/back faces
-- depth: Z-buffer (z/w, 12.12) or W-buffer (clip w) per POLYGON_ATTR bit 14;
-  pass if new depth < old (first-submitted wins ties)
-- shading modes (melonDS RenderPixel arithmetic): modulation, decal,
-  toon (palette 0..31 table), highlight (toon added after texturing, all
-  channels set to the red component first)
+  clipping); POLYGON_ATTR bits 6/7 render front/back faces; ZeroDotW
+  check (GPU3D.cpp:1357-1390)
+- shading modes (melonDS RenderPixel arithmetic, 457-562): modulation,
+  decal, toon (32-entry table, index = vr>>1), highlight (channels set to
+  red first, toon added after texturing); FinalColor 9-bit expansion
+  (1463-1468) and 12.20 clip scale + post-clip rounding (1108-1116)
 - alpha: per-polygon alpha (bits 16-20), texture alpha modulation
-  ((ta+1)*(pa+1)-1)>>5, 1-bit alpha test (alpha <= ref discards, ref = 0),
+  ((ta+1)*(pa+1)-1)>>5, alpha test (alpha <= ref discards;
+  RenderPixel->span-fill placement, GPU3D_Soft.cpp:1157-1161),
   melonDS AlphaBlend for translucent pixels (DISP3DCNT bit 3 gate)
+- render order: melonDS YSort, SortKey = (ybot<<8)|ytop with translucent
+  flag 0x10000, stable sort of the opaque set (or all, per SWAP sort mode
+  bit 0) with translucent in submission order (GPU3D.cpp:1511-1512,
+  2632-2671)
 - lighting: ambient+diffuse+specular with shininess table, 4 lights,
   integer arithmetic identical to melonDS CalculateLighting()
-
-Partial / staged:
 - clipping/culling: mirrors melonDS GPU3D.cpp SubmitPolygon/ClipPolygon —
   culling in clip space on the (x, y, w) normal BEFORE clipping (dot < 0 =
   back face / POLYGON_ATTR bit 7, dot > 0 = front / bit 6, dot == 0 draws);
@@ -102,7 +125,25 @@ Partial / staged:
   (z > w drops the polygon unless POLYGON_ATTR bit 12); attributes
   interpolate with hardware trunc-toward-zero arithmetic; W truncated to
   24 bits and any w == 0 vertex makes the polygon degenerate (not
-  rendered).  Unimplemented: the ZeroDotW check (0x04000610 is captured)
+  rendered)
+
+Frame post pass (gx_post_pass, ScanlineFinalPass GPU3D_Soft.cpp:1453-1621):
+- edge marking (DISP3DCNT bit5): 4-neighbor polyid/depth contour test,
+  EdgeTable[polyid>>3] color, alpha kept (1459-1490); every marked pixel
+  also breaks antialiasing coverage — the attr coverage field is forced to
+  16 (`(attr & 0xFFFFE0FF) | 0x00001000`) before the AA pass, so it blends
+  17/32 against the second layer (1486-1487)
+- fog (DISP3DCNT bit7): per-pixel density from the depth buffer via the
+  34-entry table + offset/shift (CalculateFogDensity 1414-1451), color
+  blend unless bit6 (alpha-only fog), alpha always blended (1492-1570);
+  fog is applied to the topmost TWO pixels — the AA second layer is fogged
+  too, gated on the top pixel's edge flags (attr & 0xF) and the lower
+  pixel's own fog flag (attr bit15), with density from the lower pixel's
+  depth (1500-1503, 1527-1570)
+- antialiasing (DISP3DCNT bit4): coverage blend with the second layer,
+  alpha always blended (1570-1620)
+
+Partial / staged:
 - wireframe polygons (alpha = 0) are drawn filled at forced alpha 31;
   1px-edge wireframe rendering is staged
 - translucent polygons blend in submission order (no depth-sorted
@@ -112,9 +153,16 @@ Partial / staged:
   bottom-up buffers — our surface is top-down PPM so y0 is the top row
 
 Stubbed (ignored, documented):
-- fog (0x3D/0x3E/0x3F registers never reach the renderer)
-- edge marking, antialiasing, shadow volumes/polygon-ID shadow masking
+- shadow volumes / polygon-ID shadow masking + stencil buffer
+  (IsShadow/IsShadowMask GPU3D.cpp:1425-1426, RenderShadowMaskScanline +
+  StencilBuffer GPU3D_Soft.cpp:1122-1132/1218-1228, PlotTranslucentPixel
+  shadow branch 570-583): mode-3 polygons render as ordinary translucent
+  polygons.  NOT exercised by the canonical capture (0 shadow polys).
 - FIFO timing, stalls, IRQ behavior (out of scope for the render base)
+
+Known residual vs melonDS on the canonical 3D capture: 1.30% of pixels
+(see GX_TRACES.md §4-§5) — AA second-layer/coverage divergence on dense
+character meshes and two translucent shadow quads.
 
 ## GL backend skeleton (src/gx_gl.c)
 
@@ -148,10 +196,54 @@ Real-game validation (melonDS trace capture + replay + per-pixel diff) is
 documented in GX_TRACES.md; the tooling is tools/gx_replay.c and
 tools/gx_tracediff.py and the capture patch is ref/melonds-gxfifo-log.patch.
 
-Unit tests (tests/test_matrix.c, tests/test_tex.c, tests/test_shade.c) pin
-matrix ops, the transform/viewport mapping, culling, lighting, FIFO command
-packing, texcoord transforms, texture decode and shading modes against
-hand-computed constants (arithmetic shown in the test comments).
+Unit tests pin matrix ops, the transform/viewport mapping, culling, lighting,
+FIFO command packing, texcoord transforms, texture decode and shading modes
+against hand-computed constants (arithmetic shown in the test comments), and
+the post passes (fog density/blend/alpha-fog/second-layer fog, edge marking
+incl. the break-AA-coverage write, AA final pass):
+tests/test_matrix.c (51 checks), tests/test_tex.c (99), tests/test_shade.c
+(16), tests/test_post.c (46) — 212 checks total.
+
+Golden note (Phase-3B): tests/golden/cube.ppm was regenerated (1176 pixels
+changed) because the rasterizer model changed from barycentric fill to the
+melonDS scanline port; the change is justified line-referenced above and the
+golden is re-pinned by the 3+3 determinism check.
+
+## 2D engine coverage (Phase-3B2, src/gx_2d.c + src/gx_2d.h)
+
+The DS 2D engine and screen compositor are a faithful port of the melonDS
+software 2D renderer's scanline model (GPU2D_Soft.cpp DrawBG_x/DrawSprite_x,
+GPU2D.cpp window + register-latch timing, GPU_ColorOp.h color math,
+GPU_Soft.cpp display path), the same way gx_raster.c mirrors the 3D
+rasterizer.  Integer-only; output bytes match melonDS framebuffers exactly.
+Input is the per-unit GX2D state image dumped by ref/melonds-2d-log.patch
+(f%05u.2d, layout in gx_2d.h) plus the melonDS 3D layer (f%05u.fb).
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| BG modes 0-5 dispatch | implemented | melonDS DrawScanlineBGMode<0..5> layer/priority order |
+| BG modes 6/7 | implemented | Mode6 large-bitmap BG2 + 3D; Mode7 BG0/BG1 text + 3D |
+| text BG | implemented | 16/256-color, h/v flip, 4 screen sizes + wide-area bit, char/screen bases, palette banks |
+| affine BG | implemented | PA-PD, ref points w/ per-scanline B/D increments (UpdateRegistersPostDraw model), overflow bit, 4 sizes |
+| extended BG | implemented | affine+text mixed (ext palette, flips) and bitmap modes (256-color palette + direct-color 15bpp) |
+| large BG (mode 6) | implemented | 512x256..1024x512 bitmap, BG2 only |
+| sprites | implemented | all 128 OAM entries, 12 sizes x normal/rotscale/double-size, 16/256-color, 1D/2D OBJ mapping (all 4 DISP3CNT variants), bitmap sprites (32/64-wide), x/y flip, semitransparent mode, OBJ-window sprites, priority interleave, sprite Y mosaic + X mosaic post-pass |
+| palette decode | implemented | 15bpp BGR555 + bit15 bottom-green-bit (melonDS [Gericom] note), 4 BG banks, extended BG (4 slots) and OBJ palettes per engine |
+| windowing | implemented | WIN0/WIN1/OBJ-window/outside masks, X/Y edge latch semantics (CalculateWindowMask/UpdateWindows verbatim, incl. wrap ranges) |
+| color special effects | implemented | alpha blend (EVA/EVB), brighten/darken (EVY) on 18-bit values, sprite-blend and 3D-layer blend rules (flag bits 0x80/0x40, ColorBlend5 5-bit alpha) |
+| mosaic | implemented | BG X (table) + Y (latched rows), OBJ Y + X post-pass latch rules |
+| display output | implemented | engine A modes 0-3 (off/regular/VRAM/FIFO), engine B off/regular, master brightness up/down with clamp, screen-off fills, POWCNT screens-disabled black, screen-swap buffer routing |
+| compositor | implemented | 2D layers + validated 3D layer (BG0, 5-bit alpha) + engine B, melonDS SoftRenderer frame model byte-for-byte |
+| display capture (DISPCAPCNT) | absorbed | replay is snapshot-based: capture writes land in the next unit's VRAM snapshot, so DoCapture need not be replayed; register values are captured in the state image for completeness |
+| mid-frame writes | limitation | one state snapshot per frame (scanline 0); mid-frame register/VRAM/palette/OAM writes within a frame are not represented. Measured impact on the real capture: 1 of 820 units (a transition frame with mid-frame palette writes; see GX_TRACES.md 7) |
+
+Tests: tests/test_2d.c — 48 checks (text BG 16/256-color + flips + scroll,
+affine identity, sprites normal/transparent/semitransparent, window 0
+clipping, alpha blend/brighten/darken, master brightness + clamp, engine B
+palette routing + screen-off fill, X mosaic, 3x in-process determinism).
+Golden: tests/golden/scene2d.ppm (mixed scene: 256-color BG + 16-color BG +
+sprites + window + blend + master brightness on both engines), re-pinned by
+the 3+3 determinism check in tests/check_determinism.sh (`make golden2d`).
 
 ## Lighting hand-computation (T8 reference)
 

@@ -1,0 +1,332 @@
+--- a/src/GPU3D.cpp
++++ b/src/GPU3D.cpp
+@@ -83,7 +83,22 @@
+ static int FbEvery = 1;
+ static int TexEvery = 1;
+ static int TexFrom = 0;
++static int TwoDEvery = 0;
++static int TwoDFrom = 0;
+ static long Pace = 0;
++// optional dump windows "a-b;c-d" (inclusive unit ranges): when set, ALL
++// per-unit dumps (.fb/.texvram/.texpal/.2d/.scr) are restricted to units in
++// any range; .gx streams always record.  Keeps multi-window validation runs
++// small.  Empty = no restriction (legacy behavior).
++static std::vector<std::pair<long, long>> DumpRanges;
++
++static bool InDumpRanges(long u) noexcept
++{
++    if (DumpRanges.empty()) return true;
++    for (const auto& r : DumpRanges)
++        if (u >= r.first && u <= r.second) return true;
++    return false;
++}
+ 
+ static void Init() noexcept
+ {
+@@ -97,6 +112,19 @@
+     if ((s = getenv("MELONDS_GXLOG_FBEVERY")))  FbEvery = atoi(s) > 0 ? atoi(s) : 1;
+     if ((s = getenv("MELONDS_GXLOG_TEXEVERY"))) TexEvery = atoi(s) > 0 ? atoi(s) : 1;
+     if ((s = getenv("MELONDS_GXLOG_TEXFROM")))  TexFrom = atoi(s);
++    if ((s = getenv("MELONDS_GXLOG_2DEVERY")))  TwoDEvery = atoi(s) > 0 ? atoi(s) : 0;
++    if ((s = getenv("MELONDS_GXLOG_2DFROM")))   TwoDFrom = atoi(s);
++    if ((s = getenv("MELONDS_GXLOG_RANGES")))
++    {
++        char rbuf[1024];
++        snprintf(rbuf, sizeof(rbuf), "%s", s);
++        for (char* tok = strtok(rbuf, ";"); tok; tok = strtok(nullptr, ";"))
++        {
++            long a = 0, b = 0;
++            if (sscanf(tok, "%ld-%ld", &a, &b) == 2 && b >= a)
++                DumpRanges.emplace_back(a, b);
++        }
++    }
+     if ((s = getenv("MELONDS_GXLOG_PACE")))     Pace = atol(s);
+     if ((s = getenv("MELONDS_GXLOG_PRESS")))
+     {
+@@ -224,6 +252,7 @@
+ void DumpFramebuffer(const u32* color, int stride, int firstpix, int w, int h) noexcept
+ {
+     if (!Active() || !FbDump || PendingFB < 0) return;
++    if (!InDumpRanges(PendingFB)) return;
+     if (FbEvery > 1 && (PendingFB % FbEvery) != 0) return;
+     char path[1200];
+     snprintf(path, sizeof(path), "%s/f%05d.fb", Dir, PendingFB);
+@@ -237,6 +266,7 @@
+ void DumpTextureMem(const u8* texvram, u32 texsize, const u8* texpal, u32 palsize) noexcept
+ {
+     if (!Active() || PendingFB < 0 || PendingFB < TexFrom) return;
++    if (!InDumpRanges(PendingFB)) return;
+     if (TexEvery > 1 && (PendingFB % TexEvery) != 0) return;
+     char path[1200];
+     snprintf(path, sizeof(path), "%s/f%05d.texvram", Dir, PendingFB);
+@@ -247,6 +277,88 @@
+     if (f) { fwrite(texpal, 1, palsize, f); fclose(f); }
+ }
+ 
++// ---- 2D compositor state + final screens ---------------------------------
++// f%05u.2d container: "GX2D" <u32 ver=1> <u32 unit> <u32 flags> <u32 size>
++//   flags bit0 = keyframe
++//   keyframe payload: <size> raw state bytes
++//   delta payload:    <u32 nruns> { <u32 off> <u32 len> <len bytes> }*
++// The state image layout (little-endian, GX2D_STATE_SIZE bytes) is documented
++// in GX_TRACES.md and mirrored by gxrender/src/gx_2d.h (gx2d_state_load).
++
++static std::vector<u8> Prev2D;
++static bool HavePrev2D = false;
++
++void Dump2D(const void* state, u32 size) noexcept
++{
++    if (!Active() || TwoDEvery <= 0) return;
++    if (PendingFB < 0 || PendingFB < TwoDFrom) return;
++    if (!InDumpRanges(PendingFB)) return;
++    if (TwoDEvery > 1 && (PendingFB % TwoDEvery) != 0) return;
++
++    const u8* src = (const u8*)state;
++    bool keyframe = !HavePrev2D || Prev2D.size() != size;
++    std::vector<u8> payload;
++
++    if (!keyframe)
++    {
++        // one run per maximal contiguous changed region
++        std::vector<u8> body;
++        u32 nruns = 0;
++        u32 i = 0;
++        while (i < size)
++        {
++            if (src[i] == Prev2D[i]) { i++; continue; }
++            u32 start = i;
++            while (i < size && src[i] != Prev2D[i]) i++;
++            u32 len = i - start;
++            for (int b = 0; b < 4; b++) body.push_back((u8)(start >> (b * 8)));
++            for (int b = 0; b < 4; b++) body.push_back((u8)(len >> (b * 8)));
++            body.insert(body.end(), src + start, src + start + len);
++            nruns++;
++        }
++        if (body.size() + 4 > (size * 3) / 4) keyframe = true; // not worth it
++        else
++        {
++            for (int b = 0; b < 4; b++) payload.push_back((u8)(nruns >> (b * 8)));
++            payload.insert(payload.end(), body.begin(), body.end());
++        }
++    }
++    if (keyframe) payload.assign(src, src + size);
++
++    char path[1200];
++    snprintf(path, sizeof(path), "%s/f%05d.2d", Dir, PendingFB);
++    FILE* f = fopen(path, "wb");
++    if (!f) return;
++    u8 hdr[20] = { 'G', 'X', '2', 'D', 1, 0, 0, 0 };
++    u32 unit = (u32)PendingFB, flags = keyframe ? 1 : 0;
++    memcpy(&hdr[8], &unit, 4);
++    memcpy(&hdr[12], &flags, 4);
++    memcpy(&hdr[16], &size, 4);
++    fwrite(hdr, 1, 20, f);
++    if (!payload.empty()) fwrite(payload.data(), 1, payload.size(), f);
++    fclose(f);
++
++    Prev2D.assign(src, src + size);
++    HavePrev2D = true;
++}
++
++void DumpScreens(const void* fb0, const void* fb1) noexcept
++{
++    if (!Active() || TwoDEvery <= 0) return;
++    if (PendingFB < 0 || PendingFB < TwoDFrom) return;
++    if (!InDumpRanges(PendingFB)) return;
++    if (TwoDEvery > 1 && (PendingFB % TwoDEvery) != 0) return;
++    char path[1200];
++    snprintf(path, sizeof(path), "%s/f%05d.scr", Dir, PendingFB);
++    FILE* f = fopen(path, "wb");
++    if (!f) return;
++    fwrite(fb0, 4, 256 * 192, f);
++    fwrite(fb1, 4, 256 * 192, f);
++    fclose(f);
++}
++
++bool TwoDActive() noexcept { return Active() && TwoDEvery > 0; }
++
+ }
+ 
+ 
+--- a/src/GPU3D.h
++++ b/src/GPU3D.h
+@@ -102,6 +102,15 @@
+ void CloseUnit(melonDS::NDS& nds) noexcept; // called from GPU3D::VBlank
+ void DumpFramebuffer(const u32* color, int stride, int firstpix, int w, int h) noexcept;
+ void DumpTextureMem(const u8* texvram, u32 texsize, const u8* texpal, u32 palsize) noexcept;
++// 2D compositor state (MELONDS_GXLOG_2DEVERY/2DFROM): Dump2D() writes the
++// packed GX2D state image (keyframe or delta vs the previous dump) as
++// f%05u.2d; DumpScreens() writes the final composed screens (2 x 256*192
++// u32, post master-brightness 8-bit BGRA) as f%05u.scr.  Both are indexed
++// by the same PendingUnit() slot as f%05u.fb (state at display start of the
++// frame whose inputs are f%05u.fb/.2d, screens at the end of its display).
++void Dump2D(const void* state, u32 size) noexcept;
++void DumpScreens(const void* fb0, const void* fb1) noexcept;
++bool TwoDActive() noexcept; // Active() && MELONDS_GXLOG_2DEVERY set
+ }
+ 
+ class GPU3D
+--- a/src/GPU_Soft.cpp
++++ b/src/GPU_Soft.cpp
+@@ -16,12 +16,145 @@
+     with melonDS. If not, see http://www.gnu.org/licenses/.
+ */
+ 
++#include <string.h>
++#include <vector>
+ #include "NDS.h"
+ #include "GPU_Soft.h"
+ #include "GPU_ColorOp.h"
+ 
++// gxrender 2D-state capture (see gxrender/ref/melonds-2d-log.patch and
++// GX_TRACES.md): declared here instead of GPU3D.h to keep this file's
++// include set unchanged.
+ namespace melonDS
+ {
++namespace GXLog
++{
++void Dump2D(const void* state, u32 size) noexcept;
++void DumpScreens(const void* fb0, const void* fb1) noexcept;
++int PendingUnit() noexcept;
++bool Active() noexcept;
++bool TwoDActive() noexcept;
++}
++}
++
++namespace melonDS
++{
++
++// ---------------------------------------------------------------------------
++// GX2D state image assembly.  Fixed little-endian layout (host is LE),
++// GX2D_STATE_SIZE bytes; mirrored by gxrender/src/gx_2d.h:
++//   0x00000  256  engine A regs block      (layout below)
++//   0x00100  256  engine B regs block
++//   0x00200  512  global regs block
++//   0x00400 2048  palette RAM
++//   0x00C00 2048  OAM
++//   0x01400 512K  VRAMFlat_ABG
++//   0x81400 128K  VRAMFlat_BBG
++//   0xA1400 256K  VRAMFlat_AOBJ
++//   0xE1400 128K  VRAMFlat_BOBJ
++//   0x101400  32K VRAMFlat_ABGExtPal
++//   0x109400  32K VRAMFlat_BBGExtPal
++//   0x111400   8K VRAMFlat_AOBJExtPal
++//   0x113400   8K VRAMFlat_BOBJExtPal
++//   0x115400 512K VRAM_A..D raw banks (VRAM display / capture sources)
++// Engine regs block: +0x00 dispcnt u32, +0x04 bgcnt[4] u16, +0x0C bgxpos[4],
++// +0x14 bgypos[4], +0x1C bgxref[2] s32, +0x24 bgyref[2], +0x2C bgxrefreload[2],
++// +0x34 bgyrefreload[2], +0x3C bgrota[2] s16, +0x40 bgrotb[2], +0x44 bgrotc[2],
++// +0x48 bgrotd[2], +0x4C win0coords[4] u8, +0x50 win1coords[4], +0x54 wincnt[4],
++// +0x58 bgmosaicsize[2], +0x5A objmosaicsize[2], +0x5C blendcnt u16,
++// +0x5E blendalpha u16, +0x60 eva/evb/evy u8, +0x63 win0active, +0x64 win1active.
++// Global block: +0x00 masterbright A/B u16, +0x04 screens_enabled,
++// +0x05 screen_swap, +0x06 engA_enabled, +0x07 engB_enabled, +0x08 VRAMCNT[9],
++// +0x11 VRAMSTAT, +0x12 capture_enable, +0x14 capturecnt u32,
++// +0x18 dispfifobuffer[256] u16.
++// ---------------------------------------------------------------------------
++constexpr u32 GX2D_STATE_SIZE = 0x195400;
++
++static inline void GXP16(u8* p, u16 v) { memcpy(p, &v, 2); }
++static inline void GXP32(u8* p, u32 v) { memcpy(p, &v, 4); }
++
++static void GXLogDumpEngine(u8* dst, const GPU2D& e)
++{
++    GXP32(dst + 0x00, e.DispCnt);
++    for (int i = 0; i < 4; i++) GXP16(dst + 0x04 + i * 2, e.BGCnt[i]);
++    for (int i = 0; i < 4; i++) GXP16(dst + 0x0C + i * 2, e.BGXPos[i]);
++    for (int i = 0; i < 4; i++) GXP16(dst + 0x14 + i * 2, e.BGYPos[i]);
++    for (int i = 0; i < 2; i++) GXP32(dst + 0x1C + i * 4, (u32)e.BGXRef[i]);
++    for (int i = 0; i < 2; i++) GXP32(dst + 0x24 + i * 4, (u32)e.BGYRef[i]);
++    for (int i = 0; i < 2; i++) GXP32(dst + 0x2C + i * 4, (u32)e.BGXRefReload[i]);
++    for (int i = 0; i < 2; i++) GXP32(dst + 0x34 + i * 4, (u32)e.BGYRefReload[i]);
++    for (int i = 0; i < 2; i++) GXP16(dst + 0x3C + i * 2, (u16)e.BGRotA[i]);
++    for (int i = 0; i < 2; i++) GXP16(dst + 0x40 + i * 2, (u16)e.BGRotB[i]);
++    for (int i = 0; i < 2; i++) GXP16(dst + 0x44 + i * 2, (u16)e.BGRotC[i]);
++    for (int i = 0; i < 2; i++) GXP16(dst + 0x48 + i * 2, (u16)e.BGRotD[i]);
++    memcpy(dst + 0x4C, e.Win0Coords, 4);
++    memcpy(dst + 0x50, e.Win1Coords, 4);
++    memcpy(dst + 0x54, e.WinCnt, 4);
++    dst[0x58] = e.BGMosaicSize[0]; dst[0x59] = e.BGMosaicSize[1];
++    dst[0x5A] = e.OBJMosaicSize[0]; dst[0x5B] = e.OBJMosaicSize[1];
++    GXP16(dst + 0x5C, e.BlendCnt);
++    GXP16(dst + 0x5E, e.BlendAlpha);
++    dst[0x60] = e.EVA; dst[0x61] = e.EVB; dst[0x62] = e.EVY;
++    dst[0x63] = e.Win0Active; dst[0x64] = e.Win1Active;
++}
++
++static void GXLogDump2DState(melonDS::GPU& gpu)
++{
++    static std::vector<u8> buf(GX2D_STATE_SIZE);
++    u8* s = buf.data();
++
++    // make all 2D flat views coherent (same dance as SoftRenderer2D::DrawScanline)
++    auto d1 = gpu.VRAMDirty_ABG.DeriveState(gpu.VRAMMap_ABG, gpu);
++    gpu.MakeVRAMFlat_ABGCoherent(d1);
++    auto d2 = gpu.VRAMDirty_BBG.DeriveState(gpu.VRAMMap_BBG, gpu);
++    gpu.MakeVRAMFlat_BBGCoherent(d2);
++    auto d3 = gpu.VRAMDirty_AOBJ.DeriveState(gpu.VRAMMap_AOBJ, gpu);
++    gpu.MakeVRAMFlat_AOBJCoherent(d3);
++    auto d4 = gpu.VRAMDirty_BOBJ.DeriveState(gpu.VRAMMap_BOBJ, gpu);
++    gpu.MakeVRAMFlat_BOBJCoherent(d4);
++    auto d5 = gpu.VRAMDirty_ABGExtPal.DeriveState(gpu.VRAMMap_ABGExtPal, gpu);
++    gpu.MakeVRAMFlat_ABGExtPalCoherent(d5);
++    auto d6 = gpu.VRAMDirty_BBGExtPal.DeriveState(gpu.VRAMMap_BBGExtPal, gpu);
++    gpu.MakeVRAMFlat_BBGExtPalCoherent(d6);
++    auto d7 = gpu.VRAMDirty_AOBJExtPal.DeriveState(&gpu.VRAMMap_AOBJExtPal, gpu);
++    gpu.MakeVRAMFlat_AOBJExtPalCoherent(d7);
++    auto d8 = gpu.VRAMDirty_BOBJExtPal.DeriveState(&gpu.VRAMMap_BOBJExtPal, gpu);
++    gpu.MakeVRAMFlat_BOBJExtPalCoherent(d8);
++
++    memset(s, 0, GX2D_STATE_SIZE);
++    GXLogDumpEngine(s + 0x00000, gpu.GPU2D_A);
++    GXLogDumpEngine(s + 0x00100, gpu.GPU2D_B);
++
++    u8* g = s + 0x00200;
++    GXP16(g + 0x00, gpu.MasterBrightnessA);
++    GXP16(g + 0x02, gpu.MasterBrightnessB);
++    g[0x04] = gpu.ScreensEnabled ? 1 : 0;
++    g[0x05] = gpu.ScreenSwap ? 1 : 0;
++    g[0x06] = gpu.GPU2D_A.Enabled ? 1 : 0;
++    g[0x07] = gpu.GPU2D_B.Enabled ? 1 : 0;
++    memcpy(g + 0x08, gpu.VRAMCNT, 9);
++    g[0x11] = gpu.VRAMSTAT;
++    g[0x12] = gpu.CaptureEnable ? 1 : 0;
++    GXP32(g + 0x14, gpu.CaptureCnt);
++    memcpy(g + 0x18, gpu.DispFIFOBuffer, 256 * 2);
++
++    memcpy(s + 0x00400, gpu.Palette, 2 * 1024);
++    memcpy(s + 0x00C00, gpu.OAM, 2 * 1024);
++    memcpy(s + 0x01400, gpu.VRAMFlat_ABG, 512 * 1024);
++    memcpy(s + 0x81400, gpu.VRAMFlat_BBG, 128 * 1024);
++    memcpy(s + 0xA1400, gpu.VRAMFlat_AOBJ, 256 * 1024);
++    memcpy(s + 0xE1400, gpu.VRAMFlat_BOBJ, 128 * 1024);
++    memcpy(s + 0x101400, gpu.VRAMFlat_ABGExtPal, 32 * 1024);
++    memcpy(s + 0x109400, gpu.VRAMFlat_BBGExtPal, 32 * 1024);
++    memcpy(s + 0x111400, gpu.VRAMFlat_AOBJExtPal, 8 * 1024);
++    memcpy(s + 0x113400, gpu.VRAMFlat_BOBJExtPal, 8 * 1024);
++    memcpy(s + 0x115400, gpu.VRAM_A, 128 * 1024);
++    memcpy(s + 0x135400, gpu.VRAM_B, 128 * 1024);
++    memcpy(s + 0x155400, gpu.VRAM_C, 128 * 1024);
++    memcpy(s + 0x175400, gpu.VRAM_D, 128 * 1024);
++
++    GXLog::Dump2D(s, GX2D_STATE_SIZE);
++}
+ 
+ SoftRenderer::SoftRenderer(melonDS::NDS& nds)
+     : Renderer(nds.GPU)
+@@ -155,6 +288,15 @@
+             dstB[i] = 0xFF000000;
+         }
+     }
++
++    // gxrender capture: 2D compositor state at display start (line 0), final
++    // composed screens at display end (line 191); same PendingUnit() slot as
++    // f%05u.fb (the 3D layer displayed by this frame).
++    if (!GXLog::TwoDActive()) return;
++    if (line == 0)
++        GXLogDump2DState(GPU);
++    else if (line == 191)
++        GXLog::DumpScreens(Framebuffer[BackBuffer][0], Framebuffer[BackBuffer][1]);
+ }
+ 
+ void SoftRenderer::DrawSprites(u32 line)
