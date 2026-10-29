@@ -72,6 +72,19 @@ report committed in `tools/phase3a_trace_compare.txt`:
 |---|---|---|---|
 | acceptance window | 10 000 | **10 000 / 10 000 = 100 %** strict prefix (also window-filtered and post-resync) | none |
 | deep capture (5 M melonDS vs 3 M native trace) | 5 000 000 | **3 000 000 / 5 000 000 = 60 %** — native trace file ends at its TRACE_LIMIT; all 3 M captured native PCs match | none inside the native capture |
+| deep capture, Thumb image (Phase-3A3, 10 M vs 10 M) | 10 000 000 | **3 633 818 / 10 000 000 = 36.3 %** strict prefix (also window-filtered) | index 3 633 818: melonDS `0x0201C4C0` vs native `0x0201C4AC` |
+
+**Thumb dispatch image (Phase-3A3).**  `work/phase3a/arm9_thumb.c` is the
+gap-closed dispatch image: **73 120 cases / 2 020 functions**, Thumb
+translation covering the full ARMv5TE Thumb set plus ARM<->Thumb
+interworking (`tools/thumb_disasm_check.py` PASS: 86/86 encoding, 85/85 text
+vs objdump, 51/51 Thumb instructions, 8/8 interworking in the generated C).
+Deep run on the stored image (`sh work/phase3a/run_thumb_deep.sh`, 200 M
+steps): the `blx` at `0x0201C178` now enters Thumb at `0x020004A8`, passing
+the Phase-3A2 halt point; new halt at **`0x0201C4B8`** (step budget
+exhausted; 1032 distinct PCs).  10 M PC trace vs melonDS: **3 633 818 /
+10 000 000 = 36.3 %** strict prefix, first divergence at index 3 633 818
+(melonDS `0x0201C4C0` vs native `0x0201C4AC`).
 
 **IO model status.**  Nothing is implemented yet; every `0x04000000+`
 access is a stub (reads 0, writes dropped).  The exact register set the

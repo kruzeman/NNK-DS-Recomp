@@ -772,12 +772,32 @@ pub fn decode_thumb(h: u16, h2: u16, addr: u32, size: usize) -> Insn {
     let text;
     let mut kind;
     if h & 0xF800 == 0xF000 && size == 4 {
-        // v5 / Thumb-2 BL, BLX: two halfwords, one32-bit slot
+        // v5 / Thumb-2 BL, BLX: two halfwords, one32-bit slot.
+        // ARM ARM: I1 = NOT(J1 EOR S), I2 = NOT(J2 EOR S) — BOTH are derived
+        // from S (bit 10 of the FIRST halfword).  An earlier draft used bit 9
+        // for I2, which flipped the high offset bit whenever S and bit 9
+        // differed (observed: `f4f7 f000` decoded 4 MiB past binutils'
+        // target).  A second halfword that is not a BL/BLX suffix makes
+        // binutils print the pair UNDEFINED; report it as undefined so the
+        // CFG walk stops instead of calling a garbage address.  Validity
+        // (measured against binutils on a suffix battery): bits15..14 must be
+        // 11, and a BLX suffix (bit12 = 0) must have bit0 clear
+        // (`f000 e7fe` = blx, `f000 e7ff` = not one).
+        let suffix_ok =
+            (h2 & 0xC000) == 0xC000 && ((h2 & 0x1000) != 0 || (h2 & 1) == 0);
+        if !suffix_ok {
+            return Insn {
+                addr,
+                words: vec![h as u32 | ((h2 as u32) << 16)],
+                text: String::new(),
+                kind: Kind::Undef,
+            };
+        }
         let j1 = ((h2 >> 13) & 1) as u32;
         let j2 = ((h2 >> 11) & 1) as u32;
-        let i1 = (!(j1 ^ (((h >> 10) & 1) as u32))) & 1;
-        let i2 = (!(j2 ^ (((h >> 9) & 1) as u32))) & 1;
         let s = ((h >> 10) & 1) as u32;
+        let i1 = (!(j1 ^ s)) & 1;
+        let i2 = (!(j2 ^ s)) & 1;
         let imm10 = (h & 0x3FF) as u32;
         let imm11 = (h2 & 0x7FF) as u32;
         let mut off = (s << 24) | (i1 << 23) | (i2 << 22) | (imm10 << 12) | (imm11 << 1);
@@ -808,21 +828,38 @@ pub fn decode_thumb(h: u16, h2: u16, addr: u32, size: usize) -> Insn {
 
 fn thumb_base(h: u16, addr: u32) -> (String, Kind) {
     // format 1: shift by immediate (bits 15..11 < 0b011; 0b011 is format 2)
+    // A Thumb shift writes Rd = Rm <shift> #imm, which is a MOV with a
+    // shifted operand — NOT an AND/EOR/SUB as an earlier draft modelled it
+    // (`lsls rd, rm, #n` must not read the old rd at all).  Immediate 0
+    // means LSR/ASR #32 (binutils prints the 32) and LSL #0 is the `movs`
+    // alias.  Kind::Dp op 13 = MOV.
     if h & 0xE000 == 0x0000 && (h >> 11) < 3 {
         let op = ((h >> 11) & 3) as u8;
         let imm = ((h >> 6) & 31) as u8;
         let rm = ((h >> 3) & 7) as u8;
         let rd = (h & 7) as u8;
         let names = ["lsls", "lsrs", "asrs"];
-        let amt = if imm == 0 && op > 0 { 32 } else { imm as u32 };
+        if op == 0 && imm == 0 {
+            return (
+                format!("movs r{}, r{}", rd, rm),
+                Kind::Dp {
+                    op: 13,
+                    s: true,
+                    rd,
+                    rn: rd,
+                    src: Operand::Reg { rm, kind: 0, amount: 0, by_reg: false },
+                },
+            );
+        }
+        let amt: u8 = if imm == 0 { 32 } else { imm };
         return (
             format!("{} r{}, r{}, #{}", names[op as usize], rd, rm, amt),
             Kind::Dp {
-                op: [0, 1, 2][op as usize],
+                op: 13,
                 s: true,
                 rd,
                 rn: rd,
-                src: Operand::Reg { rm, kind: op, amount: imm, by_reg: false },
+                src: Operand::Reg { rm, kind: op, amount: amt, by_reg: false },
             },
         );
     }
@@ -873,17 +910,23 @@ fn thumb_base(h: u16, addr: u32) -> (String, Kind) {
         let op = ((h >> 6) & 15) as u8;
         let rm = ((h >> 3) & 7) as u8;
         let rd = (h & 7) as u8;
+        // ARM ARM Thumb format 4 opcode table mapped onto the shared
+        // data-processing op field: the four register-shift forms are MOVs
+        // with a shifted operand (op 13), ADC is op 5 (an earlier draft used
+        // op 4 = ADD, silently dropping the carry), and RSBS with the
+        // implicit #0 is modelled as RSB rd, #0 with rn = Rm so the emitter
+        // computes 0 - Rm.  binutils spells RSBS `negs`.
         let (name, dpop) = match op {
             0 => ("ands", 0u8),
             1 => ("eors", 1u8),
-            2 => ("lsls", 0u8),
-            3 => ("lsrs", 1u8),
-            4 => ("asrs", 2u8),
-            5 => ("adcs", 4u8),
+            2 => ("lsls", 13u8),
+            3 => ("lsrs", 13u8),
+            4 => ("asrs", 13u8),
+            5 => ("adcs", 5u8),
             6 => ("sbcs", 6u8),
-            7 => ("rors", 3u8),
+            7 => ("rors", 13u8),
             8 => ("tst", 8u8),
-            9 => ("rsbs", 3u8),
+            9 => ("negs", 3u8),
             10 => ("cmp", 10u8),
             11 => ("cmn", 11u8),
             12 => ("orrs", 12u8),
@@ -899,7 +942,7 @@ fn thumb_base(h: u16, addr: u32) -> (String, Kind) {
             );
         }
         if matches!(op, 2 | 3 | 4 | 7) {
-            // register-specified shift of Rd
+            // register-specified shift of Rd: mov rd, rd, <shift> rs
             let sk = match op {
                 2 => 0,
                 3 => 1,
@@ -909,12 +952,19 @@ fn thumb_base(h: u16, addr: u32) -> (String, Kind) {
             return (
                 format!("{} r{}, r{}", name, rd, rm),
                 Kind::Dp {
-                    op: dpop,
+                    op: 13,
                     s: true,
                     rd,
                     rn: rd,
                     src: Operand::Reg { rm: rd, kind: sk, amount: rm, by_reg: true },
                 },
+            );
+        }
+        if op == 9 {
+            // negs rd, rm  ==  rsbs rd, rm, #0  ==  rsb rd, rm, #0
+            return (
+                format!("negs r{}, r{}", rd, rm),
+                Kind::Dp { op: 3, s: true, rd, rn: rm, src: Operand::Imm(0) },
             );
         }
         return (
@@ -939,14 +989,24 @@ fn thumb_base(h: u16, addr: u32) -> (String, Kind) {
         if op < 3 {
             let name = ["add", "cmp", "mov"][op as usize];
             let dpop = [4u8, 10, 13][op as usize];
+            // ARM ARM: only CMP (format 5) sets the flags; ADD/MOV with a
+            // high register do not — flag-setting here would clobber the
+            // CPSR before the conditional branch that follows.
+            let s = op == 1;
             return (
-                format!("{} r{}, r{}", name, REGS[rd as usize], REGS[rm as usize]),
-                Kind::Dp { op: dpop, s: true, rd, rn: rd, src: Operand::Reg { rm, kind: 0, amount: 0, by_reg: false } },
+                format!("{} {}, {}", name, REGS[rd as usize], REGS[rm as usize]),
+                Kind::Dp {
+                    op: dpop,
+                    s,
+                    rd,
+                    rn: rd,
+                    src: Operand::Reg { rm, kind: 0, amount: 0, by_reg: false },
+                },
             );
         }
         let blx = h & 0x0080 != 0;
         return (
-            format!("{} r{}", if blx { "blx" } else { "bx" }, REGS[rm as usize]),
+            format!("{} {}", if blx { "blx" } else { "bx" }, REGS[rm as usize]),
             Kind::Bx { rm, link: blx },
         );
     }
@@ -1070,12 +1130,18 @@ fn thumb_base(h: u16, addr: u32) -> (String, Kind) {
             Kind::LdmStm { load, rn: 13, wb: true, list: full, pu: if load { 1 } else { 2 }, s: false },
         );
     }
-    // format 15: multiple load/store
+    // format 15: multiple load/store.  There is no writeback bit: LDMIA/
+    // STMIA always write the base back, EXCEPT that Thumb LDMIA leaves the
+    // loaded value in Rb when Rb is in the register list (melonDS
+    // ARMInterpreter_LoadStore.cpp T_LDMIA line 790 — writeback only when
+    // `!(list & (1<<Rb))`).  An earlier draft read bit 8 (the low bit of
+    // Rb!) as a writeback flag, which disabled writeback for every odd base
+    // register.  binutils prints `!` under exactly the same condition.
     if h & 0xF000 == 0xC000 {
         let rn = ((h >> 8) & 7) as u8;
         let list = (h & 0xFF) as u16;
         let load = h & 0x0800 != 0;
-        let wb = h & 0x0100 == 0;
+        let wb = if load { list & (1 << rn) == 0 } else { true };
         return (
             format!(
                 "{} r{}{}, {}",
@@ -1087,14 +1153,18 @@ fn thumb_base(h: u16, addr: u32) -> (String, Kind) {
             Kind::LdmStm { load, rn, wb, list, pu: 1, s: false },
         );
     }
-    // format 16/17: conditional branch / SWI / undefined
+    // format 16: conditional branch, format 17: UDF (0xDE) / SWI (0xDF).
+    // The two were transposed in an earlier draft: Thumb SWI is 0xDFxx and
+    // UDF is 0xDExx (verified against binutils: `df0b -> svc 11`,
+    // `de10 -> udf #16`), and a Thumb SWI carries its number in bits 7..0 —
+    // which is exactly what FreeBIOS reads with `ldrb r12, [lr, #-2]`.
     if h & 0xF000 == 0xD000 {
         let cond = (h >> 8) & 15;
         if cond == 14 {
-            return (format!("svc #{}", h & 0xFF), Kind::Svc { imm: (h & 0xFF) as u32 });
+            return (format!("udf #{}", h & 0xFF), Kind::Undef);
         }
         if cond == 15 {
-            return ("udf #0".to_string(), Kind::Undef);
+            return (format!("svc {}", h & 0xFF), Kind::Svc { imm: (h & 0xFF) as u32 });
         }
         let off = (h as i8) as i32;
         let target = addr.wrapping_add(4).wrapping_add((off * 2) as u32);
@@ -1164,18 +1234,58 @@ pub fn arm_bx_veneer(addr: u32, rm: usize) -> Option<(u32, bool)> {
     Some((target, target & 1 != 0))
 }
 
-/// `LDR rM, [pc, #imm]` immediately preceding `bx rM`.
+/// `LDR rM, [pc, #imm]` shortly preceding `bx rM` (within up to 4 intervening
+/// unconditional AL instructions that do not write rM).  The immediacy check
+/// alone missed the observed sequence at 0x020062FC
+/// (`ldr ip,[pc,#4]; mov r3,#0; bx ip` -> function pointer 0x020062B0), which
+/// left that function unrecovered and halted the native run.
 pub fn arm_bx_ldr_veneer(addr: u32, rm: usize) -> Option<(u32, bool)> {
-    if addr < 4 {
-        return None;
-    }
-    let prev = lit_value(addr - 4)?;
-    let insn = decode_arm(prev, addr - 4);
-    if let Kind::Mem { load: true, rd, rn: 15, ea, .. } = &insn.kind {
-        if *rd as usize == rm {
-            if let Some(lit) = arm_ldr_pc_target(addr - 4, ea) {
-                return Some(lit);
+    let mut a = addr;
+    for _ in 0..4 {
+        if a < 4 {
+            return None;
+        }
+        a -= 4;
+        let w = lit_value(a)?;
+        let insn = decode_arm(w, a);
+        if let Kind::Mem { load: true, rd, rn: 15, ea, .. } = &insn.kind {
+            if *rd as usize == rm {
+                return arm_ldr_pc_target(a, ea);
             }
+        }
+        // Control flow inside the window: give up (cannot see through it).
+        if matches!(
+            insn.kind,
+            Kind::Bx { .. }
+                | Kind::B { .. }
+                | Kind::BlxImm { .. }
+                | Kind::Svc { .. }
+                | Kind::Undef
+        ) {
+            return None;
+        }
+        // Conditional instructions in the window make the scan unreliable.
+        if (w >> 28) != 0xE {
+            return None;
+        }
+        // Anything that writes rM ends the search.
+        let writes_rm = match &insn.kind {
+            Kind::Dp { rd, .. }
+            | Kind::Mul { rd, .. }
+            | Kind::Clz { rd, .. }
+            | Kind::Mrs { rd, .. }
+            | Kind::Swp { rd, .. } => *rd as usize == rm,
+            Kind::Mem { load, rd, .. } => *load && *rd as usize == rm,
+            Kind::Hw { kind, rd, .. } => {
+                matches!(kind, HwKind::Ldrh | HwKind::Ldrsb | HwKind::Ldrsh | HwKind::Ldrd)
+                    && *rd as usize == rm
+            }
+            Kind::LdmStm { load, list, .. } => *load && (list & (1u16 << rm)) != 0,
+            Kind::Mcr { load, rd, .. } => *load && *rd as usize == rm,
+            _ => false,
+        };
+        if writes_rm {
+            return None;
         }
     }
     None

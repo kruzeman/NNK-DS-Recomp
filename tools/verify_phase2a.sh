@@ -24,6 +24,28 @@ echo "=== A. regression: nnktool disasm vs arm-none-eabi-objdump (4 ranges) ==="
 sh tools/verify_phase1a.sh 2>&1 | sed -n '/=== A\./,/=== B\./p' | grep -E "encoding match|text match|both match|--"
 
 echo
+echo "=== A2. Thumb disasm cross-check: battery + recovered bodies vs llvm-mc/objdump ==="
+# Thumb artifacts (Phase-3A3) live under work/, which is never committed:
+# regenerate the seed table + recovery + dispatch image if they are absent.
+if [ ! -f work/phase3a/arm9_thumb.c ] || [ ! -f work/phase3a/arm9_decompile.txt ]; then
+    python3 tools/mk_thumb_seeds.py work/phase3a/seeds_thumb.tsv
+    $NNK recompile-all $IMG work/phase3a/arm9_thumb.c --base 0x02000000 --entry 0x02000800 --seeds work/phase3a/seeds_thumb.tsv
+    SEEDS=work/phase3a/seeds_thumb.tsv
+    # Phase-3A3 trace-gap seeds: close the recovery holes the boot actually
+    # hits (trace PCs with no dispatch case).  Needs the extended melonDS
+    # ground truth; without it the image keeps its known gaps (honest) and
+    # the rest of the regression still runs.
+    if [ -s "$SCRATCH/melonds_arm9_trace_10m.txt" ]; then
+        python3 tools/mk_trace_seeds.py "$SCRATCH/melonds_arm9_trace_10m.txt" \
+            work/phase3a/arm9_thumb.c work/phase3a/seeds_thumb.tsv work/phase3a/seeds_phase3a3.tsv
+        $NNK recompile-all $IMG work/phase3a/arm9_thumb.c --base 0x02000000 --entry 0x02000800 --seeds work/phase3a/seeds_phase3a3.tsv
+        SEEDS=work/phase3a/seeds_phase3a3.tsv
+    fi
+    $NNK decompile $IMG work/phase3a --base 0x02000000 --entry 0x02000800 --seeds $SEEDS
+fi
+python3 tools/thumb_disasm_check.py
+
+echo
 echo "=== B. seeded recovery from ALL Ghidra function entries ==="
 $NNK decompile $IMG $W --base 0x02000000 --entry 0x02000800 --seeds $GH
 

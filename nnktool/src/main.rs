@@ -690,7 +690,7 @@ fn cmd_recompile_all(
         stats.calls, stats.returns, stats.indirects, stats.dup_cases
     );
     println!(
-        "jump tables expanded: {}; unresolved indirect sites: {}; thumb instructions NOT translated: {}",
+        "jump tables expanded: {}; unresolved indirect sites: {}; thumb instructions translated: {}",
         stats.jump_tables, stats.unresolved_sites, stats.thumb_insns
     );
     if stats.swi_sites == 0 {

@@ -47,10 +47,22 @@ pub struct Func {
 
 impl Func {
     pub fn bytes(&self) -> usize {
-        self.lines
-            .values()
-            .map(|(w, _)| w.len() * 4)
-            .sum()
+        self.lines.values().map(|(w, _)| line_bytes(self.key.mode, w)).sum()
+    }
+}
+
+/// Encoded bytes of one recovered line: ARM words are 4 bytes; a Thumb line
+/// is a halfword, except a BL/BLX pair which occupies one 32-bit slot.
+fn line_bytes(mode: Mode, words: &[u32]) -> usize {
+    match mode {
+        Mode::Arm => words.len() * 4,
+        Mode::Thumb => {
+            if words[0] > 0xFFFF {
+                4
+            } else {
+                2
+            }
+        }
     }
 }
 
@@ -238,6 +250,80 @@ pub fn expand_jump_table(
                 cond_al,
             })
         }
+        Kind::Bx { rm, .. } => {
+            // `blx/bx rT` where rT was just loaded by an indexed table read
+            // `ldr rT, [rN, rI, lsl #2]` whose base rN comes from a
+            // PC-relative literal (observed at 0x02007FCC: dispatch through
+            // the CP15-helper pointer table at 0x02068460).  The site itself
+            // is not a table instruction, so scan back for the index load.
+            let rm = *rm as usize;
+            let mut site: Option<(u32, u8, u8)> = None;
+            let mut seen = 0usize;
+            for (&a, (words, _)) in lines.range(..addr).rev() {
+                if seen >= 8 {
+                    break;
+                }
+                seen += 1;
+                let insn = decode_arm(words[0], a);
+                match &insn.kind {
+                    Kind::Mem {
+                        load: true,
+                        rd,
+                        rn,
+                        ea:
+                            Ea::Reg {
+                                rm: idx,
+                                kind: 0,
+                                amount: 2,
+                                pre: true,
+                                wb: false,
+                                up: true,
+                            },
+                        ..
+                    } if *rd as usize == rm => {
+                        site = Some((a, *rn, *idx));
+                        break;
+                    }
+                    Kind::Dp { rd, .. } | Kind::Mem { load: true, rd, .. }
+                        if *rd as usize == rm =>
+                    {
+                        break;
+                    }
+                    Kind::Bx { .. } | Kind::B { .. } | Kind::BlxImm { .. } => break,
+                    _ => {}
+                }
+            }
+            let (la, rn, idx) = site?;
+            let tbl = reg_def_value(lines, la, rn)?;
+            if tbl < base || tbl >= text_end {
+                return None;
+            }
+            let bound = table_bound(lines, la, idx);
+            let mut slots = Vec::new();
+            for i in 0..bound {
+                let ea = tbl.wrapping_add(4 * i as u32);
+                let Some(t) = lit_at(ea) else { break };
+                if t & 1 != 0 || t < base || t >= text_end || t & 3 != 0 {
+                    break;
+                }
+                slots.push(t);
+            }
+            if slots.is_empty() {
+                return None;
+            }
+            Some(JumpTable {
+                desc: format!(
+                    "blx/bx r{} via indexed table at 0x{:08X} -> table 0x{:08X}, {} targets (bound {})",
+                    rm,
+                    addr,
+                    tbl,
+                    slots.len(),
+                    bound
+                ),
+                slots,
+                cond_al,
+            })
+        }
         _ => None,
     }
 }
@@ -335,14 +421,22 @@ pub fn trace_function(data: &[u8], base: u32, text_end: u32, key: FuncKey, limit
                                 for s in &exp.slots {
                                     work.push(*s);
                                 }
-                                // a conditional indirect still falls through
-                                if exp.cond_al {
-                                    // unconditional: no fall-through
-                                } else if addr.wrapping_add(4) < text_end {
-                                    work.push(addr.wrapping_add(4));
-                                }
                             } else {
                                 f.indirects.push((addr, "indirect branch (unresolved)".into()));
+                            }
+                            // Fall-through recovery for the indirect site:
+                            //  * a link-indirect (`blx rM`) is an indirect CALL —
+                            //    control ALWAYS returns to addr+4, so the return
+                            //    path must be recovered even when the target is
+                            //    resolved (observed: the CP15 dispatch `blx r2`
+                            //    at 0x02007FCC left its `pop {r3, pc}` return at
+                            //    0x02007FD0 unrecovered, halting the run);
+                            //  * a conditional (cond != AL) indirect may fall
+                            //    through (e.g. `popne {..., pc}`).
+                            // Unconditional plain `bx rM` has no fall-through.
+                            let is_call = matches!(insn.kind, Kind::Bx { link: true, .. });
+                            if (is_call || (w >> 28) != 0xE) && addr.wrapping_add(4) < text_end {
+                                work.push(addr.wrapping_add(4));
                             }
                             break;
                         }
@@ -390,6 +484,12 @@ pub fn trace_function(data: &[u8], base: u32, text_end: u32, key: FuncKey, limit
                         Flow::Return => break,
                         Flow::Indirect(_) => {
                             f.indirects.push((addr, "indirect branch (unresolved)".into()));
+                            // Thumb `blx rM` (0x4780 form: bit7 of the
+                            // halfword set) is an indirect CALL — control
+                            // returns to addr+size, so recover that path too.
+                            if (h & 0x00F0) == 0x0080 && addr.wrapping_add(size as u32) < text_end {
+                                work.push(addr.wrapping_add(size as u32));
+                            }
                             break;
                         }
                         Flow::Halt => {
@@ -470,11 +570,19 @@ pub fn missing_seeds(seeds: &[FuncKey], funcs: &BTreeMap<FuncKey, Func>) -> Vec<
 pub fn coverage_bytes(funcs: &BTreeMap<FuncKey, Func>) -> usize {
     let mut covered: BTreeSet<u32> = BTreeSet::new();
     for f in funcs.values() {
+        let step = match f.key.mode {
+            Mode::Arm => 4u32,
+            Mode::Thumb => 2,
+        };
         for (addr, (words, _)) in &f.lines {
-            for i in 0..words.len() {
-                covered.insert(addr + (i as u32) * 4);
+            let units = (line_bytes(f.key.mode, words) as u32) / step;
+            for i in 0..units {
+                covered.insert(addr + i * step);
             }
         }
     }
-    covered.len() * 4
+    // count distinct 4-byte units so a Thumb halfword contributes its
+    // containing word (the reported number stays "instruction bytes")
+    let words: BTreeSet<u32> = covered.iter().map(|a| a & !3).collect();
+    words.len() * 4
 }
