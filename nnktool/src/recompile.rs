@@ -1124,7 +1124,7 @@ pub fn recompile_all(
     ));
     src.push_str(RUNTIME_ALL);
     src.push_str(
-        "static void run(void) {\n    uint32_t pc = ENTRY_CONST;\n    for (;;) {\n        if (++steps > STEP_LIMIT) { halt_reason(\"step budget exhausted\"); return; }\n        switch (pc) {\n",
+        "static void run(void) {\n    uint32_t pc = ENTRY_CONST;\n    for (;;) {\n        if (++steps > STEP_LIMIT) { halt_reason(\"step budget exhausted\"); return; }\n        arm7_evt_tick();\n        switch (pc) {\n",
     );
     for (case, _) in cases.values() {
         src.push_str(case);
@@ -1248,6 +1248,67 @@ static void io_ipcsync_write(uint32_t v) {
 static uint32_t ipc_fifo_cnt = 0;     /* IPCFIFOCNT stored config bits */
 static uint32_t arm9_recv_fifo[16];   /* words ARM9 can pop at 0x04100000 */
 static int arm9_recv_n = 0;
+
+/* ARM7 init-event chain (Phase-4A).  The ARM7's IRQ-driven init posts its
+ * event bits one by one into the shared main-RAM flag word (Main RAM
+ * 4 MiB-mirror offset 0x3FFF8C — the ARM9 polls it at 0x02FFFF8C through
+ * the SDK test_bit subroutine 0x0200BA4C; the loop at 0x0201C4B8 is
+ * wait(13,1) on bit 13 of that word).  The ARM7 is NOT executed here: this
+ * chain is scripted from a measured melonDS capture (the new MELONDS_MEMWATCH_*
+ * hook in melonDS/src/NDS.cpp logs every write to the flag word from either
+ * CPU together with the ARM9 PC-trace index at that moment):
+ *
+ *   a9idx      value      meaning (delta from previous)
+ *   3633523 -> 0x00001000  bit12 (ARM9 spinning at 0x02009B44)
+ *   3633806 -> 0x00003000  bit13 (ARM9 inside test_bit = wait(13,1) iter 2;
+ *                              melonDS exits that loop on iteration 3)
+ *   3635544 -> 0x00013000  +bit16
+ *   3635618 -> 0x00033000  +bit17
+ *   3650209 -> 0x00033080  +bit7   (ARM9 now takes IRQs: pc9=0xFFFF01DC)
+ *   3650651 -> 0x00033880  +bit11
+ *   3650668 -> 0x00037880  +bit14
+ *   3652929 -> 0x000378A0  +bit5
+ *   3654408 -> 0x00037CA0  +bit10
+ *   3768189 -> 0x00037CE0  +bit6   (these four post in one burst while the
+ *   3768189 -> 0x00037EE0  +bit9    melonDS ARM9 sits in its BIOS IRQ
+ *   3768189 -> 0x00037FE0  +bit8    handler, so the measured index is frozen
+ *   3768189 -> 0x00037FF0  +bit4    there; native steps keep counting)
+ *
+ * Clock: this run's `steps` counter, which equals the melonDS ARM9 trace
+ * index throughout the matched prefix (both count one per dispatched guest
+ * instruction).  After the first model-gap divergence the correspondence
+ * degrades — honest and documented (IO_MAP.md). */
+struct Arm7Evt { uint64_t step; uint32_t val; };
+static const struct Arm7Evt arm7_evt_log[] = {
+    {3633523, 0x00001000u},
+    {3633806, 0x00003000u},
+    {3635544, 0x00013000u},
+    {3635618, 0x00033000u},
+    {3650209, 0x00033080u},
+    {3650651, 0x00033880u},
+    {3650668, 0x00037880u},
+    {3652929, 0x000378A0u},
+    {3654408, 0x00037CA0u},
+    {3768189, 0x00037CE0u},
+    {3768189, 0x00037EE0u},
+    {3768189, 0x00037FE0u},
+    {3768189, 0x00037FF0u},
+};
+#define ARM7_EVT_N ((int)(sizeof arm7_evt_log / sizeof arm7_evt_log[0]))
+static int arm7_evt_n = 0;
+/* Called once per dispatch from run(); fast path is one load+compare. */
+static void arm7_evt_tick(void) {
+    if (arm7_evt_n < ARM7_EVT_N && steps >= arm7_evt_log[arm7_evt_n].step) {
+        uint32_t fa = 0x02FFFF8Cu;   /* = MainRAM[0x3FFF8C] in melonDS */
+        uint32_t wv = arm7_evt_log[arm7_evt_n].val;
+        uint8_t *p = gmem + (fa - GBASE);
+        p[0] = (uint8_t)wv; p[1] = (uint8_t)(wv >> 8);
+        p[2] = (uint8_t)(wv >> 16); p[3] = (uint8_t)(wv >> 24);
+        fprintf(stderr, "arm7 evt step=%llu val=0x%08X\n",
+                (unsigned long long)steps, wv);
+        arm7_evt_n++;
+    }
+}
 
 /* Card (SPICNT/ROMCNT/CARD_COMMAND/ROM_DATA). */
 static uint8_t card_cmd[8];

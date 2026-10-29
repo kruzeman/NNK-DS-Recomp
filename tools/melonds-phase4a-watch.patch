@@ -1,0 +1,1088 @@
+diff --git a/src/ARM.cpp b/src/ARM.cpp
+index 3937a994..fde2550c 100644
+--- a/src/ARM.cpp
++++ b/src/ARM.cpp
+@@ -17,6 +17,7 @@
+ */
+ 
+ #include <stdio.h>
++#include <stdlib.h>
+ #include <assert.h>
+ #include <algorithm>
+ #include "NDS.h"
+@@ -34,6 +35,157 @@ namespace melonDS
+ using Platform::Log;
+ using Platform::LogLevel;
+ 
++// ---------------------------------------------------------------------------
++// ARM9 boot PC trace (Ni no Kuni DS static-recompilation verification).
++// Env-gated, interpreter-only, ARM9 (ARMv5) only; completely inactive unless
++// MELONDS_ARM9TRACE_PATH is set:
++//   MELONDS_ARM9TRACE_PATH  output file (unset -> disabled)
++//   MELONDS_ARM9TRACE_N     PCs to log (default 1000)
++//   MELONDS_ARM9TRACE_LO    window start (default 0x02000000)
++//   MELONDS_ARM9TRACE_HI    window end   (default 0x02400000, main RAM)
++//   MELONDS_ARM9TRACE_EXIT  1 = exit(0) once N PCs are logged (default)
++// Format: one "0x%08x" line per executed in-window instruction PC; an
++// executed SWI adds a following "# swi <state> imm=0x<..> at 0x<..>" comment.
++// ---------------------------------------------------------------------------
++namespace ARM9Trace
++{
++static FILE* FP = nullptr;
++static bool Tried = false;
++static long Limit = 1000;
++static long Count = 0;
++static bool ExitAtEnd = true;
++static u32 Lo = 0x02000000;
++static u32 Hi = 0x02400000;
++
++static void Init() noexcept
++{
++    Tried = true;
++    const char* p = getenv("MELONDS_ARM9TRACE_PATH");
++    if (!p || !p[0]) return;
++    FP = fopen(p, "w");
++    if (!FP) return;
++    const char* s;
++    if ((s = getenv("MELONDS_ARM9TRACE_N")))    Limit = atol(s);
++    if ((s = getenv("MELONDS_ARM9TRACE_LO")))   Lo = (u32)strtoul(s, nullptr, 0);
++    if ((s = getenv("MELONDS_ARM9TRACE_HI")))   Hi = (u32)strtoul(s, nullptr, 0);
++    if ((s = getenv("MELONDS_ARM9TRACE_EXIT"))) ExitAtEnd = atoi(s) != 0;
++    if (Limit < 1) Limit = 1;
++    setvbuf(FP, nullptr, _IOLBF, 0);
++    fprintf(FP, "# ARM9 trace window 0x%08X..0x%08X limit %ld\n", Lo, Hi, Limit);
++}
++
++static void PC(u32 addr, u32 instr, bool thumb) noexcept
++{
++    if (!Tried) Init();
++    if (!FP) return;
++    if (addr < Lo || addr >= Hi) return;
++    if (Count >= Limit) return;
++
++    fprintf(FP, "0x%08x\n", addr);
++    bool swi = thumb ? ((instr & 0xFF00) == 0xDF00)
++                     : ((instr & 0x0F000000) == 0x0F000000);
++    if (swi)
++        fprintf(FP, "# swi %s imm=0x%06X at 0x%08x\n", thumb ? "thumb" : "arm",
++                thumb ? (instr & 0xFF) : (instr & 0xFFFFFF), addr);
++
++    if (++Count >= Limit)
++    {
++        fflush(FP);
++        fclose(FP);
++        FP = nullptr;
++        if (ExitAtEnd)
++        {
++            fflush(stderr);
++            exit(0);
++        }
++    }
++}
++}
++
++/* ARM9 PC-trace index at this moment (for MemWatch correlation; 0 if the
++ * trace is not active).  Defined by ARM9Trace, used by NDS.cpp's watch. */
++long ARM9TracePCCount() noexcept { return ARM9Trace::Count; }
++
++/* One-shot ITCM dump: when the ARM9 first EXECUTES code in the ITCM window
++ * (0x01FF8000..0x01FFFFFF) and MELONDS_ITCM_DUMP is set, write the whole
++ * 32 KiB ITCM to that path so the copied code can be disassembled. */
++namespace ITCMDump
++{
++static bool Done = false;
++static void Maybe(u32 addr, const u8 *itcm) noexcept
++{
++    if (Done || addr < 0x01FF8000u || addr >= 0x02000000u) return;
++    Done = true;
++    const char *p = getenv("MELONDS_ITCM_DUMP");
++    if (!p || !p[0]) return;
++    FILE *f = fopen(p, "wb");
++    if (!f) return;
++    fwrite(itcm, 1, 0x8000, f);
++    fclose(f);
++    fprintf(stderr, "ITCMDump: first ITCM exec pc=0x%08X -> %s\n", addr, p);
++}
++}
++
++// ---------------------------------------------------------------------------
++// ARM7 boot PC trace (Ni no Kuni DS static-recompilation verification).
++// Mirror of ARM9Trace for the ARM7 (ARMv4); env-gated, interpreter-only,
++// inactive unless MELONDS_ARM7TRACE_PATH is set:
++//   MELONDS_ARM7TRACE_PATH  output file (unset -> disabled)
++//   MELONDS_ARM7TRACE_N     PCs to log (default 1000000)
++//   MELONDS_ARM7TRACE_LO    window start (default 0x02000000)
++//   MELONDS_ARM7TRACE_HI    window end   (default 0x02400000, main RAM —
++//                           the ARM7 image runs at 0x02380000)
++//   MELONDS_ARM7TRACE_EXIT  1 = exit(0) once N PCs are logged (default 0)
++// Format: one "0x%08x" line per executed in-window instruction PC.
++// ---------------------------------------------------------------------------
++namespace ARM7Trace
++{
++static FILE* FP = nullptr;
++static bool Tried = false;
++static long Limit = 1000000;
++static long Count = 0;
++static bool ExitAtEnd = false;
++static u32 Lo = 0x02000000;
++static u32 Hi = 0x02400000;
++
++static void Init() noexcept
++{
++    Tried = true;
++    const char* p = getenv("MELONDS_ARM7TRACE_PATH");
++    if (!p || !p[0]) return;
++    FP = fopen(p, "w");
++    if (!FP) return;
++    const char* s;
++    if ((s = getenv("MELONDS_ARM7TRACE_N")))    Limit = atol(s);
++    if ((s = getenv("MELONDS_ARM7TRACE_LO")))   Lo = (u32)strtoul(s, nullptr, 0);
++    if ((s = getenv("MELONDS_ARM7TRACE_HI")))   Hi = (u32)strtoul(s, nullptr, 0);
++    if ((s = getenv("MELONDS_ARM7TRACE_EXIT"))) ExitAtEnd = atoi(s) != 0;
++    if (Limit < 1) Limit = 1;
++    setvbuf(FP, nullptr, _IOLBF, 0);
++}
++
++static void PC(u32 addr) noexcept
++{
++    if (!Tried) Init();
++    if (!FP) return;
++    if (addr < Lo || addr >= Hi) return;
++    if (Count >= Limit) return;
++
++    fprintf(FP, "0x%08x\n", addr);
++    if (++Count >= Limit)
++    {
++        fflush(FP);
++        fclose(FP);
++        FP = nullptr;
++        if (ExitAtEnd)
++        {
++            fflush(stderr);
++            exit(0);
++        }
++    }
++}
++}
++
+ #ifdef GDBSTUB_ENABLED
+ void ARM::GdbCheckA()
+ {
+@@ -670,6 +822,8 @@ void ARMv5::Execute()
+                 else             NextInstr[1] = CodeRead32(R[15], false);
+ 
+                 // actually execute
++                // Thumb state: R[15] reads as instruction address + 4 here.
++                ARM9Trace::PC(R[15] - 4, CurInstr, true);
+                 u32 icode = (CurInstr >> 6) & 0x3FF;
+                 ARMInterpreter::THUMBInstrTable[icode](this);
+             }
+@@ -685,6 +839,9 @@ void ARMv5::Execute()
+                 NextInstr[1] = CodeRead32(R[15], false);
+ 
+                 // actually execute
++                // ARM state: R[15] reads as instruction address + 8 here.
++                ARM9Trace::PC(R[15] - 8, CurInstr, false);
++                ITCMDump::Maybe(R[15] - 8, ITCM);
+                 if (CheckCondition(CurInstr >> 28))
+                 {
+                     u32 icode = ((CurInstr >> 4) & 0xF) | ((CurInstr >> 16) & 0xFF0);
+@@ -808,6 +965,7 @@ void ARMv4::Execute()
+                 NextInstr[1] = CodeRead16(R[15]);
+ 
+                 // actually execute
++                ARM7Trace::PC(R[15] - 4);
+                 u32 icode = (CurInstr >> 6);
+                 ARMInterpreter::THUMBInstrTable[icode](this);
+             }
+@@ -823,6 +981,7 @@ void ARMv4::Execute()
+                 NextInstr[1] = CodeRead32(R[15]);
+ 
+                 // actually execute
++                ARM7Trace::PC(R[15] - 8);
+                 if (CheckCondition(CurInstr >> 28))
+                 {
+                     u32 icode = ((CurInstr >> 4) & 0xF) | ((CurInstr >> 16) & 0xFF0);
+diff --git a/src/GPU3D.cpp b/src/GPU3D.cpp
+index 3272a349..87f5533c 100644
+--- a/src/GPU3D.cpp
++++ b/src/GPU3D.cpp
+@@ -17,8 +17,11 @@
+ */
+ 
+ #include <stdio.h>
++#include <stdlib.h>
+ #include <string.h>
++#include <time.h>
+ #include <algorithm>
++#include <vector>
+ #include "NDS.h"
+ #include "GPU.h"
+ #include "FIFO.h"
+@@ -31,6 +34,334 @@ namespace melonDS
+ using Platform::Log;
+ using Platform::LogLevel;
+ 
++// ---------------------------------------------------------------------------
++// GX FIFO command-stream / frame capture (gxrender trace tooling).
++// Controlled by environment variables (all optional):
++//   MELONDS_GXLOG_DIR       output directory; unset -> capture disabled
++//   MELONDS_GXLOG_FRAMES    exit(0) after this many units (0 = run forever)
++//   MELONDS_GXLOG_FBDUMP    1 = dump f%05u.fb per unit (default 1)
++//   MELONDS_GXLOG_FBEVERY   dump the framebuffer every Nth unit (default 1)
++//   MELONDS_GXLOG_TEXEVERY  dump texture memory every Nth unit (default 1)
++//   MELONDS_GXLOG_TEXFROM   first unit to dump texture memory for (default 0)
++//   MELONDS_GXLOG_PACE      cap capture at N units/second (0 = unthrottled)
++//   MELONDS_GXLOG_PRESS     deterministic input schedule, semicolon-separated:
++//                             "1200:keys:fffb"    KEYINPUT mask at unit 1200
++//                             "1300:touch:128,96" touch screen at unit 1300
++//                             "1320:touch:up"     release touch at unit 1320
++//                           events are applied at the VBlank starting that
++//                           unit (unit 0 events at the first VBlank)
++// A "unit" is one emulated frame worth of GX traffic, delimited by VBlank().
++// Record format of f%05u.gx (little-endian):
++//   01 <u32 word>                       raw GX FIFO word
++//   02 <u8 width> <u32 addr> <u32 val>  3D MMIO write (width 1/2/4)
++//   03 <u8 cmd> <u32 param>             direct command-port write (440h-5CCh)
++// f%05u.fb      = 256*192 u32 pixels (r|g<<8|b<<16|a<<24, 6-bit rgb)
++// f%05u.texvram = 512 KiB flat texture VRAM
++// f%05u.texpal  = 128 KiB flat texture palette RAM
++// ---------------------------------------------------------------------------
++namespace GXLog
++{
++
++struct PressEvent
++{
++    int Unit;
++    int Type; // 0 = keys, 1 = touch, 2 = release touch
++    u32 A, B;
++};
++
++static bool Inited = false;
++static bool On = false;
++static char Dir[1024] = {};
++static std::vector<u8> RecBuf;
++static std::vector<PressEvent> Events;
++static size_t NextEvent = 0;
++static bool Injecting = false;
++static int Unit = 0;
++static int PendingFB = -1;
++static long FrameBudget = 0;
++static int FbDump = 1;
++static int FbEvery = 1;
++static int TexEvery = 1;
++static int TexFrom = 0;
++static int TwoDEvery = 0;
++static int TwoDFrom = 0;
++static long Pace = 0;
++// optional dump windows "a-b;c-d" (inclusive unit ranges): when set, ALL
++// per-unit dumps (.fb/.texvram/.texpal/.2d/.scr) are restricted to units in
++// any range; .gx streams always record.  Keeps multi-window validation runs
++// small.  Empty = no restriction (legacy behavior).
++static std::vector<std::pair<long, long>> DumpRanges;
++
++static bool InDumpRanges(long u) noexcept
++{
++    if (DumpRanges.empty()) return true;
++    for (const auto& r : DumpRanges)
++        if (u >= r.first && u <= r.second) return true;
++    return false;
++}
++
++static void Init() noexcept
++{
++    Inited = true;
++    const char* dir = getenv("MELONDS_GXLOG_DIR");
++    if (!dir || !dir[0]) return;
++    snprintf(Dir, sizeof(Dir), "%s", dir);
++    const char* s;
++    if ((s = getenv("MELONDS_GXLOG_FRAMES")))   FrameBudget = atol(s);
++    if ((s = getenv("MELONDS_GXLOG_FBDUMP")))   FbDump = atoi(s);
++    if ((s = getenv("MELONDS_GXLOG_FBEVERY")))  FbEvery = atoi(s) > 0 ? atoi(s) : 1;
++    if ((s = getenv("MELONDS_GXLOG_TEXEVERY"))) TexEvery = atoi(s) > 0 ? atoi(s) : 1;
++    if ((s = getenv("MELONDS_GXLOG_TEXFROM")))  TexFrom = atoi(s);
++    if ((s = getenv("MELONDS_GXLOG_2DEVERY")))  TwoDEvery = atoi(s) > 0 ? atoi(s) : 0;
++    if ((s = getenv("MELONDS_GXLOG_2DFROM")))   TwoDFrom = atoi(s);
++    if ((s = getenv("MELONDS_GXLOG_RANGES")))
++    {
++        char rbuf[1024];
++        snprintf(rbuf, sizeof(rbuf), "%s", s);
++        for (char* tok = strtok(rbuf, ";"); tok; tok = strtok(nullptr, ";"))
++        {
++            long a = 0, b = 0;
++            if (sscanf(tok, "%ld-%ld", &a, &b) == 2 && b >= a)
++                DumpRanges.emplace_back(a, b);
++        }
++    }
++    if ((s = getenv("MELONDS_GXLOG_PACE")))     Pace = atol(s);
++    if ((s = getenv("MELONDS_GXLOG_PRESS")))
++    {
++        char buf[4096];
++        snprintf(buf, sizeof(buf), "%s", s);
++        for (char* tok = strtok(buf, ";"); tok; tok = strtok(nullptr, ";"))
++        {
++            PressEvent ev = {};
++            char kind[16] = {};
++            char arg[64] = {};
++            if (sscanf(tok, "%d:%15[^:]:%63s", &ev.Unit, kind, arg) != 3)
++                continue;
++            if (!strcmp(kind, "keys"))
++            {
++                ev.Type = 0;
++                ev.A = (u32)strtoul(arg, nullptr, 16) & 0xFFF;
++            }
++            else if (!strcmp(kind, "touch"))
++            {
++                if (!strcmp(arg, "up")) ev.Type = 2;
++                else
++                {
++                    unsigned x = 0, y = 0;
++                    if (sscanf(arg, "%u,%u", &x, &y) != 2) continue;
++                    ev.Type = 1;
++                    ev.A = x;
++                    ev.B = y;
++                }
++            }
++            else continue;
++            Events.push_back(ev);
++        }
++        std::stable_sort(Events.begin(), Events.end(),
++            [](const PressEvent& a, const PressEvent& b) { return a.Unit < b.Unit; });
++    }
++    RecBuf.reserve(1 << 20);
++    On = true;
++}
++
++bool Active() noexcept { if (!Inited) Init(); return On; }
++bool InputLocked() noexcept { if (!Inited) Init(); return On && !Events.empty() && !Injecting; }
++int PendingUnit() noexcept { return PendingFB; }
++
++void Word(u32 val) noexcept
++{
++    if (!Active()) return;
++    RecBuf.push_back(0x01);
++    for (int i = 0; i < 4; i++) RecBuf.push_back((u8)(val >> (i * 8)));
++}
++
++void RegWrite(u32 addr, u32 val, int width) noexcept
++{
++    if (!Active()) return;
++    if (addr >= 0x04000440 && addr < 0x040005CC)
++    {
++        if (width != 4) return; // direct ports are 32-bit only
++        RecBuf.push_back(0x03);
++        RecBuf.push_back((u8)((addr & 0x1FC) >> 2));
++        for (int i = 0; i < 4; i++) RecBuf.push_back((u8)(val >> (i * 8)));
++        return;
++    }
++    if (addr != 0x04000060 && addr != 0x04000610 && (addr < 0x04000330 || addr >= 0x040003FF))
++        return; // not render-relevant
++    RecBuf.push_back(0x02);
++    RecBuf.push_back((u8)width);
++    for (int i = 0; i < 4; i++) RecBuf.push_back((u8)(addr >> (i * 8)));
++    for (int i = 0; i < 4; i++) RecBuf.push_back((u8)(val >> (i * 8)));
++}
++
++void CloseUnit(melonDS::NDS& nds) noexcept
++{
++    if (!Active()) return;
++    char path[1200];
++    snprintf(path, sizeof(path), "%s/f%05d.gx", Dir, Unit);
++    FILE* f = fopen(path, "wb");
++    if (f)
++    {
++        if (!RecBuf.empty()) fwrite(RecBuf.data(), 1, RecBuf.size(), f);
++        fclose(f);
++    }
++    RecBuf.clear();
++    PendingFB = Unit;
++    Unit++;
++
++    // input events due at (the VBlank starting) this new unit
++    Injecting = true;
++    while (NextEvent < Events.size() && Events[NextEvent].Unit <= Unit)
++    {
++        const PressEvent& ev = Events[NextEvent++];
++        switch (ev.Type)
++        {
++        case 0: nds.SetKeyMask(ev.A); break;
++        case 1: nds.TouchScreen((u16)ev.A, (u16)ev.B); break;
++        case 2: nds.ReleaseScreen(); break;
++        }
++    }
++    Injecting = false;
++
++    if (Pace > 0)
++    {
++        static long long next = 0;
++        struct timespec ts;
++        clock_gettime(CLOCK_MONOTONIC, &ts);
++        long long now = (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec;
++        if (next == 0) next = now;
++        next += 1000000000LL / Pace;
++        if (next > now)
++        {
++            struct timespec sl;
++            sl.tv_sec = (time_t)((next - now) / 1000000000LL);
++            sl.tv_nsec = (long)((next - now) % 1000000000LL);
++            nanosleep(&sl, nullptr);
++        }
++        else
++            next = now; // fell behind; resync
++    }
++
++    if (FrameBudget > 0 && Unit >= FrameBudget)
++    {
++        fflush(nullptr);
++        exit(0);
++    }
++}
++
++void DumpFramebuffer(const u32* color, int stride, int firstpix, int w, int h) noexcept
++{
++    if (!Active() || !FbDump || PendingFB < 0) return;
++    if (!InDumpRanges(PendingFB)) return;
++    if (FbEvery > 1 && (PendingFB % FbEvery) != 0) return;
++    char path[1200];
++    snprintf(path, sizeof(path), "%s/f%05d.fb", Dir, PendingFB);
++    FILE* f = fopen(path, "wb");
++    if (!f) return;
++    for (int y = 0; y < h; y++)
++        fwrite(&color[firstpix + y * stride], 4, w, f);
++    fclose(f);
++}
++
++void DumpTextureMem(const u8* texvram, u32 texsize, const u8* texpal, u32 palsize) noexcept
++{
++    if (!Active() || PendingFB < 0 || PendingFB < TexFrom) return;
++    if (!InDumpRanges(PendingFB)) return;
++    if (TexEvery > 1 && (PendingFB % TexEvery) != 0) return;
++    char path[1200];
++    snprintf(path, sizeof(path), "%s/f%05d.texvram", Dir, PendingFB);
++    FILE* f = fopen(path, "wb");
++    if (f) { fwrite(texvram, 1, texsize, f); fclose(f); }
++    snprintf(path, sizeof(path), "%s/f%05d.texpal", Dir, PendingFB);
++    f = fopen(path, "wb");
++    if (f) { fwrite(texpal, 1, palsize, f); fclose(f); }
++}
++
++// ---- 2D compositor state + final screens ---------------------------------
++// f%05u.2d container: "GX2D" <u32 ver=1> <u32 unit> <u32 flags> <u32 size>
++//   flags bit0 = keyframe
++//   keyframe payload: <size> raw state bytes
++//   delta payload:    <u32 nruns> { <u32 off> <u32 len> <len bytes> }*
++// The state image layout (little-endian, GX2D_STATE_SIZE bytes) is documented
++// in GX_TRACES.md and mirrored by gxrender/src/gx_2d.h (gx2d_state_load).
++
++static std::vector<u8> Prev2D;
++static bool HavePrev2D = false;
++
++void Dump2D(const void* state, u32 size) noexcept
++{
++    if (!Active() || TwoDEvery <= 0) return;
++    if (PendingFB < 0 || PendingFB < TwoDFrom) return;
++    if (!InDumpRanges(PendingFB)) return;
++    if (TwoDEvery > 1 && (PendingFB % TwoDEvery) != 0) return;
++
++    const u8* src = (const u8*)state;
++    bool keyframe = !HavePrev2D || Prev2D.size() != size;
++    std::vector<u8> payload;
++
++    if (!keyframe)
++    {
++        // one run per maximal contiguous changed region
++        std::vector<u8> body;
++        u32 nruns = 0;
++        u32 i = 0;
++        while (i < size)
++        {
++            if (src[i] == Prev2D[i]) { i++; continue; }
++            u32 start = i;
++            while (i < size && src[i] != Prev2D[i]) i++;
++            u32 len = i - start;
++            for (int b = 0; b < 4; b++) body.push_back((u8)(start >> (b * 8)));
++            for (int b = 0; b < 4; b++) body.push_back((u8)(len >> (b * 8)));
++            body.insert(body.end(), src + start, src + start + len);
++            nruns++;
++        }
++        if (body.size() + 4 > (size * 3) / 4) keyframe = true; // not worth it
++        else
++        {
++            for (int b = 0; b < 4; b++) payload.push_back((u8)(nruns >> (b * 8)));
++            payload.insert(payload.end(), body.begin(), body.end());
++        }
++    }
++    if (keyframe) payload.assign(src, src + size);
++
++    char path[1200];
++    snprintf(path, sizeof(path), "%s/f%05d.2d", Dir, PendingFB);
++    FILE* f = fopen(path, "wb");
++    if (!f) return;
++    u8 hdr[20] = { 'G', 'X', '2', 'D', 1, 0, 0, 0 };
++    u32 unit = (u32)PendingFB, flags = keyframe ? 1 : 0;
++    memcpy(&hdr[8], &unit, 4);
++    memcpy(&hdr[12], &flags, 4);
++    memcpy(&hdr[16], &size, 4);
++    fwrite(hdr, 1, 20, f);
++    if (!payload.empty()) fwrite(payload.data(), 1, payload.size(), f);
++    fclose(f);
++
++    Prev2D.assign(src, src + size);
++    HavePrev2D = true;
++}
++
++void DumpScreens(const void* fb0, const void* fb1) noexcept
++{
++    if (!Active() || TwoDEvery <= 0) return;
++    if (PendingFB < 0 || PendingFB < TwoDFrom) return;
++    if (!InDumpRanges(PendingFB)) return;
++    if (TwoDEvery > 1 && (PendingFB % TwoDEvery) != 0) return;
++    char path[1200];
++    snprintf(path, sizeof(path), "%s/f%05d.scr", Dir, PendingFB);
++    FILE* f = fopen(path, "wb");
++    if (!f) return;
++    fwrite(fb0, 4, 256 * 192, f);
++    fwrite(fb1, 4, 256 * 192, f);
++    fclose(f);
++}
++
++bool TwoDActive() noexcept { return Active() && TwoDEvery > 0; }
++
++}
++
++
+ // 3D engine notes
+ //
+ // vertex/polygon RAM is filled when a complete polygon is defined, after it's been culled and clipped
+@@ -2424,6 +2755,7 @@ bool YSort(Polygon* a, Polygon* b)
+ 
+ void GPU3D::VBlank() noexcept
+ {
++    GXLog::CloseUnit(NDS);
+     if (GeometryEnabled)
+     {
+         if (RenderingEnabled)
+@@ -2510,6 +2842,7 @@ void GPU3D::SetRenderXPos(u16 xpos, u16 mask) noexcept
+ 
+ void GPU3D::WriteToGXFIFO(u32 val) noexcept
+ {
++    GXLog::Word(val);
+     if (NumCommands == 0)
+     {
+         NumCommands = 4;
+@@ -2687,6 +3020,7 @@ void GPU3D::Write8(u32 addr, u8 val) noexcept
+ {
+     if (!RenderingEnabled && addr >= 0x04000320 && addr < 0x04000400) return;
+     if (!GeometryEnabled  && addr >= 0x04000400 && addr < 0x04000700) return;
++    GXLog::RegWrite(addr, val, 1);
+ 
+     switch (addr)
+     {
+@@ -2737,6 +3071,7 @@ void GPU3D::Write16(u32 addr, u16 val) noexcept
+ {
+     if (!RenderingEnabled && addr >= 0x04000320 && addr < 0x04000400) return;
+     if (!GeometryEnabled  && addr >= 0x04000400 && addr < 0x04000700) return;
++    GXLog::RegWrite(addr, val, 2);
+ 
+     switch (addr)
+     {
+@@ -2824,6 +3159,7 @@ void GPU3D::Write32(u32 addr, u32 val) noexcept
+ {
+     if (!RenderingEnabled && addr >= 0x04000320 && addr < 0x04000400) return;
+     if (!GeometryEnabled  && addr >= 0x04000400 && addr < 0x04000700) return;
++    GXLog::RegWrite(addr, val, 4);
+ 
+     switch (addr)
+     {
+diff --git a/src/GPU3D.h b/src/GPU3D.h
+index 73eff2ff..f5f6290e 100644
+--- a/src/GPU3D.h
++++ b/src/GPU3D.h
+@@ -85,6 +85,34 @@ struct Polygon
+ class Renderer3D;
+ class NDS;
+ 
++// --- GX FIFO command-stream / frame capture (gxrender trace tooling) --------
++// Enabled by the MELONDS_GXLOG_DIR environment variable; entirely no-op when
++// that variable is unset.  Records, per emulated frame ("unit", delimited by
++// GPU3D::VBlank): the raw GX FIFO words, 3D MMIO register writes and direct
++// command-port writes, plus the rasterized 3D layer and flat texture memory.
++// Optional deterministic input injection (MELONDS_GXLOG_PRESS) and frame
++// pacing (MELONDS_GXLOG_PACE) support reproducible capture sessions.
++namespace GXLog
++{
++bool Active() noexcept;
++bool InputLocked() noexcept; // true while a MELONDS_GXLOG_PRESS schedule owns input
++int PendingUnit() noexcept; // unit index whose render is in flight, -1 if none
++void Word(u32 val) noexcept; // raw GX FIFO word (WriteToGXFIFO)
++void RegWrite(u32 addr, u32 val, int width) noexcept; // 3D MMIO write
++void CloseUnit(melonDS::NDS& nds) noexcept; // called from GPU3D::VBlank
++void DumpFramebuffer(const u32* color, int stride, int firstpix, int w, int h) noexcept;
++void DumpTextureMem(const u8* texvram, u32 texsize, const u8* texpal, u32 palsize) noexcept;
++// 2D compositor state (MELONDS_GXLOG_2DEVERY/2DFROM): Dump2D() writes the
++// packed GX2D state image (keyframe or delta vs the previous dump) as
++// f%05u.2d; DumpScreens() writes the final composed screens (2 x 256*192
++// u32, post master-brightness 8-bit BGRA) as f%05u.scr.  Both are indexed
++// by the same PendingUnit() slot as f%05u.fb (state at display start of the
++// frame whose inputs are f%05u.fb/.2d, screens at the end of its display).
++void Dump2D(const void* state, u32 size) noexcept;
++void DumpScreens(const void* fb0, const void* fb1) noexcept;
++bool TwoDActive() noexcept; // Active() && MELONDS_GXLOG_2DEVERY set
++}
++
+ class GPU3D
+ {
+ public:
+diff --git a/src/GPU3D_Soft.cpp b/src/GPU3D_Soft.cpp
+index e6202700..6dece380 100644
+--- a/src/GPU3D_Soft.cpp
++++ b/src/GPU3D_Soft.cpp
+@@ -1741,6 +1741,9 @@ void SoftRenderer3D::FinishRendering()
+ {
+     if (RenderThreadRunning.load(std::memory_order_relaxed) && !GPU3D.AbortFrame)
+         Platform::Semaphore_Wait(Sema_RenderDone);
++
++    if (!GPU3D.AbortFrame)
++        GXLog::DumpFramebuffer(ColorBuffer, ScanlineWidth, FirstPixelOffset, 256, 192);
+ }
+ 
+ void SoftRenderer3D::RenderFrame()
+@@ -1751,6 +1754,9 @@ void SoftRenderer3D::RenderFrame()
+     bool textureChanged = GPU.MakeVRAMFlat_TextureCoherent(textureDirty);
+     bool texPalChanged = GPU.MakeVRAMFlat_TexPalCoherent(texPalDirty);
+ 
++    GXLog::DumpTextureMem(GPU.VRAMFlat_Texture, sizeof(GPU.VRAMFlat_Texture),
++                          GPU.VRAMFlat_TexPal, sizeof(GPU.VRAMFlat_TexPal));
++
+     FrameIdentical = !(textureChanged || texPalChanged) && GPU3D.RenderFrameIdentical;
+ 
+     if (RenderThreadRunning.load(std::memory_order_relaxed))
+diff --git a/src/GPU_Soft.cpp b/src/GPU_Soft.cpp
+index 861c1a60..56dd259d 100644
+--- a/src/GPU_Soft.cpp
++++ b/src/GPU_Soft.cpp
+@@ -16,12 +16,145 @@
+     with melonDS. If not, see http://www.gnu.org/licenses/.
+ */
+ 
++#include <string.h>
++#include <vector>
+ #include "NDS.h"
+ #include "GPU_Soft.h"
+ #include "GPU_ColorOp.h"
+ 
++// gxrender 2D-state capture (see gxrender/ref/melonds-2d-log.patch and
++// GX_TRACES.md): declared here instead of GPU3D.h to keep this file's
++// include set unchanged.
+ namespace melonDS
+ {
++namespace GXLog
++{
++void Dump2D(const void* state, u32 size) noexcept;
++void DumpScreens(const void* fb0, const void* fb1) noexcept;
++int PendingUnit() noexcept;
++bool Active() noexcept;
++bool TwoDActive() noexcept;
++}
++}
++
++namespace melonDS
++{
++
++// ---------------------------------------------------------------------------
++// GX2D state image assembly.  Fixed little-endian layout (host is LE),
++// GX2D_STATE_SIZE bytes; mirrored by gxrender/src/gx_2d.h:
++//   0x00000  256  engine A regs block      (layout below)
++//   0x00100  256  engine B regs block
++//   0x00200  512  global regs block
++//   0x00400 2048  palette RAM
++//   0x00C00 2048  OAM
++//   0x01400 512K  VRAMFlat_ABG
++//   0x81400 128K  VRAMFlat_BBG
++//   0xA1400 256K  VRAMFlat_AOBJ
++//   0xE1400 128K  VRAMFlat_BOBJ
++//   0x101400  32K VRAMFlat_ABGExtPal
++//   0x109400  32K VRAMFlat_BBGExtPal
++//   0x111400   8K VRAMFlat_AOBJExtPal
++//   0x113400   8K VRAMFlat_BOBJExtPal
++//   0x115400 512K VRAM_A..D raw banks (VRAM display / capture sources)
++// Engine regs block: +0x00 dispcnt u32, +0x04 bgcnt[4] u16, +0x0C bgxpos[4],
++// +0x14 bgypos[4], +0x1C bgxref[2] s32, +0x24 bgyref[2], +0x2C bgxrefreload[2],
++// +0x34 bgyrefreload[2], +0x3C bgrota[2] s16, +0x40 bgrotb[2], +0x44 bgrotc[2],
++// +0x48 bgrotd[2], +0x4C win0coords[4] u8, +0x50 win1coords[4], +0x54 wincnt[4],
++// +0x58 bgmosaicsize[2], +0x5A objmosaicsize[2], +0x5C blendcnt u16,
++// +0x5E blendalpha u16, +0x60 eva/evb/evy u8, +0x63 win0active, +0x64 win1active.
++// Global block: +0x00 masterbright A/B u16, +0x04 screens_enabled,
++// +0x05 screen_swap, +0x06 engA_enabled, +0x07 engB_enabled, +0x08 VRAMCNT[9],
++// +0x11 VRAMSTAT, +0x12 capture_enable, +0x14 capturecnt u32,
++// +0x18 dispfifobuffer[256] u16.
++// ---------------------------------------------------------------------------
++constexpr u32 GX2D_STATE_SIZE = 0x195400;
++
++static inline void GXP16(u8* p, u16 v) { memcpy(p, &v, 2); }
++static inline void GXP32(u8* p, u32 v) { memcpy(p, &v, 4); }
++
++static void GXLogDumpEngine(u8* dst, const GPU2D& e)
++{
++    GXP32(dst + 0x00, e.DispCnt);
++    for (int i = 0; i < 4; i++) GXP16(dst + 0x04 + i * 2, e.BGCnt[i]);
++    for (int i = 0; i < 4; i++) GXP16(dst + 0x0C + i * 2, e.BGXPos[i]);
++    for (int i = 0; i < 4; i++) GXP16(dst + 0x14 + i * 2, e.BGYPos[i]);
++    for (int i = 0; i < 2; i++) GXP32(dst + 0x1C + i * 4, (u32)e.BGXRef[i]);
++    for (int i = 0; i < 2; i++) GXP32(dst + 0x24 + i * 4, (u32)e.BGYRef[i]);
++    for (int i = 0; i < 2; i++) GXP32(dst + 0x2C + i * 4, (u32)e.BGXRefReload[i]);
++    for (int i = 0; i < 2; i++) GXP32(dst + 0x34 + i * 4, (u32)e.BGYRefReload[i]);
++    for (int i = 0; i < 2; i++) GXP16(dst + 0x3C + i * 2, (u16)e.BGRotA[i]);
++    for (int i = 0; i < 2; i++) GXP16(dst + 0x40 + i * 2, (u16)e.BGRotB[i]);
++    for (int i = 0; i < 2; i++) GXP16(dst + 0x44 + i * 2, (u16)e.BGRotC[i]);
++    for (int i = 0; i < 2; i++) GXP16(dst + 0x48 + i * 2, (u16)e.BGRotD[i]);
++    memcpy(dst + 0x4C, e.Win0Coords, 4);
++    memcpy(dst + 0x50, e.Win1Coords, 4);
++    memcpy(dst + 0x54, e.WinCnt, 4);
++    dst[0x58] = e.BGMosaicSize[0]; dst[0x59] = e.BGMosaicSize[1];
++    dst[0x5A] = e.OBJMosaicSize[0]; dst[0x5B] = e.OBJMosaicSize[1];
++    GXP16(dst + 0x5C, e.BlendCnt);
++    GXP16(dst + 0x5E, e.BlendAlpha);
++    dst[0x60] = e.EVA; dst[0x61] = e.EVB; dst[0x62] = e.EVY;
++    dst[0x63] = e.Win0Active; dst[0x64] = e.Win1Active;
++}
++
++static void GXLogDump2DState(melonDS::GPU& gpu)
++{
++    static std::vector<u8> buf(GX2D_STATE_SIZE);
++    u8* s = buf.data();
++
++    // make all 2D flat views coherent (same dance as SoftRenderer2D::DrawScanline)
++    auto d1 = gpu.VRAMDirty_ABG.DeriveState(gpu.VRAMMap_ABG, gpu);
++    gpu.MakeVRAMFlat_ABGCoherent(d1);
++    auto d2 = gpu.VRAMDirty_BBG.DeriveState(gpu.VRAMMap_BBG, gpu);
++    gpu.MakeVRAMFlat_BBGCoherent(d2);
++    auto d3 = gpu.VRAMDirty_AOBJ.DeriveState(gpu.VRAMMap_AOBJ, gpu);
++    gpu.MakeVRAMFlat_AOBJCoherent(d3);
++    auto d4 = gpu.VRAMDirty_BOBJ.DeriveState(gpu.VRAMMap_BOBJ, gpu);
++    gpu.MakeVRAMFlat_BOBJCoherent(d4);
++    auto d5 = gpu.VRAMDirty_ABGExtPal.DeriveState(gpu.VRAMMap_ABGExtPal, gpu);
++    gpu.MakeVRAMFlat_ABGExtPalCoherent(d5);
++    auto d6 = gpu.VRAMDirty_BBGExtPal.DeriveState(gpu.VRAMMap_BBGExtPal, gpu);
++    gpu.MakeVRAMFlat_BBGExtPalCoherent(d6);
++    auto d7 = gpu.VRAMDirty_AOBJExtPal.DeriveState(&gpu.VRAMMap_AOBJExtPal, gpu);
++    gpu.MakeVRAMFlat_AOBJExtPalCoherent(d7);
++    auto d8 = gpu.VRAMDirty_BOBJExtPal.DeriveState(&gpu.VRAMMap_BOBJExtPal, gpu);
++    gpu.MakeVRAMFlat_BOBJExtPalCoherent(d8);
++
++    memset(s, 0, GX2D_STATE_SIZE);
++    GXLogDumpEngine(s + 0x00000, gpu.GPU2D_A);
++    GXLogDumpEngine(s + 0x00100, gpu.GPU2D_B);
++
++    u8* g = s + 0x00200;
++    GXP16(g + 0x00, gpu.MasterBrightnessA);
++    GXP16(g + 0x02, gpu.MasterBrightnessB);
++    g[0x04] = gpu.ScreensEnabled ? 1 : 0;
++    g[0x05] = gpu.ScreenSwap ? 1 : 0;
++    g[0x06] = gpu.GPU2D_A.Enabled ? 1 : 0;
++    g[0x07] = gpu.GPU2D_B.Enabled ? 1 : 0;
++    memcpy(g + 0x08, gpu.VRAMCNT, 9);
++    g[0x11] = gpu.VRAMSTAT;
++    g[0x12] = gpu.CaptureEnable ? 1 : 0;
++    GXP32(g + 0x14, gpu.CaptureCnt);
++    memcpy(g + 0x18, gpu.DispFIFOBuffer, 256 * 2);
++
++    memcpy(s + 0x00400, gpu.Palette, 2 * 1024);
++    memcpy(s + 0x00C00, gpu.OAM, 2 * 1024);
++    memcpy(s + 0x01400, gpu.VRAMFlat_ABG, 512 * 1024);
++    memcpy(s + 0x81400, gpu.VRAMFlat_BBG, 128 * 1024);
++    memcpy(s + 0xA1400, gpu.VRAMFlat_AOBJ, 256 * 1024);
++    memcpy(s + 0xE1400, gpu.VRAMFlat_BOBJ, 128 * 1024);
++    memcpy(s + 0x101400, gpu.VRAMFlat_ABGExtPal, 32 * 1024);
++    memcpy(s + 0x109400, gpu.VRAMFlat_BBGExtPal, 32 * 1024);
++    memcpy(s + 0x111400, gpu.VRAMFlat_AOBJExtPal, 8 * 1024);
++    memcpy(s + 0x113400, gpu.VRAMFlat_BOBJExtPal, 8 * 1024);
++    memcpy(s + 0x115400, gpu.VRAM_A, 128 * 1024);
++    memcpy(s + 0x135400, gpu.VRAM_B, 128 * 1024);
++    memcpy(s + 0x155400, gpu.VRAM_C, 128 * 1024);
++    memcpy(s + 0x175400, gpu.VRAM_D, 128 * 1024);
++
++    GXLog::Dump2D(s, GX2D_STATE_SIZE);
++}
+ 
+ SoftRenderer::SoftRenderer(melonDS::NDS& nds)
+     : Renderer(nds.GPU)
+@@ -155,6 +288,15 @@ void SoftRenderer::DrawScanline(u32 line)
+             dstB[i] = 0xFF000000;
+         }
+     }
++
++    // gxrender capture: 2D compositor state at display start (line 0), final
++    // composed screens at display end (line 191); same PendingUnit() slot as
++    // f%05u.fb (the 3D layer displayed by this frame).
++    if (!GXLog::TwoDActive()) return;
++    if (line == 0)
++        GXLogDump2DState(GPU);
++    else if (line == 191)
++        GXLog::DumpScreens(Framebuffer[BackBuffer][0], Framebuffer[BackBuffer][1]);
+ }
+ 
+ void SoftRenderer::DrawSprites(u32 line)
+diff --git a/src/NDS.cpp b/src/NDS.cpp
+index c6dc85fa..74e60935 100644
+--- a/src/NDS.cpp
++++ b/src/NDS.cpp
+@@ -33,6 +33,12 @@
+ #include "Wifi.h"
+ #include "AREngine.h"
+ #include "Platform.h"
++
++// GX FIFO capture tooling (see gxrender/ref/melonds-gxfifo-log.patch): while a
++// MELONDS_GXLOG_PRESS schedule is active it owns all emulated input, so the
++// frontend's per-frame SetKeyMask/TouchScreen/ReleaseScreen calls must not
++// clobber the injected state.
++namespace GXLog { bool InputLocked() noexcept; }
+ #include "FreeBIOS.h"
+ #include "Args.h"
+ #include "version.h"
+@@ -49,6 +55,106 @@ namespace melonDS
+ {
+ using namespace Platform;
+ 
++#include <stdlib.h>
++
++// ---------------------------------------------------------------------------
++// ARM9 IO bus trace (Ni no Kuni DS static-recompilation verification).
++// Env-gated, completely inactive unless MELONDS_IOTRACE_PATH is set:
++//   MELONDS_IOTRACE_PATH  output file (unset -> disabled)
++//   MELONDS_IOTRACE_N     accesses to log (default 200000)
++// Format: one line per ARM9 IO bus access (0x04000000..0x04FFFFFF):
++//   R8|R16|R32 0x<addr> 0x<value> pc=0x<ARM9 PC-8/-4>
++//   W8|W16|W32 0x<addr> 0x<value> pc=0x<...>
++// The PC is the executed instruction (R[15]-8 ARM state / R[15]-4 Thumb),
++// same convention as the ARM9 PC trace hook in ARM.cpp.
++// ---------------------------------------------------------------------------
++namespace ARM9IOTrace
++{
++static FILE* FP = nullptr;
++static bool Tried = false;
++static long Limit = 200000;
++static long Count = 0;
++
++static inline bool Active() noexcept
++{
++    if (!Tried)
++    {
++        Tried = true;
++        const char* p = getenv("MELONDS_IOTRACE_PATH");
++        if (p && p[0])
++        {
++            FP = fopen(p, "w");
++            const char* s;
++            if (FP && (s = getenv("MELONDS_IOTRACE_N"))) Limit = atol(s);
++            if (Limit < 1) Limit = 1;
++            if (FP) setvbuf(FP, nullptr, _IOLBF, 0);
++        }
++    }
++    return FP != nullptr;
++}
++
++static void Log(const char* rw, u32 addr, u32 val, u32 pc) noexcept
++{
++    if (!Active()) return;
++    if (Count >= Limit) return;
++    fprintf(FP, "%s 0x%08X 0x%08X pc=0x%08X\n", rw, addr, val, pc);
++    if (++Count >= Limit) { fflush(FP); fclose(FP); FP = nullptr; }
++}
++}
++
++// ---------------------------------------------------------------------------
++// Shared main-RAM flag watch (Ni no Kuni DS static-recompilation verification).
++// Logs any write that lands on the top of main RAM (4 MiB-mirror offset
++// 0x3FFF80..0x3FFFB0 — the SDK IPC event-mask words at 0x3FFF88/0x3FFF8C,
++// seen by the ARM9 at 0x02FFFF88 and by the ARM7 at 0x027FFF88). Env-gated:
++//   MELONDS_MEMWATCH_PATH  output file (unset -> disabled)
++//   MELONDS_MEMWATCH_N     writes to log (default 4096)
++// Format: W8|W16|W32 cpu=<9|7> 0x<guest addr> 0x<value> pc=0x<cpu PC>
++// ---------------------------------------------------------------------------
++extern long ARM9TracePCCount() noexcept;   /* ARM.cpp — ARM9 trace index */
++namespace MemWatch
++{
++static FILE* FP = nullptr;
++static bool Tried = false;
++static long Limit = 4096;
++static long Count = 0;
++
++static inline bool Active() noexcept
++{
++    if (!Tried)
++    {
++        Tried = true;
++        const char* p = getenv("MELONDS_MEMWATCH_PATH");
++        if (p && p[0])
++        {
++            FP = fopen(p, "w");
++            const char* s;
++            if (FP && (s = getenv("MELONDS_MEMWATCH_N"))) Limit = atol(s);
++            if (Limit < 1) Limit = 1;
++            if (FP) setvbuf(FP, nullptr, _IOLBF, 0);
++        }
++    }
++    return FP != nullptr;
++}
++
++static inline bool Hit(u32 addr)
++{
++    u32 off = addr & 0x003FFFFF;
++    if (off >= 0x003FFF80 && off <= 0x003FFFB0) return true; /* flag words */
++    if (addr >= 0x01FF8000u && addr < 0x02000000u) return true; /* ITCM */
++    return false;
++}
++
++static void Log(const char* cpu, int bits, u32 addr, u32 val, u32 pc7, u32 pc9) noexcept
++{
++    if (!FP) return;
++    if (Count >= Limit) return;
++    fprintf(FP, "W%d cpu=%s 0x%08X 0x%08X pc7=0x%08X pc9=0x%08X a9idx=%ld\n",
++            bits, cpu, addr, val, pc7, pc9, ARM9TracePCCount());
++    if (++Count >= Limit) { fflush(FP); fclose(FP); FP = nullptr; }
++}
++}
++
+ const s32 kMaxIterationCycles = 64;
+ const s32 kIterationCycleMargin = 8;
+ 
+@@ -1164,11 +1270,13 @@ void NDS::CancelEvent(u32 id)
+ 
+ void NDS::TouchScreen(u16 x, u16 y)
+ {
++    if (GXLog::InputLocked()) return;
+     SPI.GetTSC()->SetTouchCoords(x, y);
+ }
+ 
+ void NDS::ReleaseScreen()
+ {
++    if (GXLog::InputLocked()) return;
+     SPI.GetTSC()->SetTouchCoords(0x000, 0xFFF);
+ }
+ 
+@@ -1205,6 +1313,7 @@ void NDS::CheckKeyIRQ(u32 cpu, u32 oldkey, u32 newkey)
+ 
+ void NDS::SetKeyMask(u32 mask)
+ {
++    if (GXLog::InputLocked()) return;
+     u32 key_lo = mask & 0x3FF;
+     u32 key_hi = (mask >> 10) & 0x3;
+ 
+@@ -1997,7 +2106,9 @@ u8 NDS::ARM9Read8(u32 addr)
+ 
+     case 0x04000000:
+         // Specifically want to call the NDS version, not a subclass
+-        return NDS::ARM9IORead8(addr);
++        { u8 _v = NDS::ARM9IORead8(addr);
++          ARM9IOTrace::Log("R8", addr, _v, ARM9.R[15] - ((ARM9.CPSR & 0x20) ? 4 : 8));
++          return _v; }
+ 
+     case 0x05000000:
+         if (!(PowerControl9 & ((addr & 0x400) ? (1<<9) : (1<<1)))) return 0;
+@@ -2057,7 +2168,9 @@ u16 NDS::ARM9Read16(u32 addr)
+         }
+ 
+     case 0x04000000:
+-        return NDS::ARM9IORead16(addr);
++        { u16 _v = NDS::ARM9IORead16(addr);
++          ARM9IOTrace::Log("R16", addr, _v, ARM9.R[15] - ((ARM9.CPSR & 0x20) ? 4 : 8));
++          return _v; }
+ 
+     case 0x05000000:
+         if (!(PowerControl9 & ((addr & 0x400) ? (1<<9) : (1<<1)))) return 0;
+@@ -2117,7 +2230,9 @@ u32 NDS::ARM9Read32(u32 addr)
+         }
+ 
+     case 0x04000000:
+-        return NDS::ARM9IORead32(addr);
++        { u32 _v = NDS::ARM9IORead32(addr);
++          ARM9IOTrace::Log("R32", addr, _v, ARM9.R[15] - ((ARM9.CPSR & 0x20) ? 4 : 8));
++          return _v; }
+ 
+     case 0x05000000:
+         if (!(PowerControl9 & ((addr & 0x400) ? (1<<9) : (1<<1)))) return 0;
+@@ -2157,6 +2272,9 @@ u32 NDS::ARM9Read32(u32 addr)
+ 
+ void NDS::ARM9Write8(u32 addr, u8 val)
+ {
++    if (MemWatch::Active() && MemWatch::Hit(addr))
++        MemWatch::Log("9", 8, addr, val, ARM7.R[15] - ((ARM7.CPSR & 0x20) ? 4 : 8), ARM9.R[15] - ((ARM9.CPSR & 0x20) ? 4 : 8));
++
+     switch (addr & 0xFF000000)
+     {
+     case 0x02000000:
+@@ -2173,6 +2291,7 @@ void NDS::ARM9Write8(u32 addr, u8 val)
+         return;
+ 
+     case 0x04000000:
++        ARM9IOTrace::Log("W8", addr, val, ARM9.R[15] - ((ARM9.CPSR & 0x20) ? 4 : 8));
+         NDS::ARM9IOWrite8(addr, val);
+         return;
+ 
+@@ -2196,6 +2315,9 @@ void NDS::ARM9Write8(u32 addr, u8 val)
+ 
+ void NDS::ARM9Write16(u32 addr, u16 val)
+ {
++    if (MemWatch::Active() && MemWatch::Hit(addr))
++        MemWatch::Log("9", 16, addr, val, ARM7.R[15] - ((ARM7.CPSR & 0x20) ? 4 : 8), ARM9.R[15] - ((ARM9.CPSR & 0x20) ? 4 : 8));
++
+     addr &= ~0x1;
+ 
+     switch (addr & 0xFF000000)
+@@ -2214,6 +2336,7 @@ void NDS::ARM9Write16(u32 addr, u16 val)
+         return;
+ 
+     case 0x04000000:
++        ARM9IOTrace::Log("W16", addr, val, ARM9.R[15] - ((ARM9.CPSR & 0x20) ? 4 : 8));
+         NDS::ARM9IOWrite16(addr, val);
+         return;
+ 
+@@ -2256,6 +2379,9 @@ void NDS::ARM9Write16(u32 addr, u16 val)
+ 
+ void NDS::ARM9Write32(u32 addr, u32 val)
+ {
++    if (MemWatch::Active() && MemWatch::Hit(addr))
++        MemWatch::Log("9", 32, addr, val, ARM7.R[15] - ((ARM7.CPSR & 0x20) ? 4 : 8), ARM9.R[15] - ((ARM9.CPSR & 0x20) ? 4 : 8));
++
+     addr &= ~0x3;
+ 
+     switch (addr & 0xFF000000)
+@@ -2274,6 +2400,7 @@ void NDS::ARM9Write32(u32 addr, u32 val)
+         return;
+ 
+     case 0x04000000:
++        ARM9IOTrace::Log("W32", addr, val, ARM9.R[15] - ((ARM9.CPSR & 0x20) ? 4 : 8));
+         NDS::ARM9IOWrite32(addr, val);
+         return;
+ 
+@@ -2552,6 +2679,9 @@ u32 NDS::ARM7Read32(u32 addr)
+ 
+ void NDS::ARM7Write8(u32 addr, u8 val)
+ {
++    if (MemWatch::Active() && MemWatch::Hit(addr))
++        MemWatch::Log("7", 8, addr, val, ARM7.R[15] - ((ARM7.CPSR & 0x20) ? 4 : 8), ARM9.R[15] - ((ARM9.CPSR & 0x20) ? 4 : 8));
++
+     switch (addr & 0xFF800000)
+     {
+     case 0x02000000:
+@@ -2609,6 +2739,9 @@ void NDS::ARM7Write8(u32 addr, u8 val)
+ 
+ void NDS::ARM7Write16(u32 addr, u16 val)
+ {
++    if (MemWatch::Active() && MemWatch::Hit(addr))
++        MemWatch::Log("7", 16, addr, val, ARM7.R[15] - ((ARM7.CPSR & 0x20) ? 4 : 8), ARM9.R[15] - ((ARM9.CPSR & 0x20) ? 4 : 8));
++
+     addr &= ~0x1;
+ 
+     switch (addr & 0xFF800000)
+@@ -2679,6 +2812,9 @@ void NDS::ARM7Write16(u32 addr, u16 val)
+ 
+ void NDS::ARM7Write32(u32 addr, u32 val)
+ {
++    if (MemWatch::Active() && MemWatch::Hit(addr))
++        MemWatch::Log("7", 32, addr, val, ARM7.R[15] - ((ARM7.CPSR & 0x20) ? 4 : 8), ARM9.R[15] - ((ARM9.CPSR & 0x20) ? 4 : 8));
++
+     addr &= ~0x3;
+ 
+     switch (addr & 0xFF800000)
