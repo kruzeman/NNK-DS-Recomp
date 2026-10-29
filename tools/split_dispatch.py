@@ -85,11 +85,38 @@ def die(msg) -> NoReturn:
     sys.exit(1)
 
 
+def strip_comment(line):
+    """Remove a trailing ``/* ... */`` or ``// ...`` comment from one line.
+
+    The prelude's declarators carry comments that contain parentheses (e.g.
+    ``static uint32_t n, z, c, v;  /* CPSR NZCV (single-bank model) */``).
+    ``declaration_for`` must not mistake such a paren for a function's
+    parameter list: doing so truncated the line at the comment's ``)`` and
+    emitted an unterminated ``/*`` into nnk_rt.h, commenting out every
+    following declaration.  Comments are therefore stripped BEFORE the
+    function/variable decision.  Output text is unaffected (only analysis
+    uses the stripped copy)."""
+    out, i, n = [], 0, len(line)
+    while i < n:
+        if line.startswith("//", i):
+            break
+        if line.startswith("/*", i):
+            j = line.find("*/", i + 2)
+            if j < 0:                      # comment runs past EOL: drop rest
+                break
+            i = j + 2
+            out.append(" ")
+            continue
+        out.append(line[i])
+        i += 1
+    return "".join(out)
+
+
 def declared_names(line):
     """Names declared by a column-0 ``static`` line (crude but precise
     enough: identifiers followed by ``[``, ``(``, ``=``, ``,``, ``;`` or EOL).
     Multi-declarator lines and two-statics-per-line both work."""
-    body = line[len("static "):]
+    body = strip_comment(line[len("static "):])
     return [m.group(1) for m in STATIC_NAME_RE.finditer(body)
             if m.group(1) not in KEYWORDS]
 
@@ -104,7 +131,7 @@ def declaration_for(name, lines, static_names):
             continue
         if name not in static_names.get(i, ()):
             continue
-        text = line[len("static "):]
+        text = strip_comment(line[len("static "):])
         if text.startswith("inline "):
             text = text[len("inline "):]
         if "(" in text:
