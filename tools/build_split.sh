@@ -5,6 +5,13 @@
 #
 # usage: tools/build_split.sh [output-binary]
 #
+# INVOCATION (Phase-4L): this script is bash, not POSIX sh.  Run it directly
+# (`tools/build_split.sh out/split/arm9_gx`, respecting the shebang) or as
+# `bash tools/build_split.sh ...`.  It also re-execs itself under bash when it
+# is started by a POSIX shell (`sh tools/build_split.sh`), because `set -o
+# pipefail` and `[[ ]]` are bash-only and dash dies on them with
+# "set: Illegal option -o pipefail".
+#
 # WHY: nnktool recompile-all emits ONE C program whose run() carries a single
 # flat switch (pc) with one case per translated instruction — 73,120 cases /
 # 23.6 MB / 634,616 lines for the current Phase-3A Thumb image.  cc needs
@@ -53,6 +60,13 @@
 # Every flag set is hashed into the per-TU cache key (the exact cc command
 # line is part of it), so flipping guest flags recompiles only the parts and
 # flipping runtime flags recompiles only nnk_main.c.
+# ---- re-exec under bash when started by a POSIX shell ---------------------
+# `sh tools/build_split.sh` (dash) dies on `set -o pipefail` below; bash-only
+# constructs are used throughout, so hand off instead of half-running.
+if [ -z "${BASH_VERSION:-}" ]; then
+  exec bash "$0" "$@"
+fi
+
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 

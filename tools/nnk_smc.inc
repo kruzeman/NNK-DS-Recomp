@@ -54,6 +54,7 @@ static unsigned long long smc_nhit;       /* compiled generation found stale */
 static unsigned long long smc_ninsn;      /* instructions re-decoded */
 static unsigned long long smc_nhalt;      /* unsupported live instruction */
 static unsigned long long smc_nfb;        /* state fallback taken */
+static unsigned long long smc_nany;       /* Phase-4L: decode-on-demand hits */
 static int smc_trace_left;                /* NNK_SMC_TRACE budget */
 
 /* Emitted next to the dispatch image by tools/split_dispatch.py.  A mono
@@ -152,8 +153,8 @@ static void smc_stats(void) {
     int i, shown = 0;
     if (!smc_armed) return;
     fprintf(stderr, "smc: probes=%llu stale=%llu redecoded=%llu halts=%llu "
-            "state_fallbacks=%llu\n",
-            smc_ntry, smc_nhit, smc_ninsn, smc_nhalt, smc_nfb);
+            "state_fallbacks=%llu on_demand=%llu\n",
+            smc_ntry, smc_nhit, smc_ninsn, smc_nhalt, smc_nfb, smc_nany);
     for (i = 0; i < (int)SMC_BAND_N && shown < 12; i++) {
         if (!smc_gen[i]) continue;
         fprintf(stderr, "smc: band 0x%08X gen=%u redecoded=%u\n",
@@ -792,6 +793,54 @@ int nnk_smc_try(uint32_t *pcp) {
                 "state=%s gen=%u -> 0x%08X\n",
                 (unsigned long long)steps, pc, iw, w, thumb ? "thumb" : "arm",
                 smc_gen[o >> SMC_BAND_SHIFT], npc);
+    }
+    *pcp = npc;
+    return 1;
+}
+
+/* ---- Phase-4L: decode-on-demand for PCs with no compiled case ------------
+ * The generation-0 image carries exactly the recompiled PC set (the recovery
+ * roots).  A PC that melonDS executes but the roots never reached — measured
+ * case: 0x0215C034, the `ldmfd sp!,{pc}` tail of the arena routine at
+ * 0x0215C014, reached only after 13.2M ARM9 instructions — arrives at the
+ * dispatch default with rc==0.  nnk_smc_try() cannot help there: it requires
+ * a generation-0 word at the PC (smc_img_word) before it will re-decode, and
+ * an unrooted PC has none.
+ *
+ * This hook decodes the LIVE word unconditionally (ARM first, Thumb fallback,
+ * the same decoder the generation tracker uses) and executes it in place.
+ * Returns 1 when executed (pc updated), 0 when the word decodes as neither
+ * mode — the caller then halts with the honest "untranslated pc" report, so a
+ * genuine data-as-code jump still stops the run instead of running wild.
+ * Main-RAM window only (0x02000000..0x03800000), like nnk_smc_try. */
+int nnk_smc_exec_any(uint32_t *pcp) {
+    uint32_t pc = *pcp, o, w, npc = 0, cost = 0;
+    int thumb, rc;
+
+    if ((pc & 0xFF000000u) != GBASE) return 0;
+    o = pc & 0x3FFFFFu;
+    if (o + 4u > GSIZE) return 0;
+    w = (uint32_t)gmem[o] | ((uint32_t)gmem[o + 1u] << 8) |
+        ((uint32_t)gmem[o + 2u] << 16) | ((uint32_t)gmem[o + 3u] << 24);
+    smc_ntry++;
+    smc_nany++;
+    trace_pc(pc);
+    thumb = nnk_pc_is_thumb(pc);
+    rc = thumb ? smc_exec_thumb(pc, &npc, &cost) : smc_exec_arm(pc, w, &npc, &cost);
+    if (!rc && thumb) {
+        rc = smc_exec_arm(pc, w, &npc, &cost);
+        if (rc) { smc_nfb++; thumb = 0; }
+    } else if (!rc && !thumb && (pc & 1u) == 0u) {
+        rc = smc_exec_thumb(pc, &npc, &cost);
+        if (rc) { smc_nfb++; thumb = 1; }
+    }
+    if (!rc) return 0;
+    smc_ninsn++;
+    card_tick(cost);
+    if (smc_trace_left > 0) {
+        smc_trace_left--;
+        fprintf(stderr, "smc: on-demand step=%llu pc=0x%08X word=0x%08X state=%s -> 0x%08X\n",
+                (unsigned long long)steps, pc, w, thumb ? "thumb" : "arm", npc);
     }
     *pcp = npc;
     return 1;

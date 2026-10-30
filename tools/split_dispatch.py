@@ -495,6 +495,14 @@ def main():
         fh.write("            }\n")
         fh.write("            if (rc == 1) continue;\n")
         fh.write("            if (rc == 2) return;\n")
+        # Phase-4L: decode-on-demand.  The generation-0 image only carries the
+        # recompiled PC set (the recovery roots); a PC that melonDS executes
+        # but the roots never reached (measured: 0x0215C034, the tail of the
+        # arena routine at 0x0215C014) lands here with rc==0.  Decode the LIVE
+        # word instead of halting — the same decoder the SMC generation
+        # tracker uses (tools/nnk_smc.inc); it returns 0 only when the word
+        # does not decode as ARM or Thumb, and then the run halts honestly.
+        fh.write("            if (nnk_smc_exec_any(&pc)) continue;\n")
         fh.write('            fprintf(stderr, "untranslated pc=0x%08x\\n", pc);\n')
         fh.write('            halt_reason("dispatch to untranslated pc");\n')
         fh.write("            return;\n")
