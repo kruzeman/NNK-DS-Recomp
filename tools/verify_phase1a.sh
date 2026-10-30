@@ -1,8 +1,10 @@
 #!/bin/sh
 # Phase-1A acceptance verification (Ni no Kuni DS ARM9).
 # Rebuilds nnktool, re-runs every acceptance check, prints one summary per check.
+# Runs against the checkout this script lives in (Phase-4L), not a fixed path;
+# a worktree reaches the main checkout's work/ tree through the `work` symlink.
 set -e
-cd /home/hermes/NiNoKuni
+cd "$(dirname "$0")/.."
 NNK=nnktool/target/release/nnktool
 
 echo "=== build ==="

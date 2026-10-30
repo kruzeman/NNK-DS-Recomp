@@ -2107,8 +2107,14 @@ static uint32_t io_dispstat_read(void) {
 static void io_do_dma(int i) {
     uint32_t cnt = dma_cnt[i];
     if (!(cnt & 0x80000000u)) return;
-    uint32_t timing = (cnt >> 24) & 3u;
-    if (timing != 0u) return;                /* vblank/hblank DMA: trigger on demand elsewhere */
+    uint32_t timing = (cnt >> 27) & 7u;      /* Phase-4L: ARM9 field is bits 27..29
+                                              * (melonDS DMA::WriteCnt StartMode);
+                                              * bits 24/26 are the source-address
+                                              * control / 32-bit size flags, so the
+                                              * old `(cnt >> 24) & 3` misread e.g.
+                                              * 0x85000018 (immediate, 32-bit, fixed
+                                              * source) as a timed transfer. */
+    if (timing != 0u) return;                /* vblank/hblank: tools/nnk_dma.inc */
     uint32_t count = cnt & 0x7FFFu; if (!count) count = 0x8000u;
     int words = (cnt & (1u << 30)) != 0u;    /* bit30: word(1)/half(0) — approximate */
     uint32_t s = dma_sad[i], d = dma_dad[i];

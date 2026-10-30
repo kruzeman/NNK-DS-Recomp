@@ -5,8 +5,14 @@
 #
 #   sh tools/verify_phase2a.sh
 #
+# The script runs against ITS OWN checkout: it cd's to the repo root derived
+# from its own path (Phase-4L), so a worktree run tests that worktree's code
+# instead of the main checkout's.  Guest images and traces still live in the
+# main checkout's gitignored work/ tree, which a worktree reaches through the
+# `work` symlink (`ln -s /home/hermes/NiNoKuni/work work`).
 set -e
-cd /home/hermes/NiNoKuni
+cd "$(dirname "$0")/.."
+[ -d work ] || { echo "missing ./work (symlink it: ln -s /home/hermes/NiNoKuni/work work)" >&2; exit 2; }
 NNK=nnktool/target/release/nnktool
 W=work/phase2a
 IMG=work/ghidra_src/arm9.bin
