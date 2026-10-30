@@ -323,3 +323,40 @@ melonDS ground-truth hooks added for this phase:
 * `tools/add_memwatch_window.py <lo> <hi>` — extra MemWatch main-RAM window
   (logs the writing CPU, its PC and the ARM9 PC-trace index), on top of
   `tools/melonds-phase4a-watch.patch`.
+
+## 11. Phase-4C2: BIOS boot-state seed — the 3,638,594 divergence closed
+
+The first divergence after Phase-4C (index 3,638,594) was **not** a missing
+alias but missing *content*: at `0x02016FBC` the guest reads 0x02FFFE80
+(main-RAM 0x3FFE80) and needs the cartridge-header word at ROM offset 0x80
+(0x1D12663C) to be non-zero, because the DS BIOS copies the first 0x200 bytes
+of the cart header to main RAM 0x027FFE00 (ARM9 boot params) before entry.
+The runtime starts at the ARM9 entry and never ran that copy, so the guest
+read 0 and took the `popeq` path at 0x02016FC4.
+
+`RUNTIME_ALL` now seeds that state in `bios_boot_seed()` (called from
+`guest_init()` after `io_load_rom()`):
+
+* 0x027FFE00 ← 0x200 bytes of the ROM loaded for the card server
+  (`NNK_ROM_PATH`), with header bytes 0x160..0x1BF zeroed — measured: the
+  melonDS pre-entry block equals `ROM[0..0x200]` byte-for-byte except offset
+  0x1BC (ROM 0x60, BIOS 0). No ROM bytes are stored in the source.
+* the 20 non-zero BIOS/firmware boot-param words (0x027FF800 WifiFlash chip id
+  pair, 0x027FFC00..0x027FFCE4 firmware user settings) measured pre-entry
+  from melonDS.
+
+Provenance/regeneration: `tools/mk_bios_bootparams.py --memwatch <dump>
+--rom <rom.nds>` replays a `add_memwatch_window.py` dump, checks the
+header-copy model against the ROM and prints the `bios_bootparam[]`
+initialiser.
+
+Strict prefix (melonDS capture 10M PCs): 3,635,491 (Phase-4B) →
+3,638,594 (Phase-4C) → **3,638,915** (Phase-4C2). New first divergence at
+3,638,915: melonDS 0x02016B4C vs native 0x02016B3C — the cart model completes
+a ROM command instantly, so ROMCTRL (0x040001A4) reports DRQ (bit 23) on the
+first poll, while melonDS schedules `ROMTransfer_ReceiveData` after
+`cmddelay = 8 + (ROMCnt & 0x1FFF) + ((ROMCnt >> 16) & 0x3F)` cycles
+(NDSCart.cpp) and raises bit 23 only then; the guest's DRQ loop at
+0x02016B30 polls **909** times in melonDS before data appears. Cart transfer
+latency, not cart data — still open.
+
