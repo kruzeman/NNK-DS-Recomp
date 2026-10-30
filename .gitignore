@@ -39,3 +39,7 @@ __pycache__/
 *~
 
 worktrees/
+
+# Phase-4G: build-state symlinks into the main checkout are not tracked
+/work
+/nnktool/target
