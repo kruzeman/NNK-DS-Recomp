@@ -570,8 +570,19 @@ fn emit_insn(
                 rd
             ));
         }
-        Kind::Mcr { load, rd, .. } => {
-            if *load {
+        Kind::Mcr { load, coproc, rd, crn, crm, opc2, .. } => {
+            // CP15 (p15) TCM configuration is modelled: melonDS keys its
+            // register file on id = (crn<<8)|(crm<<4)|opc2 (ARMInterpreter
+            // MCR/MRC), and the ITCM/DTCM routing in ld*/st* depends on it.
+            // Other coprocessors keep the legacy 0 read / no-op write.
+            if *coproc == 15 {
+                let id = ((*crn as u32) << 8) | ((*crm as u32) << 4) | (*opc2 as u32);
+                if *load {
+                    body.push(format!("r[{}] = cp15_read(0x{:03X}u);", rd, id));
+                } else {
+                    body.push(format!("cp15_write(0x{:03X}u, r[{}]);", id, rd));
+                }
+            } else if *load {
                 body.push(format!("r[{}] = cp15_reg;", rd));
             } else {
                 body.push("/* mcr: no-op in this CP15 model */".into());
@@ -1124,7 +1135,7 @@ pub fn recompile_all(
     ));
     src.push_str(RUNTIME_ALL);
     src.push_str(
-        "static void run(void) {\n    uint32_t pc = ENTRY_CONST;\n    for (;;) {\n        if (++steps > STEP_LIMIT) { halt_reason(\"step budget exhausted\"); return; }\n        arm7_evt_tick();\n        switch (pc) {\n",
+        "static void run(void) {\n    uint32_t pc = ENTRY_CONST;\n    for (;;) {\n        if (++steps > step_limit) { halt_reason(\"step budget exhausted\"); return; }\n        arm7_evt_tick();\n        switch (pc) {\n",
     );
     for (case, _) in cases.values() {
         src.push_str(case);
@@ -1168,6 +1179,87 @@ static uint64_t traced;
 static uint64_t distinct_pcs;
 static uint64_t hle_hits;
 static uint32_t last_pc;
+
+/* ---- CP15 TCM model (Phase-4B, melonDS CP15.cpp semantics) ---------------
+ * ITCM: control bit18 + size register 0x911 -> ITCMSize = 0x200 <<
+ * ((setting>>1)&0x1F).  melonDS routes EVERY access with addr < ITCMSize to
+ * ITCM[addr & 0x7FFF] — one check covering both the 0x00000000 mirror and
+ * the 0x01FF8000..0x01FFFFFF window; the measured BIOS size word 0x20 gives
+ * ITCMSize = 0x02000000 exactly, so the window maps 1:1 while main RAM
+ * (0x02000000+) stays outside it.  DTCM: control bit16 + base register
+ * 0x910; size = max(0x200 << ((setting>>1)&0x1F), 0x1000); an access hits
+ * DTCM when (addr & mask) == base (the disabled base 0xFFFFFFFF can never
+ * match, so the same expression works with TCMs off).
+ *
+ * The native run starts at the ARM9 entry point 0x02000800, SKIPPING the
+ * ARM9 BIOS, so the BIOS's post-init CP15 configuration is the INITIAL state
+ * here — measured with the MELONDS_CP15TRACE hook (tools/add_cp15trace.py):
+ *   control 0x00052078 -> stored masked 0x00052000 (ITCM+DTCM on)
+ *   0x911 = 0x00000020 -> ITCMSize 0x02000000
+ *   0x910 = 0x0300000A -> DTCM base 0x03000000 size 16 KiB
+ * The boot stub then re-programs both TCMs at 0x02000A84..0x02000B28
+ * through cp15_write() below, exactly as melonDS sees them.  Cache/TLB/PU
+ * CP15 writes stay no-ops (this runtime models neither). */
+#define ITCM_LO 0x01FF8000u
+#define ITCM_HI 0x02000000u
+#define ITCM_PHYS 0x8000u
+#define DTCM_PHYS 0x4000u
+static uint8_t itcm[ITCM_PHYS];
+static uint8_t dtcm[DTCM_PHYS];
+static uint32_t cp15_control = 0x00052000u;
+static uint32_t cp15_dtcm_setting = 0x0300000Au;
+static uint32_t cp15_itcm_setting = 0x00000020u;
+static uint32_t itcm_size = 0;
+static uint32_t dtcm_base = 0xFFFFFFFFu;
+static uint32_t dtcm_mask = 0;
+static void cp15_update_tcm(void) {
+    if (cp15_control & (1u << 18))
+        itcm_size = 0x200u << ((cp15_itcm_setting >> 1) & 0x1Fu);
+    else
+        itcm_size = 0;
+    if (cp15_control & (1u << 16)) {
+        uint32_t s = 0x200u << ((cp15_dtcm_setting >> 1) & 0x1Fu);
+        if (s < 0x1000u) s = 0x1000u;
+        dtcm_mask = 0xFFFFF000u & ~(s - 1u);
+        dtcm_base = cp15_dtcm_setting & dtcm_mask;
+    } else {
+        dtcm_base = 0xFFFFFFFFu;
+        dtcm_mask = 0;
+    }
+}
+static uint32_t cp15_read(uint32_t id) {
+    switch (id) {
+    case 0x100: return cp15_control;
+    case 0x910: return cp15_dtcm_setting;
+    case 0x911: return cp15_itcm_setting;
+    default: return 0;
+    }
+}
+static void cp15_write(uint32_t id, uint32_t val) {
+    switch (id) {
+    case 0x100:
+        cp15_control = (cp15_control & ~0x000FF085u) | (val & 0x000FF085u);
+        cp15_update_tcm();
+        fprintf(stderr, "cp15 W id=0x%03X val=0x%08X pc=0x%08X -> control=0x%08X itcm_size=0x%08X dtcm_base=0x%08X dtcm_mask=0x%08X\n",
+                id, val, last_pc, cp15_control, itcm_size, dtcm_base, dtcm_mask);
+        return;
+    case 0x910:
+        cp15_dtcm_setting = val & 0xFFFFF03Eu;
+        cp15_update_tcm();
+        fprintf(stderr, "cp15 W id=0x%03X val=0x%08X pc=0x%08X -> dtcm_base=0x%08X dtcm_mask=0x%08X\n",
+                id, val, last_pc, dtcm_base, dtcm_mask);
+        return;
+    case 0x911:
+        cp15_itcm_setting = val & 0x0000003Eu;
+        cp15_update_tcm();
+        fprintf(stderr, "cp15 W id=0x%03X val=0x%08X pc=0x%08X -> itcm_size=0x%08X\n",
+                id, val, last_pc, itcm_size);
+        return;
+    default:
+        /* cache/TLB/PU CP15 writes: no guest-visible effect in this model. */
+        return;
+    }
+}
 
 #ifndef TRACE_LIMIT
 #define TRACE_LIMIT 4000000ull
@@ -1323,7 +1415,15 @@ static uint32_t dispstat = 0, dispcnt = 0;
 static uint32_t ime = 0, ie = 0, iflags = 0;
 static uint32_t tm_reload[4], tm_ctrl[4], tm_val[4];
 static uint32_t dma_sad[4], dma_dad[4], dma_cnt[4];
-static uint32_t exmemcnt = 0, powerctl = 0; static uint8_t postflg = 1;
+static uint32_t exmemcnt = 0xE880u, powerctl = 0; static uint8_t postflg = 1;
+/* exmemcnt initial value = the ARM9 BIOS's pre-entry EXMEMCNT state,
+ * measured as the first EXMEMCNT read-back before any guest write
+ * (melonDS IO trace: R16 0x04000204 0x0000E880 pc=0x02006268); melonDS's
+ * Reset value alone is 0x6000, so the BIOS writes this before entry.  The
+ * runtime starts at the entry point, so the value is initial state here.
+ * With it, the guest's read-modify-write EXMEMCNT sequence (0xE880 ->
+ * 0xE800 -> 0xE80C -> 0x680C -> ...) reproduces melonDS's exactly, and the
+ * GBA-slot open-bus decay derived from bits 3..2 matches at every read. */
 static uint32_t div_num_lo = 0, div_num_hi = 0, div_den_lo = 0, div_den_hi = 0;
 static uint32_t div_ctrl = 0, div_quot = 0, div_rem = 0;
 static uint32_t sqrt_in_lo = 0, sqrt_in_hi = 0, sqrt_ctrl = 0, sqrt_res = 0;
@@ -1367,36 +1467,110 @@ static uint32_t io_read32(uint32_t a);
 static void io_write32(uint32_t a, uint32_t v);
 static void halt_reason(const char *msg);
 
+/* GBA slot bus (Phase-4B): no GBA cart is attached, so reads follow
+ * melonDS's empty-slot open-bus (GBACart.cpp GBACartSlot::ROMRead):
+ *   halfword = ((addr >> 1) & 0xFFFF) | decay,  decay = openbus[(EXMEMCNT
+ *   >> 2) & 3],  openbus[] = {0xFE08, 0x0000, 0x0000, 0xFFFF} (NDS.cpp),
+ * and EXMEMCNT bit7 (=1: ARM7 owns the slot) fills the deselected CPU's
+ * reads with 0 (melonDS ARM9Read8/16/32, "deselected CPU is 00h-filled").
+ * Measured for this boot: at the ITCM DMA1 halfword fill from 0x08000080
+ * (melonDS IO trace: W32 0x040000BC=0x08000080 / 0x040000C0=0x0206F500 /
+ * 0x040000C4=0x80000020 at pc9=0x01FF84C8..0x01FF84D0, EXMEMCNT still
+ * 0x680C per R16 0x04000204 pc=0x0201C5D8) the slot reads 0xFFFF, which is
+ * the fill value that later flows 0x0206F500..0x0206F53E -> 0x02FFFC30 and
+ * gates the 0x0201C198 wait — an unmapped-0 read there deadlocked the run. */
+static const uint32_t gba_openbus_tbl[4] = { 0xFE08u, 0u, 0u, 0xFFFFu };
+static inline int is_gba_rom(uint32_t a) {
+    return (a & 0xFF000000u) == 0x08000000u || (a & 0xFF000000u) == 0x09000000u;
+}
+static inline int is_gba_ram(uint32_t a) { return (a & 0xFF000000u) == 0x0A000000u; }
+static inline uint32_t gba_bus16(uint32_t a) {
+    if (exmemcnt & (1u << 7)) return 0;
+    return ((a >> 1) & 0xFFFFu) | gba_openbus_tbl[(exmemcnt >> 2) & 3u];
+}
+
+/* Guest accessors.  TCM routing comes FIRST, in melonDS's data-path order
+ * (CP15.cpp DataRead32/DataWrite32: ITCM, then DTCM, then the bus — IO and the
+ * flat window are "the bus" here): an ITCM hit lands in itcm[addr & 0x7FFF],
+ * a DTCM hit in dtcm[addr & 0x3FFF].  With TCMs disabled the checks can
+ * never match (itcm_size == 0; dtcm_base == 0xFFFFFFFF), so unmapped low
+ * addresses keep reading 0 / dropping writes as before. */
 static inline uint32_t ld32(uint32_t a) {
+    if (a < itcm_size) {
+        const uint8_t *p = itcm + (a & (ITCM_PHYS - 1u));
+        return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+    }
+    if ((a & dtcm_mask) == dtcm_base) {
+        const uint8_t *p = dtcm + (a & (DTCM_PHYS - 1u));
+        return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+    }
+    if (is_gba_rom(a)) return gba_bus16(a) | (gba_bus16(a + 2u) << 16);
+    if (is_gba_ram(a)) return (exmemcnt & (1u << 7)) ? 0u : 0xFFFFFFFFu;
     if (a >= IO_LO && a < IO_HI) return io_read32(a);
     if (a < GBASE || (uint64_t)a + 4u > (uint64_t)GBASE + GSIZE) return 0;
     const uint8_t *p = gmem + (a - GBASE);
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 static inline void st32(uint32_t a, uint32_t v) {
+    if (a < itcm_size) {
+        uint8_t *p = itcm + (a & (ITCM_PHYS - 1u));
+        p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
+        return;
+    }
+    if ((a & dtcm_mask) == dtcm_base) {
+        uint8_t *p = dtcm + (a & (DTCM_PHYS - 1u));
+        p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
+        return;
+    }
     if (a >= IO_LO && a < IO_HI) { io_write32(a, v); return; }
     if (a < GBASE || (uint64_t)a + 4u > (uint64_t)GBASE + GSIZE) return;
     uint8_t *p = gmem + (a - GBASE);
     p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
 }
 static inline uint32_t ld16(uint32_t a) {
+    if (a < itcm_size) {
+        const uint8_t *p = itcm + (a & (ITCM_PHYS - 1u));
+        return (uint32_t)p[0] | ((uint32_t)p[1] << 8);
+    }
+    if ((a & dtcm_mask) == dtcm_base) {
+        const uint8_t *p = dtcm + (a & (DTCM_PHYS - 1u));
+        return (uint32_t)p[0] | ((uint32_t)p[1] << 8);
+    }
+    if (is_gba_rom(a)) return gba_bus16(a);
+    if (is_gba_ram(a)) return (exmemcnt & (1u << 7)) ? 0u : 0xFFFFu;
     if (a >= IO_LO && a < IO_HI) return io_read16(a);
     if (a < GBASE || (uint64_t)a + 2u > (uint64_t)GBASE + GSIZE) return 0;
     const uint8_t *p = gmem + (a - GBASE);
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8);
 }
 static inline void st16(uint32_t a, uint16_t v) {
+    if (a < itcm_size) {
+        uint8_t *p = itcm + (a & (ITCM_PHYS - 1u));
+        p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8);
+        return;
+    }
+    if ((a & dtcm_mask) == dtcm_base) {
+        uint8_t *p = dtcm + (a & (DTCM_PHYS - 1u));
+        p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8);
+        return;
+    }
     if (a >= IO_LO && a < IO_HI) { io_write16(a, v); return; }
     if (a < GBASE || (uint64_t)a + 2u > (uint64_t)GBASE + GSIZE) return;
     uint8_t *p = gmem + (a - GBASE);
     p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8);
 }
 static inline uint32_t ld8(uint32_t a) {
+    if (a < itcm_size) return itcm[a & (ITCM_PHYS - 1u)];
+    if ((a & dtcm_mask) == dtcm_base) return dtcm[a & (DTCM_PHYS - 1u)];
+    if (is_gba_rom(a)) return (gba_bus16(a & ~1u) >> ((a & 1u) * 8)) & 0xFFu;
+    if (is_gba_ram(a)) return (exmemcnt & (1u << 7)) ? 0u : 0xFFu;
     if (a >= IO_LO && a < IO_HI) return io_read8(a);
     if (a < GBASE || (uint64_t)a + 1u > (uint64_t)GBASE + GSIZE) return 0;
     return gmem[a - GBASE];
 }
 static inline void st8(uint32_t a, uint32_t v) {
+    if (a < itcm_size) { itcm[a & (ITCM_PHYS - 1u)] = (uint8_t)v; return; }
+    if ((a & dtcm_mask) == dtcm_base) { dtcm[a & (DTCM_PHYS - 1u)] = (uint8_t)v; return; }
     if (a >= IO_LO && a < IO_HI) { io_write8(a, v); return; }
     if (a < GBASE || (uint64_t)a + 1u > (uint64_t)GBASE + GSIZE) return;
     gmem[a - GBASE] = (uint8_t)v;
@@ -1509,7 +1683,11 @@ static void io_write32(uint32_t a, uint32_t v) {
         fprintf(stderr, "io: unscripted IPCFIFO request 0x%08X at pc=0x%08X\n", v, last_pc);
         return;
     }
-    case 0x04000204: exmemcnt = v; return;
+    case 0x04000204:
+        exmemcnt = v;
+        fprintf(stderr, "io: EXMEMCNT=0x%08X pc=0x%08X gba_decay=0x%04X\n",
+                v, last_pc, gba_openbus_tbl[(v >> 2) & 3u]);
+        return;
     case 0x04000208: ime = v & 1u; return;
     case 0x04000210: ie = v; return;
     case 0x04000214: iflags &= ~v; return;
@@ -1672,11 +1850,30 @@ static void debug_dump(uint32_t pc) {
             (int)n, (int)z, (int)c, (int)v);
 }
 
+/* First-execution ITCM snapshot (Phase-4B): the loader's copy into ITCM is
+ * what the pre-translated ITCM cases execute, so the runtime must prove the
+ * bytes it holds are the bytes melonDS executed.  Logged unconditionally;
+ * NNK_ITCM_DUMP=<path> writes the 32 KiB array at that moment for a
+ * byte-compare against the melonDS MELONDS_ITCM_DUMP capture. */
+static int itcm_dumped;
+static void itcm_dump_once(uint32_t pc) {
+    if (itcm_dumped || pc < ITCM_LO || pc >= ITCM_HI) return;
+    itcm_dumped = 1;
+    fprintf(stderr, "itcm: first dispatch pc=0x%08X itcm_size=0x%08X\n", pc, itcm_size);
+    const char *p = getenv("NNK_ITCM_DUMP");
+    if (!p || !p[0]) return;
+    FILE *f = fopen(p, "wb");
+    if (f) { fwrite(itcm, 1, ITCM_PHYS, f); fclose(f);
+             fprintf(stderr, "itcm: dumped to %s\n", p); }
+    else fprintf(stderr, "itcm: cannot open %s\n", p);
+}
+
 static void trace_pc(uint32_t pc) {
     last_pc = pc;
     cycles++;                       /* coarse timing: ~1 cycle per instruction */
     checkpoint_dump(pc);
     debug_dump(pc);
+    itcm_dump_once(pc);
     if (traced < TRACE_LIMIT) printf("0x%08x\n", pc);
     traced++;
     if (pc >= IMAGE_LOAD) {
@@ -1804,7 +2001,7 @@ static int hle_swi(uint32_t imm24, uint32_t at, int thumb) {
     }
 }
 
-static void guest_init(void) { memset(r, 0, sizeof r); n = z = c = v = 0; io_load_rom(); }
+static void guest_init(void) { memset(r, 0, sizeof r); n = z = c = v = 0; cp15_update_tcm(); io_load_rom(); }
 "##;
 
 const RUNTIME_ALL_MAIN: &str = r##"int main(int argc, char **argv) {
