@@ -430,7 +430,7 @@ def main():
         fh.write("            }\n")
         fh.write("            if (rc == 1) continue;\n")
         fh.write("            if (rc == 2) return;\n")
-        fh.write('            fprintf(stderr, "untranslated pc=0x%%08x\\n", pc);\n')
+        fh.write('            fprintf(stderr, "untranslated pc=0x%08x\\n", pc);\n')
         fh.write('            halt_reason("dispatch to untranslated pc");\n')
         fh.write("            return;\n")
         fh.write("        }\n")
