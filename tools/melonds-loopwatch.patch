@@ -1,0 +1,486 @@
+diff --git a/src/ARM.cpp b/src/ARM.cpp
+index 3937a994..9056bba4 100644
+--- a/src/ARM.cpp
++++ b/src/ARM.cpp
+@@ -17,6 +17,8 @@
+ */
+ 
+ #include <stdio.h>
++#include <stdarg.h>
++#include <stdlib.h>
+ #include <assert.h>
+ #include <algorithm>
+ #include "NDS.h"
+@@ -34,6 +36,408 @@ namespace melonDS
+ using Platform::Log;
+ using Platform::LogLevel;
+ 
++// ---------------------------------------------------------------------------
++// ARM9 boot PC trace (Ni no Kuni DS static-recompilation verification).
++// Env-gated, interpreter-only, ARM9 (ARMv5) only; completely inactive unless
++// MELONDS_ARM9TRACE_PATH is set:
++//   MELONDS_ARM9TRACE_PATH  output file (unset -> disabled)
++//   MELONDS_ARM9TRACE_N     PCs to log (default 1000)
++//   MELONDS_ARM9TRACE_LO    window start (default 0x02000000)
++//   MELONDS_ARM9TRACE_HI    window end   (default 0x02400000, main RAM)
++//   MELONDS_ARM9TRACE_EXIT  1 = exit(0) once N PCs are logged (default)
++// Format: one "0x%08x" line per executed in-window instruction PC; an
++// executed SWI adds a following "# swi <state> imm=0x<..> at 0x<..>" comment.
++// ---------------------------------------------------------------------------
++// IRQ trace (Ni no Kuni Phase-4C): env-gated, inactive unless
++// MELONDS_IRQTRACE_PATH is set.  Declared here (ARM.cpp owns the ARM9 trace
++// counter); NDS.cpp logs SetIRQ through IRQTrace::LogSetIRQ.
++namespace IRQTrace
++{
++static FILE* FP = nullptr;
++static bool Tried = false;
++static long Limit = 100000;
++static long Count = 0;
++static void Init() noexcept
++{
++    Tried = true;
++    const char* p = getenv("MELONDS_IRQTRACE_PATH");
++    if (!p || !p[0]) return;
++    FP = fopen(p, "w");
++    if (!FP) return;
++    setvbuf(FP, nullptr, _IOLBF, 0);
++    const char* s;
++    if ((s = getenv("MELONDS_IRQTRACE_N"))) Limit = atol(s);
++}
++static inline bool Active() noexcept { if (!Tried) Init(); return FP != nullptr; }
++static inline void Log(const char* fmt, ...) noexcept
++{
++    if (!Active()) return;
++    if (Count >= Limit) return;
++    va_list ap; va_start(ap, fmt);
++    vfprintf(FP, fmt, ap);
++    va_end(ap);
++    Count++;
++}
++}
++
++// RegProbe (Ni no Kuni Phase-4C): env-gated register dump at selected PCs.
++// MELONDS_REGPROBE_PATH names the output file; MELONDS_REGPROBE_PCS is a
++// comma-separated PC list.  Inactive unless both are set.
++namespace RegProbe
++{
++static FILE* FP = nullptr;
++static bool Tried = false;
++static int  NPc = 0;
++static u32  Pcs[32];
++static long Limit = 200;
++static long Count = 0;
++/* Phase-4F: memory capture.  MELONDS_REGPROBE_MEM is an
++ * "addr:len[,addr:len...]" list (up to 4); MELONDS_REGPROBE_MEM_PATH names the
++ * output file (hexdump per hit, read through the ARM9 data path so DTCM hits
++ * work).  MELONDS_REGPROBE_EXIT_PC + MELONDS_REGPROBE_EXIT_HIT (1-based,
++ * default 1) make the emulator exit() right after logging that hit, which pins
++ * a capture to a specific call instead of the first one. */
++static FILE* MFP = nullptr;
++static int   NMem = 0;
++static u32   MemAddr[4];
++static u32   MemLen[4];
++static u32   ExitPc = 0;
++static long  ExitHit = 1;
++static long  ExitSeen = 0;
++
++static void Init() noexcept
++{
++    Tried = true;
++    const char* p = getenv("MELONDS_REGPROBE_PATH");
++    if (!p || !p[0]) return;
++    const char* l = getenv("MELONDS_REGPROBE_PCS");
++    if (!l || !l[0]) return;
++    FP = fopen(p, "w");
++    if (!FP) return;
++    setvbuf(FP, nullptr, _IOLBF, 0);
++    const char* q = l;
++    while (*q && NPc < 32)
++    {
++        while (*q == ' ' || *q == ',') q++;
++        if (!*q) break;
++        Pcs[NPc++] = (u32)strtoul(q, (char**)&q, 0);
++    }
++    const char* n;
++    if ((n = getenv("MELONDS_REGPROBE_N"))) Limit = atol(n);
++    if ((n = getenv("MELONDS_REGPROBE_EXIT_PC"))) ExitPc = (u32)strtoul(n, nullptr, 0);
++    if ((n = getenv("MELONDS_REGPROBE_EXIT_HIT"))) ExitHit = atol(n);
++    if (ExitHit < 1) ExitHit = 1;
++    const char* m = getenv("MELONDS_REGPROBE_MEM");
++    const char* mp = getenv("MELONDS_REGPROBE_MEM_PATH");
++    if (m && m[0] && mp && mp[0])
++    {
++        MFP = fopen(mp, "w");
++        if (MFP) setvbuf(MFP, nullptr, _IOLBF, 0);
++        const char* q = m;
++        while (*q && NMem < 4)
++        {
++            while (*q == ' ' || *q == ',') q++;
++            if (!*q) break;
++            u32 a = (u32)strtoul(q, (char**)&q, 0);
++            while (*q == ' ' || *q == ':') q++;
++            u32 l = (u32)strtoul(q, (char**)&q, 0);
++            MemAddr[NMem] = a;
++            MemLen[NMem] = l ? l : 0x100;
++            NMem++;
++        }
++    }
++    fprintf(FP, "# regprobe %d pcs mem %d exitpc=0x%08X exithit=%ld\n",
++            NPc, NMem, ExitPc, ExitHit);
++}
++
++/* Hexdump each configured range through the ARM9 data path (CP15::DataRead8
++ * routes ITCM/DTCM first, then the bus), so both the DTCM argument block and
++ * main-RAM structures read back exactly as the guest sees them. */
++static void DumpMem(ARMv5* cpu, u32 pc) noexcept
++{
++    if (!MFP) return;
++    fprintf(MFP, "hit %ld pc=0x%08X\n", Count + 1, pc);
++    for (int r = 0; r < NMem; r++)
++    {
++        fprintf(MFP, "range 0x%08X len 0x%X\n", MemAddr[r], MemLen[r]);
++        for (u32 off = 0; off < MemLen[r]; off += 16)
++        {
++            fprintf(MFP, "0x%08X:", MemAddr[r] + off);
++            for (u32 i = 0; i < 16 && (off + i) < MemLen[r]; i++)
++            {
++                u32 v = 0;
++                cpu->DataRead8(MemAddr[r] + off + i, &v);
++                fprintf(MFP, " %02X", v & 0xFF);
++            }
++            fprintf(MFP, "\n");
++        }
++    }
++    fflush(MFP);
++}
++
++static void Log(u32* R, u32 cpsr, u32* svc, u32* irq, u32 pc, ARMv5* cpu) noexcept
++{
++    if (!Tried) Init();
++    if (!FP) return;
++    if (Count >= Limit) return;
++    bool want = false;
++    for (int i = 0; i < NPc; i++) if (Pcs[i] == pc) { want = true; break; }
++    if (!want) return;
++    fprintf(FP, "reg pc=0x%08X cpsr=0x%08X", pc, cpsr);
++    for (int i = 0; i < 15; i++) fprintf(FP, " r%d=0x%08X", i, R[i]);
++    fprintf(FP, " svc_sp=0x%08X svc_lr=0x%08X svc_spsr=0x%08X irq_sp=0x%08X irq_lr=0x%08X irq_spsr=0x%08X\n",
++            svc[0], svc[1], svc[2], irq[0], irq[1], irq[2]);
++    DumpMem(cpu, pc);
++    Count++;
++    if (ExitPc && pc == ExitPc)
++    {
++        ExitSeen++;
++        if (ExitSeen >= ExitHit)
++        {
++            fprintf(stderr, "regprobe: exit at hit %ld of pc=0x%08X\n", ExitSeen, pc);
++            fflush(FP);
++            if (MFP) { fflush(MFP); fclose(MFP); MFP = nullptr; }
++            fflush(stderr);
++            exit(0);
++        }
++    }
++}
++
++}  // namespace RegProbe
++
++namespace ARM9Trace
++{
++static FILE* FP = nullptr;
++static bool Tried = false;
++static long Limit = 1000;
++static long Count = 0;
++static bool ExitAtEnd = true;
++static FILE* MFP = nullptr;   /* MELONDS_ARM9MODE_PATH: "0xADDR thumb" */
++static u32 Lo = 0x02000000;
++static u32 Hi = 0x02400000;
++
++static void Init() noexcept
++{
++    Tried = true;
++    const char* p = getenv("MELONDS_ARM9TRACE_PATH");
++    if (!p || !p[0]) return;
++    FP = fopen(p, "w");
++    if (!FP) return;
++    const char* s;
++    if ((s = getenv("MELONDS_ARM9TRACE_N")))    Limit = atol(s);
++    if ((s = getenv("MELONDS_ARM9TRACE_LO")))   Lo = (u32)strtoul(s, nullptr, 0);
++    if ((s = getenv("MELONDS_ARM9TRACE_HI")))   Hi = (u32)strtoul(s, nullptr, 0);
++    if ((s = getenv("MELONDS_ARM9TRACE_EXIT"))) ExitAtEnd = atoi(s) != 0;
++    if (Limit < 1) Limit = 1;
++    setvbuf(FP, nullptr, _IOLBF, 0);
++    fprintf(FP, "# ARM9 trace window 0x%08X..0x%08X limit %ld\n", Lo, Hi, Limit);
++    if ((s = getenv("MELONDS_ARM9MODE_PATH")) && s[0])
++    {
++        MFP = fopen(s, "w");
++        if (MFP) { setvbuf(MFP, nullptr, _IOLBF, 0);
++                   fprintf(MFP, "# ARM9 mode trace window 0x%08X..0x%08X limit %ld\n", Lo, Hi, Limit); }
++    }
++}
++
++static void PC(u32 addr, u32 instr, bool thumb) noexcept
++{
++    if (!Tried) Init();
++    if (!FP) return;
++    if (addr < Lo || addr >= Hi) return;
++    if (Count >= Limit) return;
++
++    fprintf(FP, "0x%08x\n", addr);
++    if (MFP) fprintf(MFP, "0x%08x %d\n", addr, thumb ? 1 : 0);
++    bool swi = thumb ? ((instr & 0xFF00) == 0xDF00)
++                     : ((instr & 0x0F000000) == 0x0F000000);
++    if (swi)
++        fprintf(FP, "# swi %s imm=0x%06X at 0x%08x\n", thumb ? "thumb" : "arm",
++                thumb ? (instr & 0xFF) : (instr & 0xFFFFFF), addr);
++
++    if (++Count >= Limit)
++    {
++        fflush(FP);
++        fclose(FP);
++        FP = nullptr;
++        if (MFP) { fflush(MFP); fclose(MFP); MFP = nullptr; }
++        if (ExitAtEnd)
++        {
++            fflush(stderr);
++            exit(0);
++        }
++    }
++}
++}
++
++/* LoopWatch (Ni no Kuni Phase-4N): the ARM9 WFI idle loop at 0x0200712C
++ * (8d0c=enable IRQ, 9118=WFI, b back).  Logs entry, every observed IRQ taken
++ * while the PC is inside the loop window, the departure (wake) with the full
++ * register file + IE/IF/IME, and the next ARM9_TRACE_AFTER PCs of the
++ * post-wakeup path.  env: MELONDS_LOOPWATCH_PATH (output file),
++ * MELONDS_LOOPWATCH_AFTER (post-wakeup PC count, default 600). */
++namespace LoopWatch
++{
++static FILE* FP = nullptr;
++static bool Tried = false;
++static long AfterLimit = 600;
++static long PostN = 0;
++static long Count = 0;
++static int InLoop = 0;
++static unsigned Iters = 0;
++static u32 LoopLo = 0x0200712Cu, LoopHi = 0x02007140u;
++
++static void Init() noexcept
++{
++    Tried = true;
++    const char* p = getenv("MELONDS_LOOPWATCH_PATH");
++    if (!p || !p[0]) return;
++    FP = fopen(p, "w");
++    if (!FP) return;
++    setvbuf(FP, nullptr, _IOLBF, 0);
++    const char* s;
++    if ((s = getenv("MELONDS_LOOPWATCH_AFTER"))) AfterLimit = atol(s);
++    fprintf(FP, "# loopwatch window 0x%08X..0x%08X after=%ld\n", LoopLo, LoopHi, AfterLimit);
++}
++
++static inline void PC(u32 addr, u32 cpsr, u32 r13, u32 r14, u32 ts,
++                      u32 ie, u32 ifl, u32 ime) noexcept
++{
++    if (!Tried) Init();
++    if (!FP) return;
++    bool in = (addr >= LoopLo && addr < LoopHi);
++    if (in)
++    {
++        PostN = 0;
++        if (!InLoop)
++        {
++            InLoop = 1; Iters = 0;
++            fprintf(FP, "enter ts=%u pc=0x%08X cpsr=0x%08X r13=0x%08X r14=0x%08X ie=0x%08X if=0x%08X ime=%u\n",
++                    ts, addr, cpsr, r13, r14, ie, ifl, ime);
++            if (++Count > 100000) { fclose(FP); FP = nullptr; }
++        }
++        else Iters++;
++        return;
++    }
++    if (InLoop)
++    {
++        InLoop = 0;
++        fprintf(FP, "leave ts=%u pc=0x%08X cpsr=0x%08X r13=0x%08X r14=0x%08X ie=0x%08X if=0x%08X ime=%u iters=%u\n",
++                ts, addr, cpsr, r13, r14, ie, ifl, ime, Iters);
++        PostN = AfterLimit;
++        if (++Count > 100000) { fclose(FP); FP = nullptr; }
++        return;
++    }
++    if (PostN > 0)
++    {
++        PostN--;
++        fprintf(FP, "post ts=%u pc=0x%08X cpsr=0x%08X\n", ts, addr, cpsr);
++        if (++Count > 200000) { fclose(FP); FP = nullptr; }
++    }
++}
++
++static inline void IRQHit(u32 pc9, u32 ts, u32 ie, u32 ifl, u32 ime) noexcept
++{
++    if (!Tried) Init();
++    if (!FP) return;
++    fprintf(FP, "irqwake ts=%u pc9=0x%08X ie=0x%08X if=0x%08X ime=%u enabled=0x%08X iters=%u\n",
++            ts, pc9, ie, ifl, ime, ie & ifl, Iters);
++    if (++Count > 100000) { fclose(FP); FP = nullptr; }
++}
++}
++
++/* ARM9 PC-trace index at this moment (for MemWatch correlation; 0 if the
++ * trace is not active).  Defined by ARM9Trace, used by NDS.cpp's watch. */
++long ARM9TracePCCount() noexcept { return ARM9Trace::Count; }
++
++/* IRQ trace bridge (Ni no Kuni Phase-4C): NDS::SetIRQ (NDS.cpp) routes the
++ * ARM9-side IF raise through this C-linkage trampoline into IRQTrace::Log. */
++extern "C" void IRQTraceSetIRQLine(long a9idx, int bit, unsigned ie,
++                                   unsigned ifl, int ime, unsigned pc9) noexcept
++{
++    IRQTrace::Log("setirq bit=%d a9idx=%ld ie=0x%08X if=0x%08X ime=%d pc9=0x%08X\n",
++                  bit, a9idx, ie, ifl, ime, pc9);
++}
++
++/* One-shot ITCM dump: when the ARM9 first EXECUTES code in the ITCM window
++ * (0x01FF8000..0x01FFFFFF) and MELONDS_ITCM_DUMP is set, write the whole
++ * 32 KiB ITCM to that path so the copied code can be disassembled. */
++namespace ITCMDump
++{
++static bool Done = false;
++static void Maybe(u32 addr, const u8 *itcm) noexcept
++{
++    if (Done || addr < 0x01FF8000u || addr >= 0x02000000u) return;
++    Done = true;
++    const char *p = getenv("MELONDS_ITCM_DUMP");
++    if (!p || !p[0]) return;
++    FILE *f = fopen(p, "wb");
++    if (!f) return;
++    fwrite(itcm, 1, 0x8000, f);
++    fclose(f);
++    fprintf(stderr, "ITCMDump: first ITCM exec pc=0x%08X -> %s\n", addr, p);
++}
++}
++
++// ---------------------------------------------------------------------------
++// ARM7 boot PC trace (Ni no Kuni DS static-recompilation verification).
++// Mirror of ARM9Trace for the ARM7 (ARMv4); env-gated, interpreter-only,
++// inactive unless MELONDS_ARM7TRACE_PATH is set:
++//   MELONDS_ARM7TRACE_PATH  output file (unset -> disabled)
++//   MELONDS_ARM7TRACE_N     PCs to log (default 1000000)
++//   MELONDS_ARM7TRACE_LO    window start (default 0x02000000)
++//   MELONDS_ARM7TRACE_HI    window end   (default 0x02400000, main RAM —
++//                           the ARM7 image runs at 0x02380000)
++//   MELONDS_ARM7TRACE_EXIT  1 = exit(0) once N PCs are logged (default 0)
++// Format: one "0x%08x" line per executed in-window instruction PC.
++// ---------------------------------------------------------------------------
++namespace ARM7Trace
++{
++static FILE* FP = nullptr;
++static bool Tried = false;
++static long Limit = 1000000;
++static long Count = 0;
++static bool ExitAtEnd = false;
++static u32 Lo = 0x02000000;
++static u32 Hi = 0x02400000;
++
++static void Init() noexcept
++{
++    Tried = true;
++    const char* p = getenv("MELONDS_ARM7TRACE_PATH");
++    if (!p || !p[0]) return;
++    FP = fopen(p, "w");
++    if (!FP) return;
++    const char* s;
++    if ((s = getenv("MELONDS_ARM7TRACE_N")))    Limit = atol(s);
++    if ((s = getenv("MELONDS_ARM7TRACE_LO")))   Lo = (u32)strtoul(s, nullptr, 0);
++    if ((s = getenv("MELONDS_ARM7TRACE_HI")))   Hi = (u32)strtoul(s, nullptr, 0);
++    if ((s = getenv("MELONDS_ARM7TRACE_EXIT"))) ExitAtEnd = atoi(s) != 0;
++    if (Limit < 1) Limit = 1;
++    setvbuf(FP, nullptr, _IOLBF, 0);
++}
++
++static void PC(u32 addr) noexcept
++{
++    if (!Tried) Init();
++    if (!FP) return;
++    if (addr < Lo || addr >= Hi) return;
++    if (Count >= Limit) return;
++
++    fprintf(FP, "0x%08x\n", addr);
++    if (++Count >= Limit)
++    {
++        fflush(FP);
++        fclose(FP);
++        FP = nullptr;
++        if (ExitAtEnd)
++        {
++            fflush(stderr);
++            exit(0);
++        }
++    }
++}
++}
++
+ #ifdef GDBSTUB_ENABLED
+ void ARM::GdbCheckA()
+ {
+@@ -528,8 +932,21 @@ void ARM::TriggerIRQ()
+ {
+     if (CPSR & 0x80)
+         return;
+-
+     u32 oldcpsr = CPSR;
++    if (Num == 0 && IRQTrace::Active())
++    {
++        // pc9 = next instruction that would have executed (same convention as
++        // the PC hook); R_IRQ[0/1] are the BANKED IRQ sp/lr before UpdateMode.
++        IRQTrace::Log("trigger a9idx=%ld pc9=0x%08X oldcpsr=0x%08X sp_irq=0x%08X lr_irq=0x%08X sp_cur=0x%08X\n",
++                      ARM9Trace::Count, R[15] - ((CPSR & 0x20) ? 4 : 8), oldcpsr,
++                      R_IRQ[0], R_IRQ[1], R[13]);
++    }
++    if (Num == 0)
++    {
++        u32 tpc = R[15] - ((CPSR & 0x20) ? 4 : 8);
++        if (tpc >= 0x02009118u && tpc <= 0x02009124u)
++            LoopWatch::IRQHit(tpc, (u32)NDS.ARM9Timestamp, NDS.IE[0], NDS.IF[0], NDS.IME[0] & 1);
++    }
+     CPSR &= ~0xFF;
+     CPSR |= 0xD2;
+     UpdateMode(oldcpsr, CPSR);
+@@ -670,6 +1087,11 @@ void ARMv5::Execute()
+                 else             NextInstr[1] = CodeRead32(R[15], false);
+ 
+                 // actually execute
++                // Thumb state: R[15] reads as instruction address + 4 here.
++                ARM9Trace::PC(R[15] - 4, CurInstr, true);
++                LoopWatch::PC(R[15] - 4, CPSR, R[13], R[14], (u32)NDS.ARM9Timestamp,
++                              NDS.IE[0], NDS.IF[0], NDS.IME[0] & 1);
++                RegProbe::Log(R, CPSR, R_SVC, R_IRQ, R[15] - 4, this);
+                 u32 icode = (CurInstr >> 6) & 0x3FF;
+                 ARMInterpreter::THUMBInstrTable[icode](this);
+             }
+@@ -685,6 +1107,12 @@ void ARMv5::Execute()
+                 NextInstr[1] = CodeRead32(R[15], false);
+ 
+                 // actually execute
++                // ARM state: R[15] reads as instruction address + 8 here.
++                ARM9Trace::PC(R[15] - 8, CurInstr, false);
++                LoopWatch::PC(R[15] - 8, CPSR, R[13], R[14], (u32)NDS.ARM9Timestamp,
++                              NDS.IE[0], NDS.IF[0], NDS.IME[0] & 1);
++                RegProbe::Log(R, CPSR, R_SVC, R_IRQ, R[15] - 8, this);
++                ITCMDump::Maybe(R[15] - 8, ITCM);
+                 if (CheckCondition(CurInstr >> 28))
+                 {
+                     u32 icode = ((CurInstr >> 4) & 0xF) | ((CurInstr >> 16) & 0xFF0);
+@@ -808,6 +1236,7 @@ void ARMv4::Execute()
+                 NextInstr[1] = CodeRead16(R[15]);
+ 
+                 // actually execute
++                ARM7Trace::PC(R[15] - 4);
+                 u32 icode = (CurInstr >> 6);
+                 ARMInterpreter::THUMBInstrTable[icode](this);
+             }
+@@ -823,6 +1252,7 @@ void ARMv4::Execute()
+                 NextInstr[1] = CodeRead32(R[15]);
+ 
+                 // actually execute
++                ARM7Trace::PC(R[15] - 8);
+                 if (CheckCondition(CurInstr >> 28))
+                 {
+                     u32 icode = ((CurInstr >> 4) & 0xF) | ((CurInstr >> 16) & 0xFF0);

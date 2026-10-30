@@ -542,6 +542,38 @@ def main():
         fh.write("int nnk_part_itcm(uint32_t *pc_io);\n")
         fh.write("#endif\n")
 
+    # ---- Phase-4N: cart transfer-done IRQ + rule-based delivery ----------
+    # Measurement (p4n_wake.txt, melonDS LoopWatch hook): the ARM9 WFI idle
+    # loop at 0x0200712C is woken by IRQ bit 19 (IRQ_CartXferDone) --
+    # "irqwake ... ie=0x000C0009 if=0x00280000 ime=1 enabled=0x00080000" --
+    # once per card transfer, every ~21,700 card-bus cycles.  melonDS raises
+    # it in NDSCart::Interface::ROMEndTransfer when AUXSPICNT bit14 is set.
+    # The generated image has two gaps that make that unreachable:
+    #   (a) a data-read transfer never schedules ROMTransfer_End, so ROMCnt
+    #       bit31 stays set and no end-of-transfer event ever fires;
+    #   (b) card_end_transfer() drops the cart IRQ entirely (Phase-4D note);
+    #   (c) IRQ delivery was gated to the 3 scripted triggers (IRQ_TRIG_N),
+    #       so nothing after step 9,097,801 is ever delivered.
+    prelude = inject(prelude,
+                     "    if (card_pos >= card_len) return;",
+                     "    if (card_pos >= card_len) { card_end_pending = 1;"
+                     " card_next = card_cycles + (uint64_t)card_xfer *"
+                     " (4u + ((card_pos & 0x1FFu) ? 0u : card_gap2)); return; }",
+                     "card end-of-transfer scheduling")
+    prelude = inject(prelude,
+                     "    card_next = CARD_NEVER; card_end_pending = 0;",
+                     "    card_next = CARD_NEVER; card_end_pending = 0;\n"
+                     "    if (spicnt & (1u << 14)) iflags |= 0x00080000u;"
+                     "   /* ROMEndTransfer: IRQ_CartXferDone */",
+                     "card transfer-done IRQ raise")
+    prelude = inject(prelude,
+                     "        else if (!irq_active && irq_trig_n < IRQ_TRIG_N"
+                     " && steps > irq_trig_log[irq_trig_n]",
+                     "        else if (!irq_active"
+                     " && (irq_trig_n >= IRQ_TRIG_N || steps > irq_trig_log[irq_trig_n])",
+                     "rule-based IRQ delivery")
+    sys.stderr.write("Phase-4N: cart IRQ + rule-based delivery spliced\n")
+
     # ---- Phase-4K: firmware boot state (console MAC) --------------------
     # The guest reads the console WIFI MAC from 0x02FFFCF4; it is a console /
     # firmware property (melonDS serves DEFAULT_MAC there), not ROM data, and
