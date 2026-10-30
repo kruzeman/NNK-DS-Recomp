@@ -48,6 +48,7 @@ static unsigned nnk_dma_timed_n;         /* vblank/hblank triggers */
  * 0x200-byte transfer could never finish and the guest's next command stalled
  * in the ROMCNT-busy wait at 0x020168A0. */
 static int nnk_is_io(uint32_t a) { return a >= 0x04000000u && a < 0x05000000u; }
+static void nnk_ipc_tick(void);   /* Phase-4Q: defined below (ARM7 IPC reply) */
 static uint32_t nnk_bus_rd32(uint32_t a) { return nnk_is_io(a) ? io_read32(a) : ld32(a); }
 static uint32_t nnk_bus_rd16(uint32_t a) { return nnk_is_io(a) ? io_read16(a) : ld16(a); }
 static void nnk_bus_wr32(uint32_t a, uint32_t v) { if (nnk_is_io(a)) io_write32(a, v); else st32(a, v); }
@@ -201,6 +202,19 @@ static void nnk_dma_card(int i) {
 }
 
 void nnk_dma_tick(void) {
+    /* Phase-4Q: deliver a pending measured ARM7 IPC reply. */
+    nnk_ipc_tick();
+    /* Phase-4Q probe: the IE write history.  At the barrier native held
+     * IE=0x00000009 where melonDS holds 0x00040019 (IPCRecv bit18 / Timer1
+     * bit4), so this logs every IE change with the writing pc. */
+    { static uint32_t last_ie; static int init, n;
+      if (init && ie != last_ie && n < 60) {
+          fprintf(stderr, "iewr step=%llu pc=0x%08X ie 0x%08X -> 0x%08X "
+                  "if=0x%08X ime=%u\n", (unsigned long long)steps, last_pc,
+                  last_ie, ie, iflags, ime);
+          n++;
+      }
+      last_ie = ie; init = 1; }
     /* Phase-4P: cart-DMA bus ownership — the CPU does not execute while a
      * mode-5 channel drains a transfer (melonDS CPUStop_DMA9_n). */
     nnk_card_stall();
@@ -284,5 +298,78 @@ void nnk_dma_tick(void) {
             }
             nnk_dma_copy(i);
         }
+    }
+}
+
+/* ---- Phase-4Q: ARM7 IPC-FIFO responder (measured request -> reply) -------
+ *
+ * ROOT CAUSE OF THE u16[0x0206E93A] BARRIER (native step 18,554,864): the
+ * guest's card/stream driver starts an operation through the SDK API at
+ * 0x0200FA38, which sets handler-mask bit 1 (pc 0x0200FB20) and then SENDS
+ * the ARM7 two IPC-FIFO requests at pc 0x0200BAD4.  melonDS's ARM7 answers
+ * the first one; this runtime's scripted responder knew only the Phase-4C
+ * request (0x037A404D) and dropped both:
+ *
+ *   io: unscripted IPCFIFO request 0x80004046 at pc=0x0200BAD4
+ *   io: unscripted IPCFIFO request 0x40400006 at pc=0x0200BAD4
+ *
+ * so no reply ever reached the ARM9, the IPC-recv IRQ never fired, the
+ * driver's "done" event never ran its finish tail (0x0200F784..0x0200F7A0)
+ * and the mask bit never cleared; the guest spun at 0x0200FEFC to the step
+ * budget while melonDS proceeds.
+ *
+ * melonDS ground truth (p4q_mel_io.txt, whole-run send vocabulary of
+ * W32 0x04000188): 0x037A404D (scripted, Phase-4C), 0x80004046, 0x40400006,
+ * 0x000001AB x3, 0x000000AB, 0x0000002B, 0x81BA702B, 0x81B39C07, 0x81B36C07,
+ * 0x81B34E07, 0x81B34807.  Exactly ONE reply word is read back by the ARM9:
+ * 0xC0204006 (R32 0x04100000 pc=0x0200BB44 ts=28,709,423), 2,076 cycles
+ * after the request 0x80004046 (W32 0x04000188 pc=0x0200BAD4 ts=28,707,347)
+ * and delivered through the IPC-recv IRQ (IF bit18: the BIOS stub acks
+ * 0x00040000 at ts=28,709,384).  The ts unit equals the ARM9 cycle scale
+ * (card start->start gap in the same trace 10,900..11,400 ts vs the measured
+ * 10,850 ARM9 cycles), so the modelled latency is 2,076 runtime cycles.
+ *
+ * 0xC0204006 decoded against the guest's handler at 0x0200F5CC: handler id
+ * (word & 0x1F) = 6 -> the driver's IPC entry, bit5 = 0 (dispatch path),
+ * type ((word >> 14) & 0x7F) = 1, sub-index ((word >> 6) & 0xFF) = 0 ->
+ * 0x0200F710 case r0==1 -> the finish tail that writes +0x36=2 and clears
+ * mask bit 1 at 0x0200F7A0.  The register-path twin 0x80004046 (bit5 = 1,
+ * same type 1) is the ARM9's "notify me when done" request. */
+static uint32_t nnk_ipc_reply_word;
+static uint64_t nnk_ipc_reply_at;       /* runtime cycles when the reply lands */
+static int nnk_ipc_reply_pend;
+static unsigned nnk_ipc_handled_n;      /* log cap */
+void nnk_ipc_send(uint32_t v);
+static void nnk_ipc_tick(void);
+
+void nnk_ipc_send(uint32_t v) {
+    if (v == 0x80004046u) {
+        nnk_ipc_reply_word = 0xC0204006u;
+        nnk_ipc_reply_at = cycles + 2076u;   /* measured request->reply gap */
+        nnk_ipc_reply_pend = 1;
+        if (nnk_ipc_handled_n < 8u) {
+            fprintf(stderr, "ipc: ARM7 request 0x%08X -> reply 0x%08X in 2076 "
+                    "cycles step=%llu pc=0x%08X\n", v, nnk_ipc_reply_word,
+                    (unsigned long long)steps, last_pc);
+            nnk_ipc_handled_n++;
+        }
+        return;
+    }
+    if (nnk_ipc_handled_n < 8u) {
+        fprintf(stderr, "ipc: ARM7 request 0x%08X (no measured reply in the "
+                "melonDS capture) step=%llu pc=0x%08X\n", v,
+                (unsigned long long)steps, last_pc);
+        nnk_ipc_handled_n++;
+    }
+}
+
+static void nnk_ipc_tick(void) {
+    if (nnk_ipc_reply_pend && cycles >= nnk_ipc_reply_at) {
+        nnk_ipc_reply_pend = 0;
+        if (arm9_recv_n < 16u) arm9_recv_fifo[arm9_recv_n++] = nnk_ipc_reply_word;
+        iflags |= 0x00040000u;               /* IRQ_IPCRecv: the ARM7 answered */
+        fprintf(stderr, "ipc: reply 0x%08X queued if=0x%08X ie=0x%08X ime=%u "
+                "cpsr=%02X step=%llu\n", nnk_ipc_reply_word, iflags, ie, ime,
+                (unsigned)cpsr_ctl, (unsigned long long)steps);
     }
 }
