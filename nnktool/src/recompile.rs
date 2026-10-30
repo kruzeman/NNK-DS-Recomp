@@ -347,6 +347,20 @@ fn emit_insn(
                 _ => body.push("/* unreachable dp op */".into()),
             }
             body.push("}".into());
+            if *rd == 15 && *s && !test {
+                // SUBS/MOVS ... PC outside USR/SYS mode is the ARM exception
+                // return: the PC takes the computed value AND CPSR <- SPSR
+                // (flags + mode, so r13/r14 swap back to the interrupted
+                // bank).  In USR/SYS mode it is a plain branch.  Measure:
+                // 0x0200729C `subs pc, lr, #4` under SPSR 0x0000001F returns
+                // to SYS mode at lr-4 = 0x02015EC4.
+                body.push(
+                    "if (mode_priv()) { uint32_t _spsr = spsr_bank[mode_cur]; \
+                     cpsr_set_ctl(_spsr & 0xFFu); n = (_spsr >> 31) & 1; z = (_spsr >> 30) & 1; \
+                     c = (_spsr >> 29) & 1; v = (_spsr >> 28) & 1; }"
+                        .into(),
+                );
+            }
             if *rd == 15 && !test {
                 pc_written = true;
                 flow = Flow::Indirect(None);
@@ -416,24 +430,40 @@ fn emit_insn(
             body.push("}".into());
         }
         Kind::Mrs { spsr, rd } => {
-            let _ = spsr;
-            body.push(format!(
-                "r[{}] = (n << 31) | (z << 30) | (c << 29) | (v << 28) | 0x10u | cpsr_ctl;",
-                rd
-            ));
+            if *spsr {
+                // SPSR of the CURRENT mode (melonDS keeps one per mode).
+                body.push(format!("r[{}] = spsr_bank[mode_cur];", rd));
+            } else {
+                body.push(format!(
+                    "r[{}] = (n << 31) | (z << 30) | (c << 29) | (v << 28) | 0x10u | cpsr_ctl;",
+                    rd
+                ));
+            }
         }
         Kind::Msr { spsr, mask, src } => {
-            let _ = spsr;
             let (opnd, _) = operand_c(src, addr, thumb);
             body.push(format!("{{ uint32_t _v = {};", opnd));
-            if mask & 1 != 0 {
-                body.push("cpsr_ctl = _v & 0xFFu;".into());
-            }
-            if mask & 8 != 0 {
-                body.push(
-                    "n = (_v >> 31) & 1; z = (_v >> 30) & 1; c = (_v >> 29) & 1; v = (_v >> 28) & 1;"
-                        .into(),
-                );
+            if *spsr {
+                // A write to SPSR never touches the current CPSR, and it goes
+                // to the SPSR of the CURRENT mode (ARM ARM B4.1.3).
+                let mut e = String::from("spsr_bank[mode_cur]");
+                if mask & 1 != 0 {
+                    e = format!("(({} & ~0xFFu) | (_v & 0xFFu))", e);
+                }
+                if mask & 8 != 0 {
+                    e = format!("(({} & 0x0FFFFFFFu) | (_v & 0xF0000000u))", e);
+                }
+                body.push(format!("spsr_bank[mode_cur] = {};", e));
+            } else {
+                if mask & 1 != 0 {
+                    body.push("cpsr_set_ctl(_v & 0xFFu);".into());
+                }
+                if mask & 8 != 0 {
+                    body.push(
+                        "n = (_v >> 31) & 1; z = (_v >> 30) & 1; c = (_v >> 29) & 1; v = (_v >> 28) & 1;"
+                            .into(),
+                    );
+                }
             }
             body.push("}".into());
         }
@@ -479,8 +509,18 @@ fn emit_insn(
             if *load {
                 if *rd == 15 {
                     // LDR pc: bit0 selects the target instruction state, the
-                    // dispatch key is the even address either way.
-                    body.push(format!("uint32_t _t = {};", addr_expr));
+                    // dispatch key is the even address either way.  The VALUE
+                    // AT the effective address is the target (the SDK stub's
+                    // `popeq {pc}` encodes as post-indexed ldr pc, [sp], #4 —
+                    // using the address itself here jumped to the stack slot).
+                    body.push(format!(
+                        "uint32_t _t = {};",
+                        if *byte {
+                            format!("ld8({})", addr_expr)
+                        } else {
+                            format!("ld32({})", addr_expr)
+                        }
+                    ));
                     body.push("pc = _t & ~1u;".into());
                     pc_written = true;
                     flow = Flow::Indirect(None);
@@ -524,13 +564,19 @@ fn emit_insn(
             let regs: Vec<u8> = (0..16).filter(|i| list & (1 << i) != 0).map(|i| i as u8).collect();
             let cnt = regs.len() as u32;
             let base = reg_c(*rn, addr);
+            // S-bit with no PC in the list = the USER-bank form: in a
+            // privileged mode r13/r14 are transferred to/from the user bank,
+            // NOT the current one (ARMv5 LDM/STM `^`).  With the PC in the
+            // list it is the exception-return form (not modelled: the boot
+            // uses `subs pc, lr, #4` instead).
+            let user_bank = *s && (list & 0x8000) == 0;
             // Lowest transfer address per addressing mode:
             // DA: base-4n+4, IA: base, DB: base-4n, IB: base+4.
             let start = match pu {
                 0 => format!("(_base - {}u + 4u)", cnt * 4),
                 1 => "_base".to_string(),
                 2 => format!("(_base - {}u)", cnt * 4),
-                _ => "(_base + 4u)".to_string(),
+                _ => format!("(_base + 4u)"),
             };
             body.push(format!("{{ uint32_t _base = {};", base));
             body.push(format!("uint32_t _a = {};", start));
@@ -545,9 +591,17 @@ fn emit_insn(
                         body.push("pc = _t & ~1u;".into());
                         pc_written = true;
                         flow = Flow::Indirect(None);
+                    } else if user_bank && *rr == 13 {
+                        body.push(format!("bank13_set_usr(ld32(_a + {}u));", idx * 4));
+                    } else if user_bank && *rr == 14 {
+                        body.push(format!("bank14_set_usr(ld32(_a + {}u));", idx * 4));
                     } else {
                         body.push(format!("r[{}] = ld32(_a + {}u);", rr, idx * 4));
                     }
+                } else if user_bank && *rr == 13 {
+                    body.push(format!("st32(_a + {}u, bank13_get_usr());", idx * 4));
+                } else if user_bank && *rr == 14 {
+                    body.push(format!("st32(_a + {}u, bank14_get_usr());", idx * 4));
                 } else {
                     body.push(format!("st32(_a + {}u, {});", idx * 4, if thumb { reg_c_t(*rr, addr) } else { reg_c(*rr, addr) }));
                 }
@@ -557,7 +611,6 @@ fn emit_insn(
                 let sign = if *pu == 1 || *pu == 3 { "+" } else { "-" };
                 body.push(format!("r[{}] = _base {} {}u;", rn, sign, cnt * 4));
             }
-            let _ = s; // S-bit: single-bank register model, user bank == current
             body.push("}".into());
         }
         Kind::Swp { byte, rd, rn, rm } => {
@@ -791,6 +844,51 @@ static uint32_t cpsr_ctl = 0x13; /* control byte: mode/IRQ bits */
 static uint32_t cp15_reg = 0;    /* CP15 reads return 0 in this model */
 static uint32_t carry_out;       /* shifter carry-out of the last sh_op */
 static uint64_t steps;
+/* ARM9 mode banking — same model as the image-wide runtime below (see the
+ * long comment there); the entry-function translation needs it because the
+ * crt0 switches modes with msr CPSR_c. */
+#define MODE_USR 0
+#define MODE_FIQ 1
+#define MODE_IRQ 2
+#define MODE_SVC 3
+#define MODE_ABT 4
+#define MODE_UND 5
+#define MODE_N   6
+static uint32_t bank13[MODE_N], bank14[MODE_N], spsr_bank[MODE_N];
+static int mode_cur = MODE_SVC;
+static int mode_ix(uint32_t ctl) {
+    switch (ctl & 0x1Fu) {
+    case 0x11: return MODE_FIQ;
+    case 0x12: return MODE_IRQ;
+    case 0x13: return MODE_SVC;
+    case 0x17: return MODE_ABT;
+    case 0x1B: return MODE_UND;
+    default:   return MODE_USR;
+    }
+}
+/* The `ldm/stm ...^` user-bank form: r13/r14 of the USER bank.  Emitted case
+ * bodies call these (they never see the MODE_* macros: the split build keeps
+ * the case bodies in separate TUs). */
+static uint32_t bank13_get_usr(void) { return mode_cur == MODE_USR ? r[13] : bank13[MODE_USR]; }
+static uint32_t bank14_get_usr(void) { return mode_cur == MODE_USR ? r[14] : bank14[MODE_USR]; }
+static void bank13_set_usr(uint32_t v) { if (mode_cur == MODE_USR) r[13] = v; else bank13[MODE_USR] = v; }
+static void bank14_set_usr(uint32_t v) { if (mode_cur == MODE_USR) r[14] = v; else bank14[MODE_USR] = v; }
+/* Is the current mode privileged?  (Gate for the exception-return idiom.) */
+static int mode_priv(void) { return mode_cur != MODE_USR; }
+
+static uint32_t bank13_get(int b) { return b == mode_cur ? r[13] : bank13[b]; }
+static uint32_t bank14_get(int b) { return b == mode_cur ? r[14] : bank14[b]; }
+static void bank13_set(int b, uint32_t v) { if (b == mode_cur) r[13] = v; else bank13[b] = v; }
+static void bank14_set(int b, uint32_t v) { if (b == mode_cur) r[14] = v; else bank14[b] = v; }
+static void cpsr_set_ctl(uint32_t ctl) {
+    int nw = mode_ix(ctl);
+    if (nw != mode_cur) {
+        bank13[mode_cur] = r[13]; bank14[mode_cur] = r[14];
+        r[13] = bank13[nw]; r[14] = bank14[nw];
+        mode_cur = nw;
+    }
+    cpsr_ctl = ctl & 0xFFu;
+}
 static uint64_t shimmed_calls;
 static uint64_t traced;
 static uint64_t traced_exec;
@@ -1135,7 +1233,7 @@ pub fn recompile_all(
     ));
     src.push_str(RUNTIME_ALL);
     src.push_str(
-        "static void run(void) {\n    uint32_t pc = ENTRY_CONST;\n    for (;;) {\n        if (++steps > step_limit) { halt_reason(\"step budget exhausted\"); return; }\n        arm7_evt_tick();\n        switch (pc) {\n",
+        "static void run(void) {\n    uint32_t pc = ENTRY_CONST;\n    for (;;) {\n        if (++steps > step_limit) { halt_reason(\"step budget exhausted\"); return; }\n        arm7_evt_tick();\n        irq_tick();\n        if (irq_active && pc >= BIOS_IRQ_LO) { bios_irq_return(&pc); }\n        else if (!irq_active && irq_trig_n < IRQ_TRIG_N && steps > irq_trig_log[irq_trig_n]\n                 && ime && (ie & iflags) && !(cpsr_ctl & 0x80u)) {\n            irq_trig_n++;\n            irq_enter(&pc);\n        }\n        switch (pc) {\n",
     );
     for (case, _) in cases.values() {
         src.push_str(case);
@@ -1169,14 +1267,97 @@ const RUNTIME_ALL: &str = r##"#include <stdint.h>
 #define GBASE 0x02000000u
 #define GSIZE 0x01800000u
 static uint8_t gmem[GSIZE];
+/* Main-RAM mirror: melonDS maps ALL of 0x02000000..0x02FFFFFF onto the 4 MiB
+ * of main RAM with `addr & MainRAMMask` (NDS.cpp ARM9Read32/Write32, `case
+ * 0x02000000`), so e.g. 0x02FFFF8C IS main-RAM 0x3FFF8C.  Scripted ARM7-side
+ * writes must go through the same alias the guest reads from, or the two
+ * views diverge (measured: the 0x02008E1C wait(12,1) loop never saw the ARM7
+ * ready flag once the guest read the mirrored address).  Guest ld/st go
+ * through win_off() below, which applies exactly this mask. */
+static inline uint8_t *main_ram_ptr(uint32_t a) { return gmem + (a & 0x3FFFFFu); }
 static uint32_t r[16];
-static uint32_t n, z, c, v;      /* CPSR NZCV (single-bank model) */
+static uint32_t n, z, c, v;      /* CPSR NZCV (flags of the CURRENT mode) */
 static uint32_t cpsr_ctl = 0x13; /* control byte: mode/IRQ bits */
 static uint32_t cp15_reg = 0;    /* CP15 reads return 0 in this model */
 static uint32_t carry_out;       /* shifter carry-out of the last sh_op */
 static uint64_t steps;
 static uint64_t traced;
 static uint64_t distinct_pcs;
+
+/* ---- ARM9 mode banking (Phase-4C) -----------------------------------------
+ * r[] holds the registers of the CURRENT mode; bank13/bank14 keep the shadow
+ * copy of every other mode and are refreshed on each switch (the ARM has one
+ * r13/r14 pair per mode; USR and SYS share theirs).  Every exception mode
+ * also owns an SPSR.  The boot's thread-context switch is the first guest code
+ * that depends on this and it pins the semantics:
+ *   0x0200081C  msr CPSR_c, #0x13   crt0 selects SVC      (no-op here: 0x13)
+ *   0x02000830  msr CPSR_c, #0x12   -> IRQ bank, then 0x02000834 computes the
+ *                                   IRQ stack from a constant (0x027E3F7C)
+ *   0x02000858  msr CPSR_fsxc,#0x1F -> SYS bank, stack from r1 (0x027E3B7C)
+ *   0x02007238  msr CPSR_c, #0xD3   SaveContext: SVC bank, saves the SVC sp
+ *   0x02007288  msr SPSR_fsxc, r1   writes the CURRENT mode's SPSR
+ *   0x02007294  ldmia r0, {..}^     r13/r14 of the USER bank, not of the
+ *                                   current (SVC) bank
+ *   0x0200729C  subs pc, lr, #4      exception return: PC = lr-4 AND
+ *                                   CPSR <- SPSR, i.e. back to SYS mode
+ * A single-bank model reaches 0x0200729C with the USER-bank lr already in
+ * r[14] (0x02006AF0) and branches to 0x02006AEC; melonDS branches to
+ * 0x02015EC4.  Measured at 0x0200729C (tools/add_regprobe.py): CPSR
+ * 0x600000D3 (SVC), r13=0x0206EF00 r14=0x02015EC8, SPSR 0x0000001F -> SYS
+ * mode with r13=0x0206EEC0 r14=0x02006AF0 at 0x02015EC4. */
+#define MODE_USR 0
+#define MODE_FIQ 1
+#define MODE_IRQ 2
+#define MODE_SVC 3
+#define MODE_ABT 4
+#define MODE_UND 5
+#define MODE_N   6
+/* Sized with a literal 6: tools/split_dispatch.py externalises every runtime
+ * array the case bodies touch into nnk_rt.h, which has no MODE_N. */
+static uint32_t bank13[6], bank14[6], spsr_bank[6];
+static int mode_cur = MODE_SVC;  /* the 0x13 reset value above */
+static int mode_trace;           /* NNK_MODE_TRACE=1: log every switch */
+
+static int mode_ix(uint32_t ctl) {
+    switch (ctl & 0x1Fu) {
+    case 0x11: return MODE_FIQ;
+    case 0x12: return MODE_IRQ;
+    case 0x13: return MODE_SVC;
+    case 0x17: return MODE_ABT;
+    case 0x1B: return MODE_UND;
+    default:   return MODE_USR;  /* 0x10 USR and 0x1F SYS share one bank */
+    }
+}
+/* Banked r13/r14 access, used by the `ldm/stm ...^` user-bank form. */
+/* The `ldm/stm ...^` user-bank form: r13/r14 of the USER bank.  Emitted case
+ * bodies call these (they never see the MODE_* macros: the split build keeps
+ * the case bodies in separate TUs). */
+static uint32_t bank13_get_usr(void) { return mode_cur == MODE_USR ? r[13] : bank13[MODE_USR]; }
+static uint32_t bank14_get_usr(void) { return mode_cur == MODE_USR ? r[14] : bank14[MODE_USR]; }
+static void bank13_set_usr(uint32_t v) { if (mode_cur == MODE_USR) r[13] = v; else bank13[MODE_USR] = v; }
+static void bank14_set_usr(uint32_t v) { if (mode_cur == MODE_USR) r[14] = v; else bank14[MODE_USR] = v; }
+/* Is the current mode privileged?  (Gate for the exception-return idiom.) */
+static int mode_priv(void) { return mode_cur != MODE_USR; }
+
+static uint32_t bank13_get(int b) { return b == mode_cur ? r[13] : bank13[b]; }
+static uint32_t bank14_get(int b) { return b == mode_cur ? r[14] : bank14[b]; }
+static void bank13_set(int b, uint32_t v) { if (b == mode_cur) r[13] = v; else bank13[b] = v; }
+static void bank14_set(int b, uint32_t v) { if (b == mode_cur) r[14] = v; else bank14[b] = v; }
+
+/* A write to CPSR control: switch banks when the mode changes. */
+static void cpsr_set_ctl(uint32_t ctl) {
+    int nw = mode_ix(ctl);
+    if (nw != mode_cur) {
+        bank13[mode_cur] = r[13]; bank14[mode_cur] = r[14];
+        r[13] = bank13[nw]; r[14] = bank14[nw];
+        if (mode_trace)
+            fprintf(stderr, "mode %d->%d step=%llu sp=0x%08X lr=0x%08X\n",
+                    mode_cur, nw, (unsigned long long)steps, r[13], r[14]);
+        mode_cur = nw;
+    }
+    cpsr_ctl = ctl & 0xFFu;
+}
+
 static uint64_t hle_hits;
 static uint32_t last_pc;
 
@@ -1327,14 +1508,12 @@ static void io_ipcsync_write(uint32_t v) {
      * traffic).  Scripted from the observed sequence; ARM7 not executed. */
     if (arm9_sync_send == 0) {
         uint32_t fa = 0x02FFFF8Cu;
-        if (fa >= GBASE && fa + 4u <= GBASE + GSIZE) {
-            uint8_t *p = gmem + (fa - GBASE);
-            uint32_t wv = (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
-                          ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
-            wv |= (1u << 12);
-            p[0] = (uint8_t)wv; p[1] = (uint8_t)(wv >> 8);
-            p[2] = (uint8_t)(wv >> 16); p[3] = (uint8_t)(wv >> 24);
-        }
+        uint8_t *p = main_ram_ptr(fa);
+        uint32_t wv = (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+                      ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+        wv |= (1u << 12);
+        p[0] = (uint8_t)wv; p[1] = (uint8_t)(wv >> 8);
+        p[2] = (uint8_t)(wv >> 16); p[3] = (uint8_t)(wv >> 24);
     }
 }
 static uint32_t ipc_fifo_cnt = 0;     /* IPCFIFOCNT stored config bits */
@@ -1393,7 +1572,7 @@ static void arm7_evt_tick(void) {
     if (arm7_evt_n < ARM7_EVT_N && steps >= arm7_evt_log[arm7_evt_n].step) {
         uint32_t fa = 0x02FFFF8Cu;   /* = MainRAM[0x3FFF8C] in melonDS */
         uint32_t wv = arm7_evt_log[arm7_evt_n].val;
-        uint8_t *p = gmem + (fa - GBASE);
+        uint8_t *p = main_ram_ptr(fa);
         p[0] = (uint8_t)wv; p[1] = (uint8_t)(wv >> 8);
         p[2] = (uint8_t)(wv >> 16); p[3] = (uint8_t)(wv >> 24);
         fprintf(stderr, "arm7 evt step=%llu val=0x%08X\n",
@@ -1495,6 +1674,24 @@ static inline uint32_t gba_bus16(uint32_t a) {
  * a DTCM hit in dtcm[addr & 0x3FFF].  With TCMs disabled the checks can
  * never match (itcm_size == 0; dtcm_base == 0xFFFFFFFF), so unmapped low
  * addresses keep reading 0 / dropping writes as before. */
+/* Bus address -> gmem offset.  melonDS maps the ENTIRE 0x02000000..0x02FFFFFF
+ * block onto main RAM with `addr & MainRAMMask` (NDS.cpp ARM9Read32/Write32,
+ * `case 0x02000000`), i.e. the 4 MiB of main RAM is mirrored four times, and
+ * the SDK depends on it: boot params sit at 0x027FFE00 (= main-RAM 0x3FFE00)
+ * and the 0x02FFxxxx block the boot uses aliases main-RAM 0x3Fxxxx.  A flat
+ * window without the mirror diverged at trace index 3,638,594 (0x02016FBC
+ * `ldr r0,[r0,#128]` from the constant 0x02FFFE00 read back 0 instead of
+ * 0x1D12663C).  Addresses outside the block use the window as before
+ * (shared WRAM at 0x03000000+).  Returns 0 when the address is not memory. */
+static inline int win_off(uint32_t a, uint32_t n, uint32_t *off) {
+    if ((a & 0xFF000000u) == 0x02000000u) {
+        uint32_t o = a & 0x3FFFFFu;     /* MainRAMMask: 4 MiB main RAM */
+        if (o + n > 0x400000u) return 0;
+        *off = o; return 1;
+    }
+    if (a < GBASE || (uint64_t)a + n > (uint64_t)GBASE + GSIZE) return 0;
+    *off = a - GBASE; return 1;
+}
 static inline uint32_t ld32(uint32_t a) {
     if (a < itcm_size) {
         const uint8_t *p = itcm + (a & (ITCM_PHYS - 1u));
@@ -1507,9 +1704,9 @@ static inline uint32_t ld32(uint32_t a) {
     if (is_gba_rom(a)) return gba_bus16(a) | (gba_bus16(a + 2u) << 16);
     if (is_gba_ram(a)) return (exmemcnt & (1u << 7)) ? 0u : 0xFFFFFFFFu;
     if (a >= IO_LO && a < IO_HI) return io_read32(a);
-    if (a < GBASE || (uint64_t)a + 4u > (uint64_t)GBASE + GSIZE) return 0;
-    const uint8_t *p = gmem + (a - GBASE);
-    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+    { uint32_t o; if (win_off(a, 4u, &o)) { const uint8_t *p = gmem + o;
+      return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24); } }
+    return 0;
 }
 static inline void st32(uint32_t a, uint32_t v) {
     if (a < itcm_size) {
@@ -1523,9 +1720,8 @@ static inline void st32(uint32_t a, uint32_t v) {
         return;
     }
     if (a >= IO_LO && a < IO_HI) { io_write32(a, v); return; }
-    if (a < GBASE || (uint64_t)a + 4u > (uint64_t)GBASE + GSIZE) return;
-    uint8_t *p = gmem + (a - GBASE);
-    p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
+    { uint32_t o; if (win_off(a, 4u, &o)) { uint8_t *p = gmem + o;
+      p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24); } }
 }
 static inline uint32_t ld16(uint32_t a) {
     if (a < itcm_size) {
@@ -1539,9 +1735,9 @@ static inline uint32_t ld16(uint32_t a) {
     if (is_gba_rom(a)) return gba_bus16(a);
     if (is_gba_ram(a)) return (exmemcnt & (1u << 7)) ? 0u : 0xFFFFu;
     if (a >= IO_LO && a < IO_HI) return io_read16(a);
-    if (a < GBASE || (uint64_t)a + 2u > (uint64_t)GBASE + GSIZE) return 0;
-    const uint8_t *p = gmem + (a - GBASE);
-    return (uint32_t)p[0] | ((uint32_t)p[1] << 8);
+    { uint32_t o; if (win_off(a, 2u, &o)) { const uint8_t *p = gmem + o;
+      return (uint32_t)p[0] | ((uint32_t)p[1] << 8); } }
+    return 0;
 }
 static inline void st16(uint32_t a, uint16_t v) {
     if (a < itcm_size) {
@@ -1555,9 +1751,8 @@ static inline void st16(uint32_t a, uint16_t v) {
         return;
     }
     if (a >= IO_LO && a < IO_HI) { io_write16(a, v); return; }
-    if (a < GBASE || (uint64_t)a + 2u > (uint64_t)GBASE + GSIZE) return;
-    uint8_t *p = gmem + (a - GBASE);
-    p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8);
+    { uint32_t o; if (win_off(a, 2u, &o)) { uint8_t *p = gmem + o;
+      p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); } }
 }
 static inline uint32_t ld8(uint32_t a) {
     if (a < itcm_size) return itcm[a & (ITCM_PHYS - 1u)];
@@ -1565,15 +1760,14 @@ static inline uint32_t ld8(uint32_t a) {
     if (is_gba_rom(a)) return (gba_bus16(a & ~1u) >> ((a & 1u) * 8)) & 0xFFu;
     if (is_gba_ram(a)) return (exmemcnt & (1u << 7)) ? 0u : 0xFFu;
     if (a >= IO_LO && a < IO_HI) return io_read8(a);
-    if (a < GBASE || (uint64_t)a + 1u > (uint64_t)GBASE + GSIZE) return 0;
-    return gmem[a - GBASE];
+    { uint32_t o; if (win_off(a, 1u, &o)) return gmem[o]; }
+    return 0;
 }
 static inline void st8(uint32_t a, uint32_t v) {
     if (a < itcm_size) { itcm[a & (ITCM_PHYS - 1u)] = (uint8_t)v; return; }
     if ((a & dtcm_mask) == dtcm_base) { dtcm[a & (DTCM_PHYS - 1u)] = (uint8_t)v; return; }
     if (a >= IO_LO && a < IO_HI) { io_write8(a, v); return; }
-    if (a < GBASE || (uint64_t)a + 1u > (uint64_t)GBASE + GSIZE) return;
-    gmem[a - GBASE] = (uint8_t)v;
+    { uint32_t o; if (win_off(a, 1u, &o)) gmem[o] = (uint8_t)v; }
 }
 
 /* IO register semantics (melonDS-derived).  Implemented for the measured
@@ -1746,6 +1940,751 @@ static void io_write8(uint32_t a, uint32_t v) {
     if (a >= 0x04000240u && a <= 0x04000248u) { vramcnt[a - 0x04000240u] = v; return; }
     if (a == 0x04000247) { wramcnt_map = v; return; }
     io_write16(a & ~1u, v);
+}
+
+/* ---- ARM9 IRQ delivery (Phase-4C, melonDS ground truth) ------------------
+ * Ground truth: tools/add_irqtrace.py hooks (SetIRQ in NDS.cpp, TriggerIRQ
+ * in ARM.cpp) capture every IF raise ("setirq") and every taken IRQ
+ * ("trigger") with the ARM9 PC-trace index at that moment.  A 10M-PC
+ * capture gives 624 raises and exactly 3 deliveries; the delivery condition
+ * is ime && (ie & if) && !(CPSR I bit), measured true at precisely those 3.
+ *
+ * Clock: melonDS's ARM9Trace::Count at a hook = the index of the NEXT PC it
+ * will log; this runtime's `steps` at the dispatch of trace-index k equals
+ * k+1 (the counter is bumped at the top of the dispatch iteration).  So a
+ * melonDS event with a9idx=N is reproduced at the loop top where
+ * steps == N+1, i.e. condition `steps > N`.  Both the IF raises and the
+ * exception entry are scripted from the measured log AND gated on the live
+ * architectural state (ime / ie & if / CPSR.I) at check time — a delivery
+ * can never happen unless the real state says it should.
+ *
+ * Exception entry HLE (melonDS ARM::TriggerIRQ + FreeBIOS interrupt_handler,
+ * freebios/src/bios_common.s:1186 — the BIOS vector/epilogue sits at
+ * 0xFFFF0018..0xFFFF01DC, untranslated and outside the trace window, so it
+ * is HLE'd, not executed):
+ *   1. SPSR = current CPSR; CPSR control = 0xD2 (IRQ mode, I+F masked);
+ *      r13/r14 swapped with the IRQ bank (seeded with the measured
+ *      sp_irq = 0x027E3F7C, constant at all 3 triggers — the BIOS sets it
+ *      during boot, which this runtime skips).
+ *   2. push {r0-r3, r12, lr = resume+4} on the IRQ stack (the BIOS frame).
+ *   3. lr = the BIOS-return sentinel; pc = the user vector read with the
+ *      BIOS formula ((dtcm setting & ~0xFF) + 0x4000 - 4 -> dtcm[0x3FFC]),
+ *      which reads 0x01FF8000.
+ * The SDK stub then runs as normal translated ITCM code: it pushes the
+ * sentinel (stmfd sp!, {lr}), reads IME/IE/IF, acks IF, calls the user
+ * handler, and pops the sentinel into pc.  A pc >= 0xFFFF0000 dispatched
+ * while irq_active IS the BIOS epilogue (ldmia sp!, {r0-r3,r12,lr}; subs
+ * pc, lr, #4): pop the frame, restore CPSR from SPSR (mode+flags) and the
+ * banked r13/r14, resume at lr-4.  Nothing in the BIOS is traced, matching
+ * melonDS's out-of-window capture.
+ *
+ * Known model gap (unchanged by the banking model below): the stub's
+ * task-switch tail (0x01FF80B8.., taken only when [0x0206C6A0] != 0) hands
+ * the interrupted context to the SDK scheduler; the tail itself is translated
+ * guest code and now runs against the real mode banks. */
+#define BIOS_IRQ_LO 0xFFFF0000u
+#define BIOS_IRQ_RET (BIOS_IRQ_LO + 0x1F0u)  /* sentinel popped by the stub's popeq {pc} */
+static int irq_active;
+static int irq_raise_n, irq_trig_n;
+static int arm7_ipcstat_done;
+/* IRQ_SCRIPT_TABLES_BEGIN (generated by tools/gen_irq_script.py; do not edit) */
+struct IrqEvt { uint32_t step; uint32_t mask; };
+static const struct IrqEvt irq_raise_log[] = {
+    {3635491u, 0x00040000u},
+    {3645254u, 0x00080000u},
+    {3645515u, 0x00080000u},
+    {3797989u, 0x00080000u},
+    {3798122u, 0x00080000u},
+    {3798215u, 0x00080000u},
+    {3807570u, 0x00080000u},
+    {3807727u, 0x00080000u},
+    {3807820u, 0x00080000u},
+    {3816845u, 0x00080000u},
+    {3816978u, 0x00080000u},
+    {3817071u, 0x00080000u},
+    {3820188u, 0x00080000u},
+    {3820281u, 0x00080000u},
+    {4039510u, 0x00080000u},
+    {4045700u, 0x00080000u},
+    {4051890u, 0x00080000u},
+    {4058080u, 0x00080000u},
+    {4064270u, 0x00080000u},
+    {4070460u, 0x00080000u},
+    {4076740u, 0x00080000u},
+    {4082930u, 0x00080000u},
+    {4089120u, 0x00080000u},
+    {4095310u, 0x00080000u},
+    {4101500u, 0x00080000u},
+    {4107690u, 0x00080000u},
+    {4113880u, 0x00080000u},
+    {4120070u, 0x00080000u},
+    {4126260u, 0x00080000u},
+    {4132450u, 0x00080000u},
+    {4138640u, 0x00080000u},
+    {4144830u, 0x00080000u},
+    {4151020u, 0x00080000u},
+    {4157210u, 0x00080000u},
+    {4163400u, 0x00080000u},
+    {4169590u, 0x00080000u},
+    {4175780u, 0x00080000u},
+    {4182000u, 0x00080000u},
+    {4188190u, 0x00080000u},
+    {4194380u, 0x00080000u},
+    {4200570u, 0x00080000u},
+    {4206760u, 0x00080000u},
+    {4212950u, 0x00080000u},
+    {4219140u, 0x00080000u},
+    {4225330u, 0x00080000u},
+    {4231520u, 0x00080000u},
+    {4237710u, 0x00080000u},
+    {4243900u, 0x00080000u},
+    {4250090u, 0x00080000u},
+    {4256280u, 0x00080000u},
+    {4262470u, 0x00080000u},
+    {4268660u, 0x00080000u},
+    {4274850u, 0x00080000u},
+    {4281040u, 0x00080000u},
+    {4287230u, 0x00080000u},
+    {4293420u, 0x00080000u},
+    {4299610u, 0x00080000u},
+    {4305800u, 0x00080000u},
+    {4311990u, 0x00080000u},
+    {4318180u, 0x00080000u},
+    {4324370u, 0x00080000u},
+    {4330560u, 0x00080000u},
+    {4336750u, 0x00080000u},
+    {4342940u, 0x00080000u},
+    {4349130u, 0x00080000u},
+    {4355320u, 0x00080000u},
+    {4361510u, 0x00080000u},
+    {4367700u, 0x00080000u},
+    {4373890u, 0x00080000u},
+    {4380080u, 0x00080000u},
+    {4386270u, 0x00080000u},
+    {4392470u, 0x00080000u},
+    {4398660u, 0x00080000u},
+    {4404850u, 0x00080000u},
+    {4411040u, 0x00080000u},
+    {4417230u, 0x00080000u},
+    {4423420u, 0x00080000u},
+    {4429610u, 0x00080000u},
+    {4435800u, 0x00080000u},
+    {4441990u, 0x00080000u},
+    {4448180u, 0x00080000u},
+    {4454370u, 0x00080000u},
+    {4460560u, 0x00080000u},
+    {4466750u, 0x00080000u},
+    {4472940u, 0x00080000u},
+    {4479130u, 0x00080000u},
+    {4485335u, 0x00080000u},
+    {4491525u, 0x00080000u},
+    {4497715u, 0x00080000u},
+    {4503905u, 0x00080000u},
+    {4510095u, 0x00080000u},
+    {4516285u, 0x00080000u},
+    {4522475u, 0x00080000u},
+    {4528665u, 0x00080000u},
+    {4534855u, 0x00080000u},
+    {4541045u, 0x00080000u},
+    {4547235u, 0x00080000u},
+    {4553425u, 0x00080000u},
+    {4559650u, 0x00080000u},
+    {4565840u, 0x00080000u},
+    {4572030u, 0x00080000u},
+    {4578220u, 0x00080000u},
+    {4584410u, 0x00080000u},
+    {4590600u, 0x00080000u},
+    {4596790u, 0x00080000u},
+    {4602980u, 0x00080000u},
+    {4609170u, 0x00080000u},
+    {4615360u, 0x00080000u},
+    {4621550u, 0x00080000u},
+    {4627740u, 0x00080000u},
+    {4633930u, 0x00080000u},
+    {4640120u, 0x00080000u},
+    {4646310u, 0x00080000u},
+    {4652500u, 0x00080000u},
+    {4658690u, 0x00080000u},
+    {4664880u, 0x00080000u},
+    {4671070u, 0x00080000u},
+    {4677260u, 0x00080000u},
+    {4683450u, 0x00080000u},
+    {4689640u, 0x00080000u},
+    {4695830u, 0x00080000u},
+    {4702020u, 0x00080000u},
+    {4708210u, 0x00080000u},
+    {4714400u, 0x00080000u},
+    {4720590u, 0x00080000u},
+    {4726780u, 0x00080000u},
+    {4732970u, 0x00080000u},
+    {4739160u, 0x00080000u},
+    {4745350u, 0x00080000u},
+    {4751540u, 0x00080000u},
+    {4757730u, 0x00080000u},
+    {4763920u, 0x00080000u},
+    {4770110u, 0x00080000u},
+    {4776300u, 0x00080000u},
+    {4782490u, 0x00080000u},
+    {4788680u, 0x00080000u},
+    {4794870u, 0x00080000u},
+    {4801060u, 0x00080000u},
+    {4807250u, 0x00080000u},
+    {4813440u, 0x00080000u},
+    {4819630u, 0x00080000u},
+    {4825820u, 0x00080000u},
+    {4832010u, 0x00080000u},
+    {4838200u, 0x00080000u},
+    {4844390u, 0x00080000u},
+    {4850580u, 0x00080000u},
+    {4856770u, 0x00080000u},
+    {4862995u, 0x00080000u},
+    {4869185u, 0x00080000u},
+    {4875375u, 0x00080000u},
+    {4881565u, 0x00080000u},
+    {4887755u, 0x00080000u},
+    {4893945u, 0x00080000u},
+    {4900135u, 0x00080000u},
+    {4906325u, 0x00080000u},
+    {4912515u, 0x00080000u},
+    {4918705u, 0x00080000u},
+    {4924895u, 0x00080000u},
+    {4931085u, 0x00080000u},
+    {4937275u, 0x00080000u},
+    {4943465u, 0x00080000u},
+    {4949655u, 0x00080000u},
+    {4955845u, 0x00080000u},
+    {4962035u, 0x00080000u},
+    {4968225u, 0x00080000u},
+    {4974415u, 0x00080000u},
+    {4980605u, 0x00080000u},
+    {4986795u, 0x00080000u},
+    {4992985u, 0x00080000u},
+    {4999175u, 0x00080000u},
+    {5005365u, 0x00080000u},
+    {5011555u, 0x00080000u},
+    {5017745u, 0x00080000u},
+    {5023935u, 0x00080000u},
+    {5030125u, 0x00080000u},
+    {5036365u, 0x00080000u},
+    {5042555u, 0x00080000u},
+    {5048745u, 0x00080000u},
+    {5054935u, 0x00080000u},
+    {5061125u, 0x00080000u},
+    {5067315u, 0x00080000u},
+    {5073505u, 0x00080000u},
+    {5079695u, 0x00080000u},
+    {5085885u, 0x00080000u},
+    {5092075u, 0x00080000u},
+    {5098265u, 0x00080000u},
+    {5104455u, 0x00080000u},
+    {5110645u, 0x00080000u},
+    {5116835u, 0x00080000u},
+    {5123025u, 0x00080000u},
+    {5129215u, 0x00080000u},
+    {5135465u, 0x00080000u},
+    {5141655u, 0x00080000u},
+    {5147845u, 0x00080000u},
+    {5154035u, 0x00080000u},
+    {5160225u, 0x00080000u},
+    {5166425u, 0x00080000u},
+    {5172615u, 0x00080000u},
+    {5178805u, 0x00080000u},
+    {5184995u, 0x00080000u},
+    {5191185u, 0x00080000u},
+    {5197375u, 0x00080000u},
+    {5203565u, 0x00080000u},
+    {5209755u, 0x00080000u},
+    {5215945u, 0x00080000u},
+    {5222135u, 0x00080000u},
+    {5228325u, 0x00080000u},
+    {5234550u, 0x00080000u},
+    {5240780u, 0x00080000u},
+    {5246970u, 0x00080000u},
+    {5253160u, 0x00080000u},
+    {5259350u, 0x00080000u},
+    {5265540u, 0x00080000u},
+    {5271730u, 0x00080000u},
+    {5277920u, 0x00080000u},
+    {5284110u, 0x00080000u},
+    {5290300u, 0x00080000u},
+    {5296490u, 0x00080000u},
+    {5302680u, 0x00080000u},
+    {5308870u, 0x00080000u},
+    {5315060u, 0x00080000u},
+    {5321250u, 0x00080000u},
+    {5327440u, 0x00080000u},
+    {5333655u, 0x00080000u},
+    {5339845u, 0x00080000u},
+    {5346035u, 0x00080000u},
+    {5352225u, 0x00080000u},
+    {5358415u, 0x00080000u},
+    {5364605u, 0x00080000u},
+    {5370795u, 0x00080000u},
+    {5376985u, 0x00080000u},
+    {5383175u, 0x00080000u},
+    {5389365u, 0x00080000u},
+    {5395555u, 0x00080000u},
+    {5401745u, 0x00080000u},
+    {5407935u, 0x00080000u},
+    {5414125u, 0x00080000u},
+    {5420315u, 0x00080000u},
+    {5426505u, 0x00080000u},
+    {5432705u, 0x00080000u},
+    {5438895u, 0x00080000u},
+    {5445085u, 0x00080000u},
+    {5451275u, 0x00080000u},
+    {5457465u, 0x00080000u},
+    {5463655u, 0x00080000u},
+    {5469845u, 0x00080000u},
+    {5476035u, 0x00080000u},
+    {5482225u, 0x00080000u},
+    {5488415u, 0x00080000u},
+    {5494605u, 0x00080000u},
+    {5500795u, 0x00080000u},
+    {5506985u, 0x00080000u},
+    {5513175u, 0x00080000u},
+    {5519365u, 0x00080000u},
+    {5525555u, 0x00080000u},
+    {5531745u, 0x00080000u},
+    {5537935u, 0x00080000u},
+    {5544155u, 0x00080000u},
+    {5550345u, 0x00080000u},
+    {5556535u, 0x00080000u},
+    {5562725u, 0x00080000u},
+    {5568915u, 0x00080000u},
+    {5575105u, 0x00080000u},
+    {5581295u, 0x00080000u},
+    {5587485u, 0x00080000u},
+    {5593675u, 0x00080000u},
+    {5599865u, 0x00080000u},
+    {5606055u, 0x00080000u},
+    {5612245u, 0x00080000u},
+    {5618435u, 0x00080000u},
+    {5624625u, 0x00080000u},
+    {5630815u, 0x00080000u},
+    {5637005u, 0x00080000u},
+    {5643195u, 0x00080000u},
+    {5649385u, 0x00080000u},
+    {5655575u, 0x00080000u},
+    {5661765u, 0x00080000u},
+    {5667955u, 0x00080000u},
+    {5674145u, 0x00080000u},
+    {5680335u, 0x00080000u},
+    {5686525u, 0x00080000u},
+    {5692715u, 0x00080000u},
+    {5698905u, 0x00080000u},
+    {5705095u, 0x00080000u},
+    {5711285u, 0x00080000u},
+    {5717475u, 0x00080000u},
+    {5723665u, 0x00080000u},
+    {5729855u, 0x00080000u},
+    {5736045u, 0x00080000u},
+    {5742235u, 0x00080000u},
+    {5748425u, 0x00080000u},
+    {5754615u, 0x00080000u},
+    {5760805u, 0x00080000u},
+    {5766995u, 0x00080000u},
+    {5773185u, 0x00080000u},
+    {5779375u, 0x00080000u},
+    {5785565u, 0x00080000u},
+    {5791755u, 0x00080000u},
+    {5797945u, 0x00080000u},
+    {5804135u, 0x00080000u},
+    {5810325u, 0x00080000u},
+    {5816515u, 0x00080000u},
+    {5822705u, 0x00080000u},
+    {5828895u, 0x00080000u},
+    {5835085u, 0x00080000u},
+    {5841275u, 0x00080000u},
+    {5847490u, 0x00080000u},
+    {5853680u, 0x00080000u},
+    {5859870u, 0x00080000u},
+    {5866060u, 0x00080000u},
+    {5872250u, 0x00080000u},
+    {5878440u, 0x00080000u},
+    {5884630u, 0x00080000u},
+    {5890820u, 0x00080000u},
+    {5897010u, 0x00080000u},
+    {5903200u, 0x00080000u},
+    {5909390u, 0x00080000u},
+    {5915580u, 0x00080000u},
+    {5921790u, 0x00080000u},
+    {5927980u, 0x00080000u},
+    {5934170u, 0x00080000u},
+    {5940360u, 0x00080000u},
+    {5946550u, 0x00080000u},
+    {5952740u, 0x00080000u},
+    {5958930u, 0x00080000u},
+    {5965120u, 0x00080000u},
+    {5971310u, 0x00080000u},
+    {5977500u, 0x00080000u},
+    {5983690u, 0x00080000u},
+    {5989880u, 0x00080000u},
+    {5996070u, 0x00080000u},
+    {6002260u, 0x00080000u},
+    {6008450u, 0x00080000u},
+    {6014640u, 0x00080000u},
+    {6020830u, 0x00080000u},
+    {6027020u, 0x00080000u},
+    {6033210u, 0x00080000u},
+    {6039400u, 0x00080000u},
+    {6045590u, 0x00080000u},
+    {6051780u, 0x00080000u},
+    {6057970u, 0x00080000u},
+    {6064160u, 0x00080000u},
+    {6070350u, 0x00080000u},
+    {6076540u, 0x00080000u},
+    {6082730u, 0x00080000u},
+    {6088920u, 0x00080000u},
+    {6095110u, 0x00080000u},
+    {6101300u, 0x00080000u},
+    {6107490u, 0x00080000u},
+    {6113680u, 0x00080000u},
+    {6119885u, 0x00080000u},
+    {6126075u, 0x00080000u},
+    {6132265u, 0x00080000u},
+    {6138455u, 0x00080000u},
+    {6144645u, 0x00080000u},
+    {6150835u, 0x00080000u},
+    {6157025u, 0x00080000u},
+    {6163215u, 0x00080000u},
+    {6169405u, 0x00080000u},
+    {6175595u, 0x00080000u},
+    {6181785u, 0x00080000u},
+    {6187975u, 0x00080000u},
+    {6194165u, 0x00080000u},
+    {6200355u, 0x00080000u},
+    {6206545u, 0x00080000u},
+    {6212735u, 0x00080000u},
+    {6218960u, 0x00080000u},
+    {6220579u, 0x00000008u},
+    {6225211u, 0x00080000u},
+    {6231401u, 0x00080000u},
+    {6237591u, 0x00080000u},
+    {6243781u, 0x00080000u},
+    {6249971u, 0x00080000u},
+    {6256161u, 0x00080000u},
+    {6262351u, 0x00080000u},
+    {6268541u, 0x00080000u},
+    {6274731u, 0x00080000u},
+    {6280921u, 0x00080000u},
+    {6287111u, 0x00080000u},
+    {6293301u, 0x00080000u},
+    {6299491u, 0x00080000u},
+    {6305681u, 0x00080000u},
+    {6311871u, 0x00080000u},
+    {6318101u, 0x00080000u},
+    {6324291u, 0x00080000u},
+    {6330481u, 0x00080000u},
+    {6336671u, 0x00080000u},
+    {6342861u, 0x00080000u},
+    {6349051u, 0x00080000u},
+    {6355241u, 0x00080000u},
+    {6361431u, 0x00080000u},
+    {6367621u, 0x00080000u},
+    {6373811u, 0x00080000u},
+    {6380001u, 0x00080000u},
+    {6386191u, 0x00080000u},
+    {6392381u, 0x00080000u},
+    {6398571u, 0x00080000u},
+    {6404761u, 0x00080000u},
+    {6410951u, 0x00080000u},
+    {6417216u, 0x00080000u},
+    {6423406u, 0x00080000u},
+    {6429596u, 0x00080000u},
+    {6435786u, 0x00080000u},
+    {6441976u, 0x00080000u},
+    {6448166u, 0x00080000u},
+    {6454356u, 0x00080000u},
+    {6460546u, 0x00080000u},
+    {6466736u, 0x00080000u},
+    {6472926u, 0x00080000u},
+    {6479116u, 0x00080000u},
+    {6485306u, 0x00080000u},
+    {6491496u, 0x00080000u},
+    {6497686u, 0x00080000u},
+    {6503876u, 0x00080000u},
+    {6510066u, 0x00080000u},
+    {6516296u, 0x00080000u},
+    {6522486u, 0x00080000u},
+    {6528696u, 0x00080000u},
+    {6534886u, 0x00080000u},
+    {6541076u, 0x00080000u},
+    {6547266u, 0x00080000u},
+    {6553456u, 0x00080000u},
+    {6559646u, 0x00080000u},
+    {6565836u, 0x00080000u},
+    {6572026u, 0x00080000u},
+    {6578216u, 0x00080000u},
+    {6584406u, 0x00080000u},
+    {6590596u, 0x00080000u},
+    {6596786u, 0x00080000u},
+    {6603001u, 0x00080000u},
+    {6609191u, 0x00080000u},
+    {6615416u, 0x00080000u},
+    {6621606u, 0x00080000u},
+    {6627796u, 0x00080000u},
+    {6633986u, 0x00080000u},
+    {6640176u, 0x00080000u},
+    {6646366u, 0x00080000u},
+    {6652556u, 0x00080000u},
+    {6658746u, 0x00080000u},
+    {6664936u, 0x00080000u},
+    {6671126u, 0x00080000u},
+    {6677316u, 0x00080000u},
+    {6683506u, 0x00080000u},
+    {6689696u, 0x00080000u},
+    {6695886u, 0x00080000u},
+    {6702076u, 0x00080000u},
+    {6708266u, 0x00080000u},
+    {6714456u, 0x00080000u},
+    {6720646u, 0x00080000u},
+    {6726836u, 0x00080000u},
+    {6733026u, 0x00080000u},
+    {6739216u, 0x00080000u},
+    {6745406u, 0x00080000u},
+    {6751596u, 0x00080000u},
+    {6757786u, 0x00080000u},
+    {6763976u, 0x00080000u},
+    {6770166u, 0x00080000u},
+    {6776356u, 0x00080000u},
+    {6782546u, 0x00080000u},
+    {6788736u, 0x00080000u},
+    {6794926u, 0x00080000u},
+    {6801116u, 0x00080000u},
+    {6807306u, 0x00080000u},
+    {6813496u, 0x00080000u},
+    {6819686u, 0x00080000u},
+    {6825876u, 0x00080000u},
+    {6832066u, 0x00080000u},
+    {6838256u, 0x00080000u},
+    {6844446u, 0x00080000u},
+    {6850636u, 0x00080000u},
+    {6856826u, 0x00080000u},
+    {6863016u, 0x00080000u},
+    {6869206u, 0x00080000u},
+    {6875396u, 0x00080000u},
+    {6881586u, 0x00080000u},
+    {6887776u, 0x00080000u},
+    {6893966u, 0x00080000u},
+    {6900156u, 0x00080000u},
+    {6906371u, 0x00080000u},
+    {6912561u, 0x00080000u},
+    {6918751u, 0x00080000u},
+    {6924941u, 0x00080000u},
+    {6931131u, 0x00080000u},
+    {6937321u, 0x00080000u},
+    {6943511u, 0x00080000u},
+    {6949701u, 0x00080000u},
+    {6955891u, 0x00080000u},
+    {6962081u, 0x00080000u},
+    {6968271u, 0x00080000u},
+    {6974461u, 0x00080000u},
+    {6980651u, 0x00080000u},
+    {6986841u, 0x00080000u},
+    {6993031u, 0x00080000u},
+    {6999221u, 0x00080000u},
+    {7005411u, 0x00080000u},
+    {7011601u, 0x00080000u},
+    {7017791u, 0x00080000u},
+    {7023981u, 0x00080000u},
+    {7030171u, 0x00080000u},
+    {7036361u, 0x00080000u},
+    {7042551u, 0x00080000u},
+    {7048741u, 0x00080000u},
+    {7054931u, 0x00080000u},
+    {7061121u, 0x00080000u},
+    {7067311u, 0x00080000u},
+    {7073501u, 0x00080000u},
+    {7079691u, 0x00080000u},
+    {7085881u, 0x00080000u},
+    {7092071u, 0x00080000u},
+    {7098261u, 0x00080000u},
+    {7104451u, 0x00080000u},
+    {7110641u, 0x00080000u},
+    {7116831u, 0x00080000u},
+    {7123021u, 0x00080000u},
+    {7129211u, 0x00080000u},
+    {7135401u, 0x00080000u},
+    {7141591u, 0x00080000u},
+    {7147781u, 0x00080000u},
+    {7153971u, 0x00080000u},
+    {7160161u, 0x00080000u},
+    {7166351u, 0x00080000u},
+    {7172541u, 0x00080000u},
+    {7178731u, 0x00080000u},
+    {7184921u, 0x00080000u},
+    {7191111u, 0x00080000u},
+    {7197301u, 0x00080000u},
+    {7203491u, 0x00080000u},
+    {7209711u, 0x00080000u},
+    {7215901u, 0x00080000u},
+    {7222091u, 0x00080000u},
+    {7228281u, 0x00080000u},
+    {7234471u, 0x00080000u},
+    {7240676u, 0x00080000u},
+    {7246866u, 0x00080000u},
+    {7253056u, 0x00080000u},
+    {7259246u, 0x00080000u},
+    {7265436u, 0x00080000u},
+    {7271626u, 0x00080000u},
+    {7277816u, 0x00080000u},
+    {7284026u, 0x00080000u},
+    {7290216u, 0x00080000u},
+    {7296406u, 0x00080000u},
+    {7302596u, 0x00080000u},
+    {7308786u, 0x00080000u},
+    {7314976u, 0x00080000u},
+    {7321166u, 0x00080000u},
+    {7327356u, 0x00080000u},
+    {7333546u, 0x00080000u},
+    {7339736u, 0x00080000u},
+    {7345941u, 0x00080000u},
+    {7352131u, 0x00080000u},
+    {7358321u, 0x00080000u},
+    {7364511u, 0x00080000u},
+    {7370701u, 0x00080000u},
+    {7376891u, 0x00080000u},
+    {7383081u, 0x00080000u},
+    {7389271u, 0x00080000u},
+    {7395461u, 0x00080000u},
+    {7401671u, 0x00080000u},
+    {7407861u, 0x00080000u},
+    {7414051u, 0x00080000u},
+    {7420241u, 0x00080000u},
+    {7426431u, 0x00080000u},
+    {7432621u, 0x00080000u},
+    {7438811u, 0x00080000u},
+    {7445001u, 0x00080000u},
+    {7451191u, 0x00080000u},
+    {7457381u, 0x00080000u},
+    {7463571u, 0x00080000u},
+    {7469761u, 0x00080000u},
+    {7475951u, 0x00080000u},
+    {7482141u, 0x00080000u},
+    {7488331u, 0x00080000u},
+    {7494521u, 0x00080000u},
+    {7500756u, 0x00080000u},
+    {7506946u, 0x00080000u},
+    {7513136u, 0x00080000u},
+    {7519326u, 0x00080000u},
+    {7525516u, 0x00080000u},
+    {7531706u, 0x00080000u},
+    {7537896u, 0x00080000u},
+    {7544086u, 0x00080000u},
+    {7550276u, 0x00080000u},
+    {7556486u, 0x00080000u},
+    {7562676u, 0x00080000u},
+    {7568866u, 0x00080000u},
+    {7575056u, 0x00080000u},
+    {7581246u, 0x00080000u},
+    {7587461u, 0x00080000u},
+    {7593651u, 0x00080000u},
+    {7599896u, 0x00080000u},
+    {7606086u, 0x00080000u},
+    {7612276u, 0x00080000u},
+    {7618466u, 0x00080000u},
+    {7624656u, 0x00080000u},
+    {7630846u, 0x00080000u},
+    {7637036u, 0x00080000u},
+    {7643226u, 0x00080000u},
+    {7649416u, 0x00080000u},
+    {7655606u, 0x00080000u},
+    {7661796u, 0x00080000u},
+    {7667986u, 0x00080000u},
+    {7674176u, 0x00080000u},
+    {7680366u, 0x00080000u},
+    {7686556u, 0x00080000u},
+    {7692746u, 0x00080000u},
+    {7698976u, 0x00080000u},
+    {7705166u, 0x00080000u},
+    {7711356u, 0x00080000u},
+    {7717546u, 0x00080000u},
+    {7723736u, 0x00080000u},
+    {7729926u, 0x00080000u},
+    {7736116u, 0x00080000u},
+    {7742306u, 0x00080000u},
+    {7748496u, 0x00080000u},
+    {7754686u, 0x00080000u},
+    {7760876u, 0x00080000u},
+    {7767066u, 0x00080000u},
+    {7773256u, 0x00080000u},
+    {7779446u, 0x00080000u},
+    {7785638u, 0x00080000u},
+    {7785963u, 0x00080000u},
+    {7786056u, 0x00080000u},
+    {9097800u, 0x00000008u},
+};
+#define IRQ_RAISE_N ((int)(sizeof irq_raise_log / sizeof irq_raise_log[0]))
+static const uint32_t irq_trig_log[] = { 3635491u, 6220580u, 9097801u };
+#define IRQ_TRIG_N ((int)(sizeof irq_trig_log / sizeof irq_trig_log[0]))
+
+static void irq_tick(void) {
+    while (irq_raise_n < IRQ_RAISE_N && steps > irq_raise_log[irq_raise_n].step) {
+        iflags |= irq_raise_log[irq_raise_n].mask;
+        irq_raise_n++;
+    }
+    /* ARM7 IPC-status halfword (Phase-4C): the ARM7 writes 1 to the shared
+     * main-RAM word at 0x02FFFC40 (main-RAM offset 0x3FFC40 in melonDS's
+     * 4 MiB-mirrored view; the native flat window has no mirror, so the
+     * literal address is used — the ARM9's only readers load the same
+     * literal, 0x02008DF0 / 0x02008EA8) while servicing the IPC FIFO
+     * request.  The exact write moment is NOT yet captured; it is bracketed
+     * by measurement: the ARM9's first read (call 0x02008DD8 at trace index
+     * ~3632991, before the FIFO IRQ) saw 0 in BOTH melonDS and native, and
+     * the second read (index 3636869) saw 1 in melonDS.  Scripted at the
+     * FIFO-IRQ delivery boundary (steps > 3635491), inside the bracket. */
+    if (!arm7_ipcstat_done && steps > 3635491u) {
+        st16(0x02FFFC40u, 1u);
+        arm7_ipcstat_done = 1;
+        fprintf(stderr, "arm7 ipcstat step=%llu [0x02FFFC40]=1\n", (unsigned long long)steps);
+    }
+}
+static void irq_enter(uint32_t *pc) {
+    uint32_t vec = ld32(((cp15_dtcm_setting & ~0xFFu) + 0x4000u) - 4u);
+    if (vec < ITCM_LO || vec >= ITCM_HI) {
+        halt_reason("IRQ user vector is not the ITCM stub");
+        fprintf(stderr, "irq enter step=%llu: user vector 0x%08X rejected\n",
+                (unsigned long long)steps, vec);
+        return;
+    }
+    uint32_t resume = *pc;
+    /* Exception entry: SPSR_irq = the interrupted CPSR, then switch to IRQ
+     * mode (I+F masked) which swaps in the IRQ bank of r13/r14.  The guest
+     * sets that bank itself (crt0 at 0x02000834..0x02000840 computes
+     * 0x027E3F7C), so no seed is applied here. */
+    spsr_bank[MODE_IRQ] = (n << 31) | (z << 30) | (c << 29) | (v << 28) | 0x10u | cpsr_ctl;
+    cpsr_set_ctl(0xD2u);
+    {
+        uint32_t sp = r[13] - 24u;      /* BIOS frame: r0-r3, r12, lr */
+        st32(sp, r[0]); st32(sp + 4u, r[1]); st32(sp + 8u, r[2]);
+        st32(sp + 12u, r[3]); st32(sp + 16u, r[12]); st32(sp + 20u, resume + 4u);
+        r[13] = sp;
+    }
+    r[14] = BIOS_IRQ_RET;
+    irq_active = 1;
+    cycles += 12u;                     /* BIOS entry: honest small charge */
+    fprintf(stderr, "irq enter step=%llu resume=0x%08X vector=0x%08X sp_irq=0x%08X spsr=0x%08X ime=%u ie=0x%08X if=0x%08X\n",
+            (unsigned long long)steps, resume, vec, r[13], spsr_bank[MODE_IRQ], ime, ie, iflags);
+    *pc = vec;
+}
+static void bios_irq_return(uint32_t *pc) {
+    uint32_t sp = r[13];
+    r[0] = ld32(sp); r[1] = ld32(sp + 4u); r[2] = ld32(sp + 8u);
+    r[3] = ld32(sp + 12u); r[12] = ld32(sp + 16u);
+    uint32_t lr = ld32(sp + 20u);
+    r[13] = sp + 24u;
+    {
+        uint32_t sr = spsr_bank[MODE_IRQ];
+        n = (sr >> 31) & 1u; z = (sr >> 30) & 1u;
+        c = (sr >> 29) & 1u; v = (sr >> 28) & 1u;
+        cpsr_set_ctl(sr & 0xFFu);       /* back to the interrupted mode+bank */
+    }
+    irq_active = 0;
+    *pc = lr - 4u;
+    cycles += 4u;                      /* BIOS epilogue */
+    fprintf(stderr, "irq return step=%llu pc=0x%08X cpsr_ctl=0x%08X mode=%d sp=0x%08X\n",
+            (unsigned long long)steps, *pc, cpsr_ctl, mode_cur, r[13]);
 }
 
 /* Barrel shifter: value, kind (0 lsl / 1 lsr / 2 asr / 3 ror|rrx), amount,
@@ -2014,6 +2953,8 @@ const RUNTIME_ALL_MAIN: &str = r##"int main(int argc, char **argv) {
     guest_init();
     { const char *s = getenv("NNK_STEP_LIMIT");
       if (s && s[0]) step_limit = strtoull(s, NULL, 0); }
+    { const char *s = getenv("NNK_MODE_TRACE");
+      if (s && s[0]) mode_trace = atoi(s); }
     { const char *s = getenv("NNK_DUMP_AT_PC");
       if (s && s[0]) ckpt_pc = (uint32_t)strtoul(s, NULL, 0); }
     { const char *s = getenv("NNK_DEBUG_AT_PC");

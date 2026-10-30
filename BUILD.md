@@ -282,3 +282,44 @@ The merged image used for Phase-4B/4C runs:
 NNK_IMAGE_C=/home/hermes/NiNoKuni/work/phase3a/arm9_thumb_itcm.c \
 NNK_CFLAGS_EXTRA="-DTRACE_LIMIT=20000000ull" tools/build_split.sh
 ```
+
+## 10. Phase-4C: ARM9 IRQ/exception model, mode banking, main-RAM mirror
+
+Implemented in `nnktool/src/recompile.rs` (`RUNTIME_ALL`, and mirrored in the
+single-function runtime because the Phase-1A entry translation contains the
+crt0's `msr CPSR_c`):
+
+* **IRQ machinery** — scripted IF raises + architecturally gated exception
+  entry + BIOS epilogue HLE, regenerated from a melonDS capture by
+  `tools/gen_irq_script.py` (`tools/add_irqtrace.py` is the melonDS hook).
+  Measured: 624 IF raises, 3 deliveries in 10M ARM9 PCs.
+* **Mode banking** — r13/r14 per mode (USR/SYS shared, FIQ, IRQ, SVC, ABT,
+  UND) plus an SPSR per mode; `msr CPSR_c` switches banks; `msr SPSR_*` writes
+  the current mode's SPSR and never the CPSR; `ldm/stm ...^` reads/writes the
+  USER bank for r13/r14; `subs pc, lr, #4` / `movs pc, lr` implement the ARM
+  exception return (PC = value, CPSR <- SPSR, bank swap).
+* **Main-RAM mirror** — every address in 0x02000000..0x02FFFFFF aliases the
+  4 MiB main RAM through `addr & 0x3FFFFF`, exactly like melonDS's
+  `case 0x02000000` in ARM9Read32/Write32 (`win_off()`); scripted ARM7-side
+  writes use `main_ram_ptr()`. The SDK depends on it: boot params live at
+  0x027FFE00 (= main-RAM 0x3FFE00) and the 0x02FFFE80 / 0x02FFFF8C flags are
+  aliases of main-RAM 0x3FFE80 / 0x3FFF8C.
+
+One-shot iterate/reproduce helper (emitter build → both recompile-all runs →
+merge → split build → native run → trace compare):
+
+```
+sh tools/it_irq.sh /tmp/nat_pc.txt
+```
+
+Diagnostics knobs: `NNK_MODE_TRACE=1` logs every bank switch
+(`mode a->b step=N sp=0x.. lr=0x..`), `NNK_DEBUG_AT_PC=<pc>` dumps registers
+at a PC, `NNK_STEP_LIMIT=<n>` caps the run.
+
+melonDS ground-truth hooks added for this phase:
+
+* `tools/add_regprobe.py` — per-PC register dump including the banked SVC/IRQ
+  r13/r14 and SPSR (`MELONDS_REGPROBE_PATH`, `MELONDS_REGPROBE_PCS`).
+* `tools/add_memwatch_window.py <lo> <hi>` — extra MemWatch main-RAM window
+  (logs the writing CPU, its PC and the ARM9 PC-trace index), on top of
+  `tools/melonds-phase4a-watch.patch`.
