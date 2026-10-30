@@ -64,30 +64,51 @@ static void nnk_dma_copy(int i) {
                      ? cnt : (cnt & ~0x80000000u);
 }
 
-/* Phase-4N: DMA start mode 3 = "special" = game card (melonDS DMA::WriteCnt
- * StartMode 3 for ARM9 = NDSCart DRQ).  The storage-image read loop arms such
- * a channel and then sleeps in the WFI idle loop at 0x0200712C waiting for the
- * cart transfer-done IRQ.  Without a card-DRQ drain the transfer stalls at the
- * 2-word FIFO, never reaches ROMEndTransfer, and the IRQ never fires
- * (measured: p4n_wake.txt "irqwake ... enabled=0x00080000" once per transfer).
- * The drain walks the card state machine forward to each scheduled event, so
- * the transfer really completes and AUXSPICNT bit14 really raises IF bit19. */
+/* Phase-4O: ARM9 DMA start mode 5 = "game card DRQ".
+ *
+ * Phase-4N modelled this as mode 3 ("special") and therefore never fired: the
+ * ARM9 start-timing field is (Cnt >> 27) & 7 (melonDS DMA::WriteCnt) and the
+ * cart trigger is mode 5 — NDSCart::Interface::CheckDMA() calls
+ * NDS::CheckDMAs(0, 0x05) when ROMCNT bit23 (DRQ) rises.
+ *
+ * MEASURED PRODUCER (melonDS ground truth, MELONDS_DMALOG_PATH +
+ * MELONDS_CARDLOG_PATH, p4o_dma.log / p4o_card.log): the ITCM card-read helper
+ * writes DMA2CNT = 0xAF000001 at PC 0x01FF84D0, ts 56,526,612 —
+ *   bit31 enable, bits27-29 = 5 (cart DRQ), bit25 repeat, 16-bit units,
+ *   SAD = 0x04100010 (card data FIFO), DAD = 0x02079F80 (destination buffer)
+ * — 182 cycles before the guest reaches the WFI idle loop 0x0200712C, and the
+ * same helper then starts a 0x200-byte B7 read (ROMCNT 0xA1416657,
+ * AUXSPICNT 0xC000 = IRQ enable).  While the CPU is stopped the DMA moves the
+ * whole transfer out of the card FIFO (melonDS ReadROMData log: halted=1,
+ * pc=0x0200911C, reads=128, last read -> ROMEndTransfer -> IF bit19 at
+ * ts 56,548,252 = the loop's first wake).  So the producer is this DMA, not a
+ * guest poll loop: without it the FIFO stalls at 2 words, the transfer never
+ * ends and the loop can never be woken.
+ *
+ * The drain below walks the card state machine forward to each scheduled
+ * event, so the transfer really completes and AUXSPICNT bit14 really raises
+ * IF bit19; the destination buffer receives the card byte stream in order
+ * (16-bit units = two halfwords per FIFO word, 32-bit units = one word). */
 static unsigned nnk_dma_card_n;
 static void nnk_dma_card(int i) {
     uint32_t cnt = dma_cnt[i];
     uint32_t count = cnt & 0x001FFFFFu;
     int word = (cnt & (1u << 26)) != 0;
     uint32_t step = word ? 4u : 2u;
+    uint32_t per = word ? 1u : 2u;        /* count units per FIFO word */
     uint32_t dadir = (cnt >> 21) & 3u;
-    uint32_t d = dma_dad[i], done = 0;
+    uint32_t d = dma_dad[i], done = 0, popped = 0;
     if (!count) count = 0x00200000u;
-    while (done < count) {
-        uint32_t guard = 0x10000u;
-        while (!card_drq && card_next != CARD_NEVER && guard--) {
-            card_cycles = card_next;      /* advance the scheduled card event */
+    for (;;) {
+        /* Only fire card events that are ALREADY due on the card-bus clock:
+         * the transfer must take its modelled 21,7xx cycles of wall time, or
+         * the DMA would deliver the whole 0x200-byte read in one step and the
+         * guest would never enter the WFI idle loop the vendor SDK uses for
+         * blocking card reads.  melonDS throttles the same way: its DMA runs
+         * only up to ARM9Target (DMA::Run9), so the CPU halts in between. */
+        while (!card_drq && card_next != CARD_NEVER && card_next <= card_cycles)
             card_tick(0u);
-        }
-        if (!card_drq) break;             /* card idle: leave the channel armed */
+        if (!card_drq) break;             /* nothing due: leave the channel armed */
         {
             uint32_t v = card_fifo[card_poscpu];
             card_poscpu ^= 1;
@@ -99,19 +120,26 @@ static void nnk_dma_card(int i) {
                 if (card_count == 0) card_end_transfer();
                 else card_drq = 1;
             }
-            if (word) st32(d, v); else st16(d, (uint16_t)v);
+            if (word) st32(d, v);
+            else { st16(d, (uint16_t)(v & 0xFFFFu)); st16(d + 2u, (uint16_t)(v >> 16)); }
         }
+        popped++;
+        done += per;
         if (dadir == 1u) d -= step; else if (dadir != 2u) d += step;
-        done++;
-    }
-    if (done == count) {
-        dma_cnt[i] = (cnt & (1u << 25)) ? cnt : (cnt & ~0x80000000u);
-        if (nnk_dma_card_n < 8u) {
-            fprintf(stderr, "dma: card DMA%d drained %u %s words from 0x%08X "
-                    "to 0x%08X pc=0x%08X\n", i, done, word ? "word" : "half",
-                    dma_sad[i], dma_dad[i], last_pc);
-            nnk_dma_card_n++;
+        if (done >= count) {
+            /* Repeat bit (25) keeps the channel armed and reloads the count;
+             * without it the channel completes and the enable bit clears
+             * (melonDS DMA::Run9). */
+            if (!(cnt & (1u << 25))) { dma_cnt[i] = cnt & ~0x80000000u; break; }
+            done = 0;
         }
+    }
+    dma_dad[i] = d;
+    if (nnk_dma_card_n < 8u && popped) {
+        fprintf(stderr, "dma: card DMA%d drained %u FIFO words (%s) from "
+                "0x%08X to 0x%08X cnt=0x%08X pc=0x%08X\n", i, popped,
+                word ? "word" : "half", dma_sad[i], dma_dad[i], dma_cnt[i], last_pc);
+        nnk_dma_card_n++;
     }
 }
 
@@ -142,7 +170,10 @@ void nnk_dma_tick(void) {
         if (!(cnt & 0x80000000u)) continue;
         uint32_t mode = (cnt >> 27) & 7u;
         if (mode == 0u) { nnk_dma_copy(i); continue; }
-        if (mode == 3u) { nnk_dma_card(i); continue; }
+        /* Phase-4O: mode 5 = game card DRQ (ARM9 CNT bits 27-29; melonDS
+         * CheckDMA -> CheckDMAs(0, 0x05)).  Phase-4N's mode-3 guess never
+         * matched any measured arm and is replaced. */
+        if (mode == 5u) { nnk_dma_card(i); continue; }
         if ((mode == 1u && vbedge) || (mode == 2u && hbedge)) {
             if (nnk_dma_timed_n < 4u) {
                 fprintf(stderr, "dma: timed DMA%d mode=%u fired pc=0x%08X "
