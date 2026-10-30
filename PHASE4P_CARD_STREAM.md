@@ -187,8 +187,10 @@ env XDG_CONFIG_HOME=$S/melonds_cfg SDL_AUDIODRIVER=dummy \
 #   p4p_tail.py      tail PC histogram -> the spinning loop
 ```
 
-`SKIP_MELONDS=1 sh tools/verify_phase2a.sh` on this branch: green (log
-`p4p_verify.log`).
+`SKIP_MELONDS=1 sh tools/verify_phase2a.sh` on this branch: **green, rc=0**
+(log `p4p_verify.log`): A2 `RESULT: PASS`, Ghidra bodies 100 % covered,
+recompile-all 72,959 cases / 2,020 functions, and the strict common prefix
+**1,000 / 1,000 melonDS PCs (100.0 %)** with the 2M-PC native trace.
 
 ## 6. Known simplifications / follow-ups
 
