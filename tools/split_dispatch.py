@@ -412,6 +412,9 @@ def main():
     here = os.path.dirname(os.path.abspath(__file__))
     shutil.copyfile(os.path.join(here, "nnk_smc.inc"),
                     os.path.join(outdir, "nnk_smc.inc"))
+    # (3) Phase-4L: the DMA completion/timing shim
+    shutil.copyfile(os.path.join(here, "nnk_dma.inc"),
+                    os.path.join(outdir, "nnk_dma.inc"))
 
     # ---- header: band constants + ALL possible band prototypes so the header
     # content does not change when a new band appears (it is part of every
@@ -464,6 +467,9 @@ def main():
         fh.write("static void nnk_boot_firmware(void);\n")
         fh.writelines(prelude[:tf_idx])
         fh.write('#include "nnk_boot.inc"\n\n')
+        # Phase-4L: DMA completion/timing shim (tools/nnk_dma.inc) — included
+        # here so it sees the runtime statics, called once per dispatch below.
+        fh.write('#include "nnk_dma.inc"\n\n')
         fh.write("static const NnkPartFn nnk_band_table[NNK_BAND_COUNT] = {\n")
         for bi in sorted(bands):
             if bi == ITCM_BAND:
@@ -481,6 +487,7 @@ def main():
         fh.write("            /* Phase-4J: SMC — if a guest store changed the word this PC\n")
         fh.write("             * dispatches, the compiled case is from a stale image generation:\n")
         fh.write("             * re-decode it from live RAM and skip the band switch. */\n")
+        fh.write("            nnk_dma_tick();\n")
         fh.write("            if (nnk_smc_try(&pc)) continue;\n")
         if ITCM_BAND in bands:
             # ITCM-resident code: band -1, below the flat window, dispatched
