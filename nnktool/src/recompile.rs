@@ -1791,6 +1791,7 @@ static void io_sqrt_do(void) {
     sqrt_res = (uint32_t)res; sqrt_ctrl |= 0x8000u; sqrt_ctrl &= ~0x8000u;
 }
 
+static void io_ovl_init(void);   /* Phase-4G overlay-slot registry (defined below) */
 static void io_load_rom(void) {
     const char *p = getenv("NNK_ROM_PATH");
     if (!p || !p[0]) { fprintf(stderr, "io: NNK_ROM_PATH unset; card reads return 0\\n"); return; }
@@ -1800,6 +1801,91 @@ static void io_load_rom(void) {
     if (n > 0) { rom = malloc((size_t)n); rom_len = fread(rom, 1, (size_t)n, f); }
     fclose(f); rom_loaded = 1;
     fprintf(stderr, "io: card rom %zu bytes from %s\\n", rom_len, p);
+    io_ovl_init();
+}
+
+/* ---- overlay-slot registry + per-load overlay dumps (Phase-4G) -----------
+ * The dispatch image has ONE case per PC, but a NITRO overlay ARENA holds a
+ * different module per load (overlays 0..13 all load at 0x02079F80, 14..16 at
+ * 0x020C18E0, 17..18 at 0x020D0A00, 19..20 at 0x02159FE0), and the guest
+ * decrypts + initialises pages of the resident module at run time.  This
+ * registry is the one place that answers "which overlay is resident in which
+ * arena, in which load generation", derived from the card transfers the guest
+ * actually performs (a 0xB7 read whose address is the first byte of an ARM9
+ * overlay's FAT range IS that overlay's load) plus the ROM's overlay table.
+ *
+ *   NNK_OVL_TRACE=<path>  write one `ovl_load ...` line per load; this is the
+ *                         build-time input of tools/ovl_registry.py --trace
+ */
+static struct { uint32_t file_id, rom_off, rom_end, ram, ram_size; } ovl_tab[32];
+static int ovl_n;
+static struct { uint32_t arena; int id; int gen; } ovl_arena[8];
+static int ovl_arena_n;
+static FILE *ovl_fp;
+static int ovl_init_done, ovl_load_seq;
+
+static uint32_t ovl_rd32(size_t o) {
+    if (!rom || o + 4u > rom_len) return 0;
+    return (uint32_t)rom[o] | ((uint32_t)rom[o + 1u] << 8) |
+           ((uint32_t)rom[o + 2u] << 16) | ((uint32_t)rom[o + 3u] << 24);
+}
+static void io_ovl_init(void) {
+    const char *p;
+    if (ovl_init_done) return;
+    ovl_init_done = 1;
+    if (!rom || rom_len < 0x60u) return;
+    {
+        uint32_t fat_off = ovl_rd32(0x48), ovt_off = ovl_rd32(0x50), ovt_size = ovl_rd32(0x54);
+        uint32_t i, n = ovt_size / 32u;
+        if (n > 32u) n = 32u;
+        for (i = 0; i < n; i++) {
+            size_t o = (size_t)ovt_off + 32u * (size_t)i;
+            uint32_t file_id = ovl_rd32(o + 24u);
+            if ((size_t)fat_off + 8u * (size_t)file_id + 8u > rom_len) continue;
+            ovl_tab[ovl_n].file_id = file_id;
+            ovl_tab[ovl_n].rom_off = ovl_rd32((size_t)fat_off + 8u * (size_t)file_id);
+            ovl_tab[ovl_n].rom_end = ovl_rd32((size_t)fat_off + 8u * (size_t)file_id + 4u);
+            ovl_tab[ovl_n].ram = ovl_rd32(o + 4u);
+            ovl_tab[ovl_n].ram_size = ovl_rd32(o + 8u);
+            ovl_n++;
+        }
+    }
+    p = getenv("NNK_OVL_TRACE");
+    if (p && p[0]) {
+        ovl_fp = fopen(p, "w");
+        if (ovl_fp) setvbuf(ovl_fp, NULL, _IOLBF, 0);
+    }
+    if (ovl_n)
+        fprintf(stderr, "io: overlay registry: %d ARM9 overlays from the ROM overlay table\\n", ovl_n);
+}
+static void io_ovl_note(uint32_t addr) {
+    int i;
+    if (!ovl_init_done) io_ovl_init();
+    for (i = 0; i < ovl_n; i++) {
+        int g = 0, j;
+        if (addr != ovl_tab[i].rom_off) continue;
+        for (j = 0; j < ovl_arena_n; j++)
+            if (ovl_arena[j].arena == ovl_tab[i].ram) {
+                ovl_arena[j].id = i; ovl_arena[j].gen++; g = ovl_arena[j].gen; break;
+            }
+        if (j == ovl_arena_n && ovl_arena_n < 8) {
+            ovl_arena[ovl_arena_n].arena = ovl_tab[i].ram;
+            ovl_arena[ovl_arena_n].id = i;
+            ovl_arena[ovl_arena_n].gen = 1;
+            g = 1;
+            ovl_arena_n++;
+        }
+        ovl_load_seq++;
+        if (ovl_fp)
+            fprintf(ovl_fp, "ovl_load seq=%d id=%d rom=0x%08X size=0x%X dest=0x%08X ram_size=0x%X gen=%d\\n",
+                    ovl_load_seq, i, ovl_tab[i].rom_off,
+                    ovl_tab[i].rom_end - ovl_tab[i].rom_off,
+                    ovl_tab[i].ram, ovl_tab[i].ram_size, g);
+        fprintf(stderr, "ovl: load id=%d rom=0x%08X size=0x%X dest=0x%08X gen=%d\\n",
+                i, ovl_tab[i].rom_off, ovl_tab[i].rom_end - ovl_tab[i].rom_off,
+                ovl_tab[i].ram, g);
+        return;
+    }
 }
 
 /* ---- BIOS boot state (Phase-4C2) -----------------------------------------
@@ -2089,6 +2175,7 @@ static void io_card_start(uint32_t val) {
         fprintf(stderr, "io: card cmd 0x%02X (0xB7/0xB8 modelled) pc=0x%08X\n",
                 card_cmd[0], last_pc);
     card_op = card_cmd[0];
+    if (card_cmd[0] == 0xB7) io_ovl_note(addr);   /* Phase-4G: overlay load event */
     card_xfer = (val & (1u << 27)) ? 8u : 5u;
     card_gap2 = (val >> 16) & 0x3Fu;
     cmddelay = 8u + (val & 0x1FFFu) + (datasize ? card_gap2 : 0u);
