@@ -363,6 +363,16 @@ void nnk_ipc_send(uint32_t v) {
     }
 }
 
+/* Phase-4R state + forward decls (defined below, used by nnk_ipc_tick) */
+#define NNK_P4R_QMAX 32
+static struct { uint32_t word; uint64_t at; } nnk_p4r_q[NNK_P4R_QMAX];
+static unsigned nnk_p4r_qn;
+static unsigned nnk_p4r_emitted, nnk_p4r_drop_log;
+static int nnk_p4r_armed;
+static struct { uint32_t word; uint64_t period; uint64_t next; } nnk_p4r_stream[3];
+static void nnk_p4r_arm(uint64_t t0);
+static void nnk_p4r_schedule(void);
+
 static void nnk_ipc_tick(void) {
     if (nnk_ipc_reply_pend && cycles >= nnk_ipc_reply_at) {
         nnk_ipc_reply_pend = 0;
@@ -371,5 +381,113 @@ static void nnk_ipc_tick(void) {
         fprintf(stderr, "ipc: reply 0x%08X queued if=0x%08X ie=0x%08X ime=%u "
                 "cpsr=%02X step=%llu\n", nnk_ipc_reply_word, iflags, ie, ime,
                 (unsigned)cpsr_ctl, (unsigned long long)steps);
+        nnk_p4r_arm(cycles);                 /* Phase-4R: measured rhythm starts */
+    }
+    if (nnk_p4r_armed) {
+        nnk_p4r_schedule();
+        /* deliver every due word; the FIFO-full case retries next dispatch */
+        while (nnk_p4r_qn && cycles >= nnk_p4r_q[0].at) {
+            if (arm9_recv_n >= 16u) break;
+            uint32_t w = nnk_p4r_q[0].word;
+            arm9_recv_fifo[arm9_recv_n++] = w;
+            iflags |= 0x00040000u;           /* IRQ_IPCRecv, as melonDS */
+            nnk_p4r_emitted++;
+            if (nnk_p4r_emitted <= 8u || (nnk_p4r_emitted & 255u) == 0u) {
+                /* Phase-4R probe: the guest's queue state at delivery time.
+                 * 0x0206CA5C = the wait's snapshot word (ldr r1,[r6,#4] with
+                 * r6=0x0206CA58); the sequence is *( *(0x0206E580) ). */
+                uint32_t snap = ld32(0x0206CA5Cu);
+                uint32_t p = ld32(0x0206E580u);
+                uint32_t seq = p ? ld32(p) : 0u;
+                fprintf(stderr, "ipc: p4r ARM7 -> 0x%08X queued if=0x%08X "
+                        "ie=0x%08X ime=%u cpsr=%02X recv_n=%u snap=%08X "
+                        "seq=%08X step=%llu\n",
+                        w, iflags, ie, ime, (unsigned)cpsr_ctl,
+                        (unsigned)arm9_recv_n, snap, seq,
+                        (unsigned long long)steps);
+            }
+            memmove(nnk_p4r_q, nnk_p4r_q + 1,
+                    (--nnk_p4r_qn) * sizeof nnk_p4r_q[0]);
+        }
+    }
+}
+
+/* ---- Phase-4R: the ARM7 periodic IPC producer (measured rhythm) ----------
+ *
+ * PHASE-4Q's STOP-REPORT BARRIER, NOW MEASURED.  After the reply 0xC0204006
+ * the guest calls the SDK wait at 0x0200ACC8..0x0200AD20: it snapshots the
+ * OS message-queue sequence (bl 0x0200B3F4 -> word behind *(0x0206E580)),
+ * then loops { restore-IRQ (0x02008D34), swiDelay(50) (wrapper 0x02008D9C ->
+ * loop body 0x02008D90, 21 iterations), disable-IRQ (0x02008D20), re-read
+ * the sequence } while the sequence is unchanged.  The sequence only moves
+ * when the SDK IPC mailbox loop (0x0200BB00..0x0200BB8C, FIFO read port
+ * 0x04100000 at pc 0x0200BB44) dispatches a word to a registered handler
+ * (table indexed by word & 0x1F) — i.e. when the ARM7 SENDS A MESSAGE.
+ * melonDS's ARM7 does so on a strict cadence; this responder answered only
+ * the scripted one-shot, so the sequence never moved and the guest spun in
+ * the wait for the whole step budget (halt state r0=0x00000008 r14=0x02008DB4
+ * = the tail of one 21-iteration chunk, entered at step 18,578,180 right
+ * after the request send 0x81B34E07 at step 18,578,090).
+ *
+ * melonDS ground truth (p4q_mel_io.txt; the IO trace is ARM9-side only, so
+ * the ARM7's sends are seen as ARM9 recv-FIFO reads R32 0x04100000, all at
+ * pc 0x0200BB44, ts in ARM9-cycle units).  Offsets below are relative to
+ * the barrier reply read at ts 28,709,423:
+ *
+ *   word        n       first ts        period (measured)      handler
+ *   0xC0240006  2,770   29,132,895      560,190 = one frame    id 6 (driver)
+ *                           (+423,472; consecutive deltas 559,154..560,235)
+ *   0x00008007  4,631   29,213,146      335,104 (med)          id 7
+ *                           (+503,723; min 332,734 max 337,398 = the ARM7's
+ *                            100 Hz tick, 33,513,982/100 = 335,140)
+ *   0x00008087  1,578   30,208,472      983,040 (med)          id 7
+ *                           (+1,499,049; the 3-tick variant)
+ *
+ * The stream is not idle traffic: the guest ANSWERS each 100 Hz tick with
+ * the next card request (send 0x81B36C07 at ts 29,218,077 = +5,061 after the
+ * tick at 29,213,146; send 0x81B39C07 at ts 29,552,703 = +4,402 after the
+ * tick at 29,548,301) and the ARM7's per-frame 0xC0240006 is the "done"
+ * heartbeat of that protocol — so the cadence drives both the wait above and
+ * the card streaming that follows it (melonDS re-arms the bus at ts
+ * 29,024,936 and issues the first ROMCTRL command at ts 29,034,972, both
+ * well before the first reply; the delay gap never exceeds 141,230 ts).
+ *
+ * Rare words NOT modelled here (measured, out of this phase's window):
+ * 0x0000006B x5, a burst at ts 50,485,392..50,498,023. */
+static void nnk_p4r_enqueue(uint32_t word, uint64_t at) {
+    if (nnk_p4r_qn >= NNK_P4R_QMAX) {        /* ARM7 FIFO-full: melonDS would */
+        if (nnk_p4r_drop_log < 8u) {         /* stall the sender; we drop the */
+            fprintf(stderr, "ipc: p4r FIFO-full drop 0x%08X at=%llu step=%llu\n",
+                    word, (unsigned long long)at, (unsigned long long)steps);
+            nnk_p4r_drop_log++;
+        }
+        return;
+    }
+    nnk_p4r_q[nnk_p4r_qn].word = word;
+    nnk_p4r_q[nnk_p4r_qn].at = at;
+    nnk_p4r_qn++;
+}
+
+static void nnk_p4r_arm(uint64_t t0) {
+    if (nnk_p4r_armed) return;
+    nnk_p4r_armed = 1;
+    /* offsets/periods measured from the barrier reply (see block comment) */
+    nnk_p4r_stream[0].word = 0xC0240006u; nnk_p4r_stream[0].period = 560190u;
+    nnk_p4r_stream[0].next = t0 + 423472u;
+    nnk_p4r_stream[1].word = 0x00008007u; nnk_p4r_stream[1].period = 335104u;
+    nnk_p4r_stream[1].next = t0 + 503723u;
+    nnk_p4r_stream[2].word = 0x00008087u; nnk_p4r_stream[2].period = 983040u;
+    nnk_p4r_stream[2].next = t0 + 1499049u;
+    fprintf(stderr, "ipc: p4r periodic producer armed t0=%llu step=%llu\n",
+            (unsigned long long)t0, (unsigned long long)steps);
+}
+
+static void nnk_p4r_schedule(void) {
+    int i;
+    for (i = 0; i < 3; i++) {
+        while (cycles >= nnk_p4r_stream[i].next) {
+            nnk_p4r_enqueue(nnk_p4r_stream[i].word, nnk_p4r_stream[i].next);
+            nnk_p4r_stream[i].next += nnk_p4r_stream[i].period;
+        }
     }
 }
