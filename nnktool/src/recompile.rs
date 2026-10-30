@@ -2015,10 +2015,17 @@ static inline uint32_t ld32(uint32_t a) {
       return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24); } }
     return 0;
 }
+/* Phase-4J: code-window write tracking (SMC).  Defined in tools/nnk_smc.inc,
+ * which the dispatch image pulls in at the end of this prelude; every guest
+ * store reports its address so the affected 32 KiB band's generation counter
+ * advances and compiled cases for that band are invalidated at dispatch. */
+static inline void smc_note(uint32_t a, uint32_t n);
+
 static inline void st32(uint32_t a, uint32_t v) {
 #ifdef NNK_GX
     if (gxd && gxd_mem_io(a)) { gxd_io_write(gxd, a, v, 4); return; }
 #endif
+    smc_note(a, 4u);
     if (a < itcm_size) {
         uint8_t *p = itcm + (a & (ITCM_PHYS - 1u));
         p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
@@ -2053,6 +2060,7 @@ static inline void st16(uint32_t a, uint16_t v) {
 #ifdef NNK_GX
     if (gxd && gxd_mem_io(a)) { gxd_io_write(gxd, a, v, 2); return; }
 #endif
+    smc_note(a, 2u);
     if (a < itcm_size) {
         uint8_t *p = itcm + (a & (ITCM_PHYS - 1u));
         p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8);
@@ -2080,6 +2088,7 @@ static inline void st8(uint32_t a, uint32_t v) {
 #ifdef NNK_GX
     if (gxd && gxd_mem_io(a)) { gxd_io_write(gxd, a, v, 1); return; }
 #endif
+    smc_note(a, 1u);
     if (a < itcm_size) { itcm[a & (ITCM_PHYS - 1u)] = (uint8_t)v; return; }
     if ((a & dtcm_mask) == dtcm_base) { dtcm[a & (DTCM_PHYS - 1u)] = (uint8_t)v; return; }
     if (a >= IO_LO && a < IO_HI) { io_write8(a, v); return; }
@@ -3431,6 +3440,12 @@ static int hle_swi(uint32_t imm24, uint32_t at, int thumb) {
     }
 }
 
+/* Phase-4J: SMC runtime image-state tracking (generation-0 snapshot, per-band
+ * generation counters and the runtime re-decoder).  Kept in tools/nnk_smc.inc
+ * so the mechanism is reviewable as C instead of Rust string escaping; the
+ * build copies it next to the generated TU. */
+#include "nnk_smc.inc"
+
 static void guest_init(void) { memset(r, 0, sizeof r); n = z = c = v = 0; cp15_update_tcm(); io_load_rom(); bios_boot_seed(); }
 "##;
 
@@ -3441,6 +3456,7 @@ const RUNTIME_ALL_MAIN: &str = r##"int main(int argc, char **argv) {
     size_t got = fread(gmem, 1, IMAGE_LEN, fp);
     fclose(fp);
     if (got != IMAGE_LEN) { fprintf(stderr, "short read: got %zu, want %u\n", got, IMAGE_LEN); return 2; }
+    smc_arm();          /* Phase-4J: snapshot the compiled generation */
     guest_init();
     nnk_display_open();
     { const char *s = getenv("NNK_STEP_LIMIT");
