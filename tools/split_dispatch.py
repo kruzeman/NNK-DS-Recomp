@@ -415,6 +415,109 @@ def main():
     # (3) Phase-4L: the DMA completion/timing shim
     shutil.copyfile(os.path.join(here, "nnk_dma.inc"),
                     os.path.join(outdir, "nnk_dma.inc"))
+    # (4) Phase-4M: the VRAMCNT_A..I bank-mapping model
+    shutil.copyfile(os.path.join(here, "nnk_vramcnt.inc"),
+                    os.path.join(outdir, "nnk_vramcnt.inc"))
+
+    # ---- Phase-4M: VRAMCNT_A..I model hooks -----------------------------
+    # The generated image's IO model is store-only AND 8-bit-only for
+    # 0x04000240..0x04000249: io_write16_sw/io_write32_sw have no case (a
+    # W32/W16 store is dropped) and io_read16/io_read32 have no case (reads
+    # return 0).  melonDS uses both wide forms (W32 clear of A..D, W16 clear
+    # of H..I) before programming the banks byte-wise, and the display
+    # pipeline depends on the resulting bank map.  The substitutions below
+    # route every width through tools/nnk_vramcnt.inc (same semantics as
+    # nnktool/src/recompile.rs carries for the next regeneration).  Each
+    # anchor must match EXACTLY once or the split dies: a silently missing
+    # hook would leave the store-only class in place.
+    def inject(lines_, needle, repl, what):
+        hits = [i for i, l in enumerate(lines_) if needle in l]
+        if len(hits) != 1:
+            die("Phase-4M: %s anchor %r matched %d lines"
+                % (what, needle, len(hits)))
+        out = list(lines_)
+        nl = "\n" if lines_[hits[0]].endswith("\n") else ""
+        if nl and not repl.endswith("\n"):
+            repl += nl          # keep the file's line structure intact
+        out[hits[0]] = repl
+        return out
+
+    VRC_PROTO = (
+        "static int nnk_vrc_in(uint32_t a);\n"
+        "static void nnk_vrc_write(uint32_t a, uint32_t v, int width);\n"
+        "static uint32_t nnk_vrc_read(uint32_t a, int width);\n"
+        "static uint32_t nnk_vrc_stat(void);\n"
+        "static void nnk_vrc_mem(uint32_t a);\n"
+        "static void nnk_vrc_set_dispcnt(int n, uint32_t v);\n"
+        "static void nnk_vrc_powcnt(uint32_t v);\n"
+        "static void nnk_sh_write(uint32_t a, uint32_t v, int width);\n"
+        "static int nnk_sh_read(uint32_t a, int width, uint32_t *out);\n"
+        "static void nnk_vrc_report(void);\n")
+
+    prelude = inject(prelude, "void halt_reason(const char *msg);",
+                     "void halt_reason(const char *msg);\n" + VRC_PROTO,
+                     "vramcnt prototypes")
+    prelude = inject(prelude, "static void io_write32_sw(uint32_t a, uint32_t v) {",
+                     "static void io_write32_sw(uint32_t a, uint32_t v) {\n"
+                     "    if (nnk_vrc_in(a)) { nnk_vrc_write(a, v, 4); return; }\n",
+                     "io_write32_sw width-4")
+    prelude = inject(prelude, "    case 0x04000000: dispcnt = v; return;",
+                     "    case 0x04000000: dispcnt = v; nnk_vrc_set_dispcnt(0, v); return;\n"
+                     "    case 0x04001000: nnk_vrc_set_dispcnt(1, v); return;",
+                     "DISPCNT A/B shadow")
+    prelude = inject(prelude, "static void io_write16_sw(uint32_t a, uint32_t v) {",
+                     "static void io_write16_sw(uint32_t a, uint32_t v) {\n"
+                     "    if (nnk_vrc_in(a)) { nnk_vrc_write(a, v, 2); return; }\n",
+                     "io_write16_sw width-2")
+    prelude = inject(prelude, "static uint32_t io_read32(uint32_t a) {",
+                     "static uint32_t io_read32(uint32_t a) {\n"
+                     "    { uint32_t _shv; if (nnk_sh_read(a, 4, &_shv)) return _shv; }\n"
+                     "    if (nnk_vrc_in(a)) return nnk_vrc_read(a, 4);\n"
+                     "    if (a == 0x0400024Eu) return nnk_vrc_stat();\n"
+                     "    /* Phase-4M: POWCNT1 readback (melonDS GPU::Read16 case 0x304).\n"
+                     "     * The guest's display-init sequence at 0x02002A3C..0x02002A64 is a\n"
+                     "     * read-modify-write over 0x04000304; with no readback it reads 0 and\n"
+                     "     * the final store is 0x0001 instead of melonDS's 0x820F, i.e. the\n"
+                     "     * screen and both 2D engines stay off -> uniform black frames. */\n"
+                     "    if ((a & ~3u) == 0x04000304u) return powerctl & 0xFFFFu;\n",
+                     "io_read32 width-4 + VRAMSTAT + POWCNT1")
+    prelude = inject(prelude, "    case 0x04000304: powerctl = v; return;",
+                     "    case 0x04000304: powerctl = v & 0xFFFFu; nnk_vrc_powcnt(v); return;",
+                     "POWCNT1 write accounting")
+    prelude = inject(prelude,
+                     "    if (a >= 0x04000240u && a <= 0x04000248u) return vramcnt[a - 0x04000240u];",
+                     "    if (nnk_vrc_in(a)) return nnk_vrc_read(a, 1);",
+                     "io_read8 readback")
+    prelude = inject(prelude,
+                     "    if (a >= 0x04000240u && a <= 0x04000248u) { vramcnt[a - 0x04000240u] = v; return; }",
+                     "    if (nnk_vrc_in(a)) { nnk_vrc_write(a, v, 1); return; }",
+                     "io_write8_sw width-1")
+    for _w in (4, 2, 1):
+        prelude = inject(
+            prelude,
+            "    if (gxd && gxd_mem_io(a)) { gxd_io_write(gxd, a, v, %d); return; }" % _w,
+            "    if (gxd && gxd_mem_io(a)) { nnk_vrc_mem(a); gxd_io_write(gxd, a, v, %d); return; }" % _w,
+            "st%d window accounting" % (_w * 8))
+    # Phase-4M: the 2D register-block readback shadow.  Hooked at the io_*
+    # ENTRY points (not the *_sw models) so the shadow always sees the guest's
+    # exact address and width — the *_sw 8-bit path funnels through the
+    # halfword RMW and would misplace the high byte.
+    prelude = inject(prelude, "static uint32_t io_read16(uint32_t a) {",
+                     "static uint32_t io_read16(uint32_t a) {\n"
+                     "    { uint32_t _shv; if (nnk_sh_read(a, 2, &_shv)) return _shv; }\n",
+                     "io_read16 2D shadow")
+    prelude = inject(prelude, "static uint32_t io_read8(uint32_t a) {",
+                     "static uint32_t io_read8(uint32_t a) {\n"
+                     "    { uint32_t _shv; if (nnk_sh_read(a, 1, &_shv)) return _shv; }\n",
+                     "io_read8 2D shadow")
+    for _w, _fn in ((4, "io_write32"), (2, "io_write16"), (1, "io_write8")):
+        prelude = inject(prelude,
+                         "static void %s(uint32_t a, uint32_t v) {" % _fn,
+                         "static void %s(uint32_t a, uint32_t v) {\n"
+                         "    nnk_sh_write(a, v, %d);\n" % (_fn, _w),
+                         "%s 2D shadow" % _fn)
+    sys.stderr.write("Phase-4M: VRAMCNT_A..I width-correct model spliced into the "
+                     "IO accessors (7 hooks + 3 window counters)\n")
 
     # ---- header: band constants + ALL possible band prototypes so the header
     # content does not change when a new band appears (it is part of every
@@ -470,6 +573,9 @@ def main():
         # Phase-4L: DMA completion/timing shim (tools/nnk_dma.inc) — included
         # here so it sees the runtime statics, called once per dispatch below.
         fh.write('#include "nnk_dma.inc"\n\n')
+        # Phase-4M: VRAMCNT_A..I model (tools/nnk_vramcnt.inc) — its hooks are
+        # spliced into the prelude above; it sees the same runtime statics.
+        fh.write('#include "nnk_vramcnt.inc"\n\n')
         fh.write("static const NnkPartFn nnk_band_table[NNK_BAND_COUNT] = {\n")
         for bi in sorted(bands):
             if bi == ITCM_BAND:
@@ -517,7 +623,15 @@ def main():
         # closing braces of the for-loop and run(), then main() — these live
         # past the dispatch switch, so index the ORIGINAL line array.
         fh.writelines(lines[for_close_idx:run_close_idx + 1])
-        fh.writelines(lines[run_close_idx + 1:])
+        # Phase-4M: print the VRAMCNT bank-map report before the run summary
+        # (the same line group every run, so two runs are diffable).
+        tail = list(lines[run_close_idx + 1:])
+        tail_repl = [l for l in tail if 'fprintf(stderr, "done steps=' in l]
+        if len(tail_repl) != 1:
+            die("Phase-4M: run-summary anchor matched %d lines" % len(tail_repl))
+        tail = inject(tail, 'fprintf(stderr, "done steps=',
+                      "    nnk_vrc_report();\n" + tail_repl[0], "vramcnt report call")
+        fh.writelines(tail)
     n_cases = sum(len(c) for c in bands.values())
     if n_cases != len(blocks):
         die("parts carry %d cases but the source has %d" % (n_cases, len(blocks)))
