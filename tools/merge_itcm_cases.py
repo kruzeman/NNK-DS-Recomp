@@ -56,11 +56,16 @@ def case_blocks(lines, first_case, default):
     return blocks
 
 
-if len(sys.argv) not in (4, 5):
+if len(sys.argv) not in (4, 5, 6, 7):
     sys.exit(__doc__)
 
 main_c, itcm_c, out_c = sys.argv[1:4]
-trace_path = sys.argv[4] if len(sys.argv) == 5 else None
+trace_path = sys.argv[4] if len(sys.argv) >= 5 and sys.argv[4] != "-" else None
+# Phase-4E: the same splice is used for runtime-loaded overlay modules
+# (main-RAM slots the boot jumps into after loading them from the card):
+#   merge_itcm_cases.py <main.c> <extra.c> <out.c> [trace|-] [lo] [hi]
+if len(sys.argv) == 7:
+    ITCM_LO, ITCM_HI = int(sys.argv[5], 0), int(sys.argv[6], 0)
 
 m = load(main_c)
 _, m_disp, m_first, m_default = structure(m, "main")

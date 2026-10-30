@@ -68,12 +68,31 @@ CC=${NNK_CC:-cc}
 GFLAGS=${NNK_SPLIT_CFLAGS:--std=c11 -O0 -g0 -w}
 RFLAGS=${NNK_SPLIT_RUNTIME_CFLAGS:--std=c11 -O2 -g0 -w}
 EXTRA=${NNK_CFLAGS_EXTRA:-}
+# NNK_GX=1 builds the runtime with the live gx_display bridge
+# (-DNNK_GX): the runtime TU then forwards 2D/display/VRAM/OAM MMIO and
+# keypad reads into gxrender and presents one frame per emulated VBlank.
+# The guest parts stay untouched, so only nnk_main.o rebuilds when this flips.
+GX=${NNK_GX:-0}
+GXDIR=$(pwd)/gxrender
+GX_LDFLAGS=()
 
 # shellcheck disable=SC2206
 gflags=($GFLAGS $EXTRA)
 # shellcheck disable=SC2206
 rflags=($RFLAGS $EXTRA)
 ldflags=(-lm)
+
+if [[ "$GX" == "1" ]]; then
+  [[ -f "$GXDIR/Makefile" ]] || { echo "NNK_GX=1 but $GXDIR/Makefile missing" >&2; exit 2; }
+  echo "== gxrender: building libgxrender.a + gx_display.o + gx_gl.o =="
+  make -C "$GXDIR" -j"${BUILD_JOBS:-6}" build/libgxrender.a build/gx_display.o build/gx_gl.o >/dev/null
+  rflags+=(-DNNK_GX -I"$GXDIR/src")
+  # shellcheck disable=SC2207
+  GX_LDFLAGS=("$GXDIR/build/gx_display.o" "$GXDIR/build/gx_gl.o" "$GXDIR/build/libgxrender.a")
+  # shellcheck disable=SC2206
+  GX_LDFLAGS+=($(pkg-config --libs sdl2) -lGL)
+  ldflags+=("${GX_LDFLAGS[@]}")
+fi
 
 if [[ -n "${NNK_MONO:-}" ]]; then
   # Mono baseline: the untouched single-TU image, no cache, no split.

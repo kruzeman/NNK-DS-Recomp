@@ -1317,6 +1317,7 @@ static uint32_t cp15_reg = 0;    /* CP15 reads return 0 in this model */
 static uint32_t carry_out;       /* shifter carry-out of the last sh_op */
 static uint64_t steps;
 static uint64_t traced;
+static uint64_t trace_from;      /* NNK_TRACE_FROM: only print from this step */
 static uint64_t distinct_pcs;
 
 /* ---- ARM9 mode banking (Phase-4C) -----------------------------------------
@@ -1509,6 +1510,102 @@ static uint8_t seen[(IMAGE_LEN / 2u + 7u) / 8u];
 #define SCANLINES 263u
 static uint64_t cycles;
 static uint32_t vcount(void) { return (uint32_t)((cycles / CYCLES_PER_SCANLINE) % SCANLINES); }
+
+/* ---- live display bridge (Phase-4E) --------------------------------------
+ * gx_display (gxrender) owns the 2D/3D graphics and keypad/touch state; the
+ * runtime forwards exactly the MMIO + palette/VRAM/OAM traffic it owns and
+ * renders one frame per emulated VBlank (vcount crossing into 192..262).
+ * Compiled in only with -DNNK_GX (tools/build_split.sh NNK_GX=1), so the
+ * default build keeps its no-gxrender dependency and every pre-existing
+ * acceptance check is unaffected.
+ *
+ *   NNK_GX=window|headless   create the gxd instance (SDL2 window / headless)
+ *   NNK_GX_SHOT=<base>       dump <base>.<frame>.top.ppm / .bot.ppm
+ *   NNK_GX_SHOT_EVERY=<n>    dump every n-th frame (default 1)
+ */
+#ifdef NNK_GX
+#include "gx_display.h"
+static Gxd *gxd;
+static uint32_t gxd_last_vc = 0xFFFFFFFFu;
+static unsigned gxd_frames;
+static const char *gxd_shot;
+static unsigned gxd_shot_every = 1;
+
+static int nnk_display_open(void) {
+    const char *mode = getenv("NNK_GX");
+    GxdConfig cfg;
+    if (!mode || !mode[0]) return 0;
+    memset(&cfg, 0, sizeof cfg);
+    cfg.windowed = (strcmp(mode, "window") == 0);
+    cfg.gl_3d = 0;                 /* software 3D: the byte-exact path */
+    cfg.scale = 2;
+    cfg.layout = GXD_LAYOUT_SIDE;
+    cfg.title = "Ni no Kuni DS";
+    gxd = gxd_open(&cfg);
+    if (!gxd) { fprintf(stderr, "gx: gxd_open failed (mode=%s)\\n", mode); return 0; }
+    { const char *s = getenv("NNK_GX_SHOT");
+      if (s && s[0]) gxd_shot = s;
+      s = getenv("NNK_GX_SHOT_EVERY");
+      if (s && s[0]) gxd_shot_every = (unsigned)strtoul(s, NULL, 0); }
+    fprintf(stderr, "gx: display open mode=%s windowed=%d shot=%s\\n",
+            mode, cfg.windowed, gxd_shot ? gxd_shot : "(none)");
+    return 1;
+}
+static void nnk_display_shot(void) {
+    char p[512];
+    if (!gxd_shot || !gxd) return;
+    if (gxd_shot_every != 0u && (gxd_frames % gxd_shot_every) != 0u) return;
+    snprintf(p, sizeof p, "%s.%05u.top.ppm", gxd_shot, gxd_frames);
+    gxd_write_screen_ppm(gxd, 0, p);
+    snprintf(p, sizeof p, "%s.%05u.bot.ppm", gxd_shot, gxd_frames);
+    gxd_write_screen_ppm(gxd, 1, p);
+}
+/* Window capture (windowed mode only): proves the SDL2/GL present path, i.e.
+ * the pixels the user actually sees in the window, not just the compositor's
+ * memory image.  NNK_GX_WINDOW_PPM=<path> overwrites it at every dump. */
+static void nnk_display_window_shot(void) {
+    const char *w = getenv("NNK_GX_WINDOW_PPM");
+    if (!w || !w[0] || !gxd) return;
+    if (gxd_shot_every != 0u && (gxd_frames % gxd_shot_every) != 0u) return;
+    gxd_write_window_ppm(gxd, w);
+}
+/* Once per dispatched instruction: detect the VBlank edge, render+present.
+ * Returns nonzero when the user closed the window. */
+static int nnk_display_tick(void) {
+    uint32_t vc;
+    if (!gxd) return 0;
+    vc = vcount();
+    if (gxd_last_vc < 192u && vc >= 192u) {
+        gxd_frame(gxd);
+        gxd_frames++;
+        nnk_display_shot();
+        nnk_display_window_shot();
+    }
+    gxd_last_vc = vc;
+    return gxd_should_quit(gxd);
+}
+/* Palette / VRAM windows / OAM live in gx_display's banks, not in gmem. */
+static inline int gxd_mem_io(uint32_t a) {
+    return (a >= 0x05000000u && a < 0x05000800u) ||
+           (a >= 0x06000000u && a < 0x068A0000u) ||
+           (a >= 0x07000000u && a < 0x07000800u);
+}
+static void nnk_display_close(void) {
+    if (!gxd) return;
+    gxd_frame(gxd);                /* final state of an unfinished frame */
+    gxd_frames++;
+    nnk_display_shot();
+    nnk_display_window_shot();
+    fprintf(stderr, "gx: %u frames presented, %u unhandled io writes\\n",
+            gxd_frames, gxd_unhandled_io(gxd));
+    gxd_close(gxd);
+    gxd = NULL;
+}
+#else
+#define nnk_display_tick() 0
+#define nnk_display_open() 0
+#define nnk_display_close() ((void)0)
+#endif
 
 /* ARM7 responder stub: IPCSync send-value countdown + recv FIFO. */
 static uint32_t arm7_sync_send = 7;   /* value ARM7 sends to ARM9 (counts 7..0) */
@@ -1762,6 +1859,12 @@ static uint32_t io_read16(uint32_t a);
 static void io_write16(uint32_t a, uint32_t v);
 static uint32_t io_read32(uint32_t a);
 static void io_write32(uint32_t a, uint32_t v);
+static uint32_t io_read8_sw(uint32_t a);
+static void io_write8_sw(uint32_t a, uint32_t v);
+static uint32_t io_read16_sw(uint32_t a);
+static void io_write16_sw(uint32_t a, uint32_t v);
+static uint32_t io_read32_sw(uint32_t a);
+static void io_write32_sw(uint32_t a, uint32_t v);
 static void halt_reason(const char *msg);
 
 /* GBA slot bus (Phase-4B): no GBA cart is attached, so reads follow
@@ -1827,6 +1930,9 @@ static inline uint32_t ld32(uint32_t a) {
     return 0;
 }
 static inline void st32(uint32_t a, uint32_t v) {
+#ifdef NNK_GX
+    if (gxd && gxd_mem_io(a)) { gxd_io_write(gxd, a, v, 4); return; }
+#endif
     if (a < itcm_size) {
         uint8_t *p = itcm + (a & (ITCM_PHYS - 1u));
         p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
@@ -1858,6 +1964,9 @@ static inline uint32_t ld16(uint32_t a) {
     return 0;
 }
 static inline void st16(uint32_t a, uint16_t v) {
+#ifdef NNK_GX
+    if (gxd && gxd_mem_io(a)) { gxd_io_write(gxd, a, v, 2); return; }
+#endif
     if (a < itcm_size) {
         uint8_t *p = itcm + (a & (ITCM_PHYS - 1u));
         p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8);
@@ -1882,6 +1991,9 @@ static inline uint32_t ld8(uint32_t a) {
     return 0;
 }
 static inline void st8(uint32_t a, uint32_t v) {
+#ifdef NNK_GX
+    if (gxd && gxd_mem_io(a)) { gxd_io_write(gxd, a, v, 1); return; }
+#endif
     if (a < itcm_size) { itcm[a & (ITCM_PHYS - 1u)] = (uint8_t)v; return; }
     if ((a & dtcm_mask) == dtcm_base) { dtcm[a & (DTCM_PHYS - 1u)] = (uint8_t)v; return; }
     if (a >= IO_LO && a < IO_HI) { io_write8(a, v); return; }
@@ -1996,6 +2108,7 @@ static void io_card_start(uint32_t val) {
 }
 static uint32_t io_read32(uint32_t a) {
     switch (a) {
+    case 0x04000130: case 0x04000132: return io_read16(a);
     case 0x04000000: return dispcnt;
     case 0x04000004: return io_dispstat_read() | (vcount() << 16);
     case 0x04000100: case 0x04000104: case 0x04000108: case 0x0400010C: {
@@ -2063,7 +2176,7 @@ static uint32_t io_read32(uint32_t a) {
     default: return 0;
     }
 }
-static void io_write32(uint32_t a, uint32_t v) {
+static void io_write32_sw(uint32_t a, uint32_t v) {
     switch (a) {
     case 0x04000000: dispcnt = v; return;
     case 0x04000004: dispstat = v & 0xFFF8u; return;
@@ -2117,6 +2230,18 @@ static void io_write32(uint32_t a, uint32_t v) {
 }
 static uint32_t io_read16(uint32_t a) {
     switch (a) {
+    case 0x04000130:
+        /* KEYINPUT: live SDL keypad through gx_display; headless 0x03FF =
+         * no key pressed. */
+#ifdef NNK_GX
+        if (gxd) return gxd_io_read(gxd, a, 2);
+#endif
+        return 0x03FFu;
+    case 0x04000132:
+#ifdef NNK_GX
+        if (gxd) return gxd_io_read(gxd, a, 2);
+#endif
+        return 0;
     case 0x04000004: return io_dispstat_read();
     case 0x04000006: return vcount();
     case 0x04000180: return io_ipcsync_read();
@@ -2132,7 +2257,7 @@ static uint32_t io_read16(uint32_t a) {
     default: return io_read32(a) & 0xFFFFu;
     }
 }
-static void io_write16(uint32_t a, uint32_t v) {
+static void io_write16_sw(uint32_t a, uint32_t v) {
     switch (a) {
     case 0x04000004: dispstat = v & 0xFFF8u; return;
     case 0x04000180: { io_ipcsync_write(v); return; }
@@ -2141,7 +2266,7 @@ static void io_write16(uint32_t a, uint32_t v) {
     case 0x04000100: case 0x04000104: case 0x04000108: case 0x0400010C: tm_reload[(a-0x04000100u)>>2] = v; return;
     case 0x04000102: case 0x04000106: case 0x0400010A: case 0x0400010E: tm_ctrl[(a-0x04000102u)>>2] = v; return;
     case 0x04000300: postflg = (uint8_t)v; return;
-    default: io_write32(a & ~3u, (io_read32(a & ~3u) & ~(0xFFFFu << ((a&2)*8))) | ((v & 0xFFFFu) << ((a&2)*8))); return;
+    default: io_write32_sw(a & ~3u, (io_read32(a & ~3u) & ~(0xFFFFu << ((a&2)*8))) | ((v & 0xFFFFu) << ((a&2)*8))); return;
     }
 }
 static uint32_t io_read8(uint32_t a) {
@@ -2150,11 +2275,38 @@ static uint32_t io_read8(uint32_t a) {
     if (a == 0x04000247) return wramcnt_map;
     return io_read16(a & ~1u) >> ((a & 1u) * 8);
 }
-static void io_write8(uint32_t a, uint32_t v) {
+static void io_write8_sw(uint32_t a, uint32_t v) {
     if (a == 0x04000300) { postflg = (uint8_t)v; return; }
     if (a >= 0x04000240u && a <= 0x04000248u) { vramcnt[a - 0x04000240u] = v; return; }
     if (a == 0x04000247) { wramcnt_map = v; return; }
-    io_write16(a & ~1u, v);
+    io_write16_sw(a & ~1u, v);
+}
+
+/* ---- bus-write entry points (Phase-4E: forward display traffic) ----------
+ * Every guest store reaches the bus through io_write32/16/8 (from st32/16/8)
+ * or directly (DMA).  They forward the write to gx_display with the SAME
+ * width the guest used, then run the runtime's own register model (which
+ * keeps DISPSTAT/VCOUNT/timers/IPC/card state).  gxd ignores addresses it
+ * does not own, so over-forwarding is safe; the *_sw variants are the raw
+ * models used for internal read-modify-write composition (no second
+ * forwarding, no double-width clobber of the display state). */
+static void io_write32(uint32_t a, uint32_t v) {
+#ifdef NNK_GX
+    if (gxd) gxd_io_write(gxd, a, v, 4);
+#endif
+    io_write32_sw(a, v);
+}
+static void io_write16(uint32_t a, uint32_t v) {
+#ifdef NNK_GX
+    if (gxd) gxd_io_write(gxd, a, v, 2);
+#endif
+    io_write16_sw(a, v);
+}
+static void io_write8(uint32_t a, uint32_t v) {
+#ifdef NNK_GX
+    if (gxd) gxd_io_write(gxd, a, v, 1);
+#endif
+    io_write8_sw(a, v);
 }
 
 /* ---- ARM9 IRQ delivery (Phase-4C, melonDS ground truth) ------------------
@@ -3025,10 +3177,11 @@ static void itcm_dump_once(uint32_t pc) {
 static void trace_pc(uint32_t pc) {
     last_pc = pc;
     cycles++;                       /* coarse timing: ~1 cycle per instruction */
+    if (nnk_display_tick()) { halt_reason("SDL window closed"); step_limit = steps; }
     checkpoint_dump(pc);
     debug_dump(pc);
     itcm_dump_once(pc);
-    if (traced < TRACE_LIMIT) printf("0x%08x\n", pc);
+    if (steps >= trace_from && traced < TRACE_LIMIT + trace_from) printf("0x%08x\n", pc);
     traced++;
     if (pc >= IMAGE_LOAD) {
         uint32_t idx = (pc - IMAGE_LOAD) >> 1;
@@ -3166,8 +3319,11 @@ const RUNTIME_ALL_MAIN: &str = r##"int main(int argc, char **argv) {
     fclose(fp);
     if (got != IMAGE_LEN) { fprintf(stderr, "short read: got %zu, want %u\n", got, IMAGE_LEN); return 2; }
     guest_init();
+    nnk_display_open();
     { const char *s = getenv("NNK_STEP_LIMIT");
       if (s && s[0]) step_limit = strtoull(s, NULL, 0); }
+    { const char *s = getenv("NNK_TRACE_FROM");
+      if (s && s[0]) trace_from = strtoull(s, NULL, 0); }
     { const char *s = getenv("NNK_MODE_TRACE");
       if (s && s[0]) mode_trace = atoi(s); }
     { const char *s = getenv("NNK_DUMP_AT_PC");
@@ -3195,6 +3351,7 @@ const RUNTIME_ALL_MAIN: &str = r##"int main(int argc, char **argv) {
             (unsigned long long)steps, (unsigned long long)traced,
             (unsigned long long)distinct_pcs, (unsigned long long)hle_hits,
             last_pc, halt_msg ? halt_msg : "none");
+    nnk_display_close();
     return 0;
 }
 "##;

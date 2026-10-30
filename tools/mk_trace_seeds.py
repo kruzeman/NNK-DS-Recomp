@@ -7,13 +7,17 @@ PC trace steps an address the dispatch image has no `case` for, the native
 run halts there ("dispatch to untranslated pc").  Every such address is
 trace-proven executable code, so seeding it directly is well-founded.
 
-  python3 tools/mk_trace_seeds.py <melonds_trace> <generated.c> <base.tsv> <out.tsv>
+  python3 tools/mk_trace_seeds.py <melonds_trace> <generated.c> <base.tsv> <out.tsv> [mode.tsv]
 
 * <generated.c>  — the CURRENT nnktool recompile-all output (its
   `case 0x02XXXXXXu:` labels are the translated-PC set),
 * <base.tsv>     — the seed table that produced it (rows kept verbatim),
 * <out.tsv>      — base rows + one row per untranslated trace PC inside the
-  image range.  ARM (4-aligned) rows use insn_len 4, Thumb (2-mod-4) 2.
+  image range.  Without [mode.tsv] ARM is inferred from alignment
+  (4-aligned -> insn_len 4, else 2), which mis-decodes 4-aligned PCs inside
+  Thumb bodies; with [mode.tsv] (MELONDS_ARM9MODE_PATH: "0xADDR thumb") the
+  mode is the one melonDS actually executed.
+
 
 Re-run after each recompile: the case set only grows, so the gap set
 converges to zero (verify with the tool's own summary before compiling).
@@ -24,10 +28,19 @@ import os
 import re
 import sys
 
-if len(sys.argv) != 5:
+if len(sys.argv) not in (5, 6):
     sys.exit(__doc__)
 
 trace_path, c_path, base_tsv, out_tsv = sys.argv[1:5]
+mode_path = sys.argv[5] if len(sys.argv) == 6 else None
+
+modes = {}
+if mode_path:
+    with open(mode_path, errors='replace') as f:
+        for line in f:
+            p = line.split()
+            if len(p) == 2 and p[0].startswith('0x'):
+                modes[int(p[0], 16)] = int(p[1])
 
 CASE_RE = re.compile(r'case (0x02[0-9A-Fa-f]{6})u:')
 
@@ -69,7 +82,7 @@ with open(trace_path) as f:
 
 gaps.sort()
 for v in gaps:
-    mode = 4 if (v & 3) == 0 else 2
+    mode = 2 if modes.get(v, 0 if (v & 3) == 0 else 1) else 4
     rows.append('%08X\tTRACE_%08X\t0\tfalse\tunknown\t%d' % (v, v, mode))
 
 os.makedirs(os.path.dirname(os.path.abspath(out_tsv)), exist_ok=True)
