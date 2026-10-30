@@ -56,8 +56,18 @@ static unsigned long long smc_nhalt;      /* unsupported live instruction */
 static unsigned long long smc_nfb;        /* state fallback taken */
 static int smc_trace_left;                /* NNK_SMC_TRACE budget */
 
-/* Emitted next to the dispatch image by tools/split_dispatch.py. */
-static int nnk_pc_is_thumb(uint32_t pc);
+/* Emitted next to the dispatch image by tools/split_dispatch.py.  A mono
+ * (recompile-all -> cc) build has no generated map, so fall back to ARM-only
+ * when the header is absent — the mono path is the regression baseline. */
+#if defined(__has_include)
+#  if __has_include("nnk_smc_map.h")
+#    include "nnk_smc_map.h"
+#  endif
+#endif
+#ifndef NNK_SMC_MAP_H
+#define NNK_SMC_MAP_H 1
+static inline int nnk_pc_is_thumb(uint32_t pc) { (void)pc; return 0; }
+#endif
 
 /* ---- generation-0 image segments ---------------------------------------
  * The COMPILED generation is the image `nnktool recompile-all` decoded, which
@@ -277,8 +287,34 @@ static int smc_exec_arm(uint32_t pc, uint32_t w, uint32_t *npc, uint32_t *costp)
     }
     if (!smc_cond(cond)) return 1;                     /* condition failed */
 
-    /* multiply / long multiply: bits 27..22 = 000000, bits 7..4 = 1001 */
-    if ((w & 0x0FC000F0u) == 0x00000090u) {
+    /* BX / BLX (register): 0x012FFF1m / 0x012FFF3m.  Mirrors the emitter
+     * (nnktool recompile.rs Kind::Bx): the dispatch key is the EVEN target
+     * address and the instruction state is implied by the case that exists
+     * there; BLX links the next instruction with bit0 set so the callee
+     * returns to Thumb.  Phase-4K: without this the encoding fell through to
+     * the data-processing branch below and was silently decoded as
+     * `teq pc, rm, lsr pc` (op=9, rd=15), which is why the run fell through
+     * 0x0215B700 (E12FFF3C blx r12) instead of calling the decrypt helper at
+     * 0x0215B528 — measured first divergence vs melonDS (step 13,142,583). */
+    if ((w & 0x0FFFFF30u) == 0x012FFF10u ||
+        (w & 0x0FFFFF30u) == 0x012FFF30u) {
+        unsigned link = (w & 0x30u) == 0x30u;
+        unsigned bxm = (unsigned)(w & 0xFu);
+        uint32_t tgt = (bxm == 15u) ? (pc + 8u) : r[bxm];
+        if (link) r[14] = (pc + 4u) | 1u;
+        *npc = tgt & ~1u;
+        *costp = 3;
+        return 1;
+    }
+
+    /* multiply / long multiply: bits 27..24 = 0000, bits 7..4 = 1001.
+     * Phase-4K: the old mask (0x0FC000F0) also covered bits 23..22, so it only
+     * matched MUL/MLA and every LONG multiply (UMULL/SMULL/UMLAL/SMLAL, bit23)
+     * fell through to the data-processing branch and was executed as an
+     * add/orr — measured: 0x0215B100 `umull r0,r1,r0,r4` (E0810094) produced
+     * r0=0 in native vs 0x00324415 in melonDS, which flipped the `bne` at
+     * 0x0215B110 (the 63,438-instruction frontier). */
+    if ((w & 0x0F0000F0u) == 0x00000090u) {
         if (w & 0x00800000u) {
             uint32_t rdhi = (w >> 16) & 0xFu, rdlo = (w >> 12) & 0xFu;
             uint32_t rs = (w >> 8) & 0xFu, rm2 = w & 0xFu;
@@ -363,7 +399,7 @@ static int smc_exec_arm(uint32_t pc, uint32_t w, uint32_t *npc, uint32_t *costp)
         unsigned Wb = (unsigned)((w >> 21) & 1u);
         unsigned imm = (unsigned)((w >> 22) & 1u);
         rn = (w >> 16) & 0xFu; rd = (w >> 12) & 0xFu;
-        base = r[rn];
+        base = smc_reg(rn, pc, 0);
         off = imm ? (((w >> 4) & 0xF0u) | (w & 0x0Fu)) : r[w & 0xFu];
         ea = P ? (U ? base + off : base - off) : base;
         if (sh == 1u) {
@@ -385,7 +421,7 @@ static int smc_exec_arm(uint32_t pc, uint32_t w, uint32_t *npc, uint32_t *costp)
         unsigned Wb = (unsigned)((w >> 21) & 1u);
         unsigned L = (unsigned)((w >> 20) & 1u);
         rn = (w >> 16) & 0xFu; rd = (w >> 12) & 0xFu;
-        base = r[rn];
+        base = smc_reg(rn, pc, 0);
         if (I) off = sh_op(smc_reg(w & 0xFu, pc, 0), (unsigned)((w >> 5) & 3u),
                            (unsigned)((w >> 7) & 0x1Fu), c);
         else   off = w & 0xFFFu;
@@ -414,7 +450,7 @@ static int smc_exec_arm(uint32_t pc, uint32_t w, uint32_t *npc, uint32_t *costp)
         cnt = 0u;
         for (k = 0; k < 16u; k++) if (list & (1u << k)) cnt++;
         if (cnt == 0u) return 0;                       /* unpredictable */
-        base = r[rn];
+        base = smc_reg(rn, pc, 0);
         user_bank = Sb && (list & 0x8000u) == 0;
         if (P && U)       addr = base + 4u;
         else if (P && !U) addr = base - cnt * 4u;

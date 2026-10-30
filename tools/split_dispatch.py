@@ -436,6 +436,22 @@ def main():
         fh.write("int nnk_part_itcm(uint32_t *pc_io);\n")
         fh.write("#endif\n")
 
+    # ---- Phase-4K: firmware boot state (console MAC) --------------------
+    # The guest reads the console WIFI MAC from 0x02FFFCF4; it is a console /
+    # firmware property (melonDS serves DEFAULT_MAC there), not ROM data, and
+    # the boot state this runtime seeds did not carry it.  tools/nnk_boot.inc
+    # implements the write; it needs the prelude's guest-memory accessors, so
+    # the include goes AFTER the prelude and guest_init() gets a forward
+    # declaration plus the call.
+    shutil.copyfile(os.path.join(here, "nnk_boot.inc"),
+                    os.path.join(outdir, "nnk_boot.inc"))
+    boot_call = "bios_boot_seed(); }"
+    if sum(1 for l in prelude if boot_call in l) != 1:
+        die("guest_init() line with %r not found in the prelude" % boot_call)
+    prelude = [l.replace(boot_call, "bios_boot_seed(); nnk_boot_firmware(); }")
+               for l in prelude]
+    sys.stderr.write("Phase-4K: console MAC seeding spliced into guest_init\n")
+
     # ---- main TU: prelude + band table + dispatch + tail
     prelude = list(prelude)          # un-static'd copy
     tf_idx = next((i for i, l in enumerate(prelude)
@@ -445,7 +461,9 @@ def main():
     main_path = os.path.join(outdir, "nnk_main.c")
     with open(main_path, "w") as fh:
         fh.write('#include "nnk_rt.h"\n\n')
+        fh.write("static void nnk_boot_firmware(void);\n")
         fh.writelines(prelude[:tf_idx])
+        fh.write('#include "nnk_boot.inc"\n\n')
         fh.write("static const NnkPartFn nnk_band_table[NNK_BAND_COUNT] = {\n")
         for bi in sorted(bands):
             if bi == ITCM_BAND:
