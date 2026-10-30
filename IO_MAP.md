@@ -171,3 +171,172 @@ melonDS ARM9 runs in its BIOS IRQ handler (`pc9=0xFFFF01DC`, IME=1); the
 native runtime latches IE/IF/IME but never dispatches exceptions; (3) the
 ARM7 is still scripted — event-chain clock = `steps`, so timing degrades
 after the first post-divergence (each post logged).
+
+## Phase-4B — ITCM/TCM memory model + execute-from-ITCM; barrier = ARM9 IRQ delivery
+
+Task t_7553cbbb, 2026-10-30.  Builds on Phase-4A (merge 10c1ae3).  All
+numbers below are from `tools/build_split.sh` binaries run on the stored
+padded image; every capture lives under
+`/home/hermes/.hermes/profiles/coder/cache/scratch/`.
+
+### What the runtime models now (new in 4B)
+
+1. **CP15 TCM configuration** (melonDS `CP15.cpp` semantics, `id =
+   (crn<<8)|(crm<<4)|opc2` exactly as melonDS's ARMInterpreter encodes it):
+   control reg `0x100` (bit16 DTCM enable, bit18 ITCM enable, mask
+   `0x000FF085`), DTCM base reg `0x910`, ITCM size reg `0x911`.  The
+   emitter now emits `cp15_read(0xNNN)` / `cp15_write(0xNNN, rX)` instead of
+   the old constant-0 `cp15_reg` read / no-op write.  **Initial state = the
+   ARM9 BIOS's post-init values**, measured with the new env-gated
+   `MELONDS_CP15TRACE_PATH` hook (`tools/add_cp15trace.py`):
+   `control 0x00052078 -> stored 0x00052000`, `0x911 = 0x20` (ITCMSize =
+   `0x02000000`), `0x910 = 0x0300000A` (DTCM base `0x03000000`, 16 KiB).
+   The boot stub then re-programs both TCMs at `0x02000A84..0x02000B28`
+   through `cp15_write` — all four writes now land with values byte-equal to
+   the melonDS CP15 trace.
+2. **ITCM + DTCM data routing** in `ld8/16/32`, `st8/16/32`, in melonDS's
+   data-path order (ITCM, DTCM, then the bus): ITCM hit =
+   `itcm[addr & 0x7FFF]` when `addr < itcm_size` (melonDS's single check —
+   with the measured size `0x02000000` the `0x01FF8000..0x01FFFFFF` window
+   maps 1:1 and main RAM stays outside it), DTCM hit =
+   `dtcm[addr & 0x3FFF]` when `(addr & mask) == base` (the disabled base
+   `0xFFFFFFFF` can never match, so the same expression works with TCMs
+   off).
+3. **Execute-from-ITCM**: the loader's auto-load block (`dst=0x01FF8000`,
+   `len=0x540`, source `0x0206C5C0` in the decompressed image — verified
+   byte-identical to the melonDS `MELONDS_ITCM_DUMP` capture for the full
+   `0x540`) is translated by a **second nnktool image** and spliced into the
+   flat-window image:
+   `tools/extract_itcm_blob.py` -> `tools/mk_itcm_seeds.py <extended trace>`
+   (74 distinct observed ITCM PCs as ARM seeds) ->
+   `nnktool recompile-all <blob> <itcm.c> --base 0x01FF8000` (153 cases) ->
+   `tools/merge_itcm_cases.py <main.c> <itcm.c> <merged.c> <trace>` (reports
+   observed-PCs-without-a-case; 0 here).  `tools/split_dispatch.py` now
+   gives the exactly-one band below `GBASE` (`(0x01FF8000-0x02000000)>>15 =
+   -1`) its own part `nnk_part_itcm.c` + a dedicated dispatch branch
+   (`pc >= NNK_ITCM_LO && pc < NNK_ITCM_HI`); `nnk_rt.h` always declares
+   `nnk_part_itcm` so the header bytes (a cache key) stay stable.
+4. **GBA slot open-bus** (empty slot): reads of `0x08/0x09` return
+   `((addr>>1) & 0xFFFF) | openbus[(EXMEMCNT>>2)&3]` with melonDS's table
+   `{0xFE08,0,0,0xFFFF}`, deselection (EXMEMCNT bit7) returns 0, `0x0A`
+   SRAM returns `0xFF` — `GBACart.cpp`/`NDS.cpp` semantics.  `EXMEMCNT`'s
+   **BIOS initial value `0xE880`** is measured (first read-back before any
+   guest write: `R16 0x04000204 0x0000E880 pc=0x02006268` in the melonDS IO
+   trace), so the guest's read-modify-write chain reproduces melonDS
+   exactly (`0xE880 -> 0xE800 -> 0xE80C -> 0x680C -> ...`, logged as
+   `io: EXMEMCNT=... gba_decay=...` on stderr).
+5. The `NNK_STEP_LIMIT` probe knob now actually works (`run()` tested the
+   `STEP_LIMIT` macro; it tests the `step_limit` variable the env sets).
+
+### Ground truth captured this phase (scratch, regenerable)
+
+* `melonds_arm9_trace_itcm.txt` — 10 000 000 PCs, **extended window
+  `LO=0x01FF8000 HI=0x02400000`** (the window now covers ITCM *and* the
+  main-RAM window, so one file compares against both views);
+  `melonds_arm9_trace_37m.txt` (3 703 225) and the Phase-4A-window
+  `melonds_arm9_trace_10m.txt` unchanged.
+* `melonds_cp15.txt` — 81 057 CP15 writes/TCM reads (BIOS at `0xFFFEFFFC`
+  then the boot stub at `0x02000A84..0x02000B28`).
+* `itcm_dump2.bin` (melonDS ITCM at first exec) vs
+  `itcm_native_dump.bin` (runtime `NNK_ITCM_DUMP` at first ITCM dispatch):
+  **`cmp` identical (32 768 bytes)** — the loader copy the pre-translated
+  ITCM cases execute is byte-exact ground truth.
+* `memwatch_3ffc30.txt`, `memwatch_6f53e.txt` — widened MemWatch bands
+  (`tools/widen_memwatch.py`); `memwatch_preentry.txt` — **114 972
+  pre-entry main-RAM writes** (all `a9idx=0`: ARM9 BIOS + ARM7 boot
+  initialization, incl. the `0x027FFE00` "NINOKUNI" header block and the
+  `0x027FFC00` firmware user-settings block) via `tools/watch_preentry.py`
+  — *captured but deliberately NOT applied yet* (see gaps).
+* IO trace `melonds_io_trace_boot.txt` (Phase-3A capture) pinned the ITCM
+  DMA register writes (`W32 0x040000BC/0x040000C0/0x040000C4` at
+  `pc9=0x01FF84C8..0x01FF84D0`) and the EXMEMCNT sequence.
+
+### Divergences found, root-caused and fixed (poll/exit discipline)
+
+| # | strict prefix | first divergence | root cause (measured) | fix |
+|---|---|---|---|---|
+| 0 | 3 634 037 (Phase-4A) | `bl 0x01FF845C` untranslated | no ITCM region, no ITCM cases | (1)+(2)+(3) |
+| 1 | **3 634 239** | melonDS `0x0201C660` vs native `0x0201C1B8` | `popeq {..,pc}` at `0x0201C1B4` not taken: the checker `0x0201C198` reads `ldrh [0x02FFFC30]` expecting `0xFFFF`, native sees 0.  The value chain: ITCM DMA1 halfword fill (SAD `0x08000080`, DAD `0x0206F500`, count 32, fired at `0x01FF84D0`) reads **GBA-slot space**, which is empty-slot open-bus `0xFFFF` in melonDS (EXMEMCNT `0x680C` -> decay `0xFFFF`) but unmapped-0 in the runtime; the fill lands in `0x0206F500..0x0206F53E` (memwatch `pc9=0x01FF84D0 a9idx=3634066`), the game copies `0x0206F53E -> 0x02FFFC30` at `0x0201C628`, the checker gates on it | (4) GBA bus + EXMEMCNT init |
+| 2 | **3 635 491 (final)** | melonDS `0x01FF8000` vs native `0x0200064A` | **first ARM9 IRQ delivery** — see stop report | not implemented (below) |
+
+### Honest stop report — exact barrier and cause
+
+**Match length: strict common prefix = 3 635 491 / 10 000 000 (36.4 % of
+the extended-window melonDS capture; 100 % of the native prefix reaches the
+barrier).**  Cross-check: against the old main-RAM-only capture the
+window-filtered prefix is 3 635 447, and 3 635 491 - 44 = 3 635 447 — the
+44 ITCM lines in the native prefix account for the difference exactly.
+`in-order matched after resync` = 3 635 491 (no resync possible past the
+barrier).  No unexplained divergence remains: both divergences above are
+root-caused with capture evidence and fixed.
+
+**Barrier (index 3 635 491; main-RAM window index 3 635 447): ARM9
+interrupt delivery.**  melonDS leaves the matched stream into the SDK's
+**ITCM IRQ entry stub `0x01FF8000`** (its first in-window handler PC; the
+vector/BIOS hop at `0xFFFF0018..0xFFFF01DC` sits outside the window and is
+not logged), then the game's IRQ handler at `0x0200BAE8`.  The native
+runtime cannot take this interrupt at all, for three measured reasons:
+
+* **no IRQ sources**: IE/IME are latched (`IE = 0x00040008` incl. bit 18,
+  `IME = 1` since `pc=0x02000CC0`, from the melonDS IO trace) but nothing
+  ever raises `IF`, so `ime && (ie & if)` is never true;
+* **no exception entry**: the CPSR model is single-bank (no SPSR, no IRQ
+  banked LR) and no code path jumps to `ExceptionBase+0x18`;
+* **no BIOS**: `0xFFFF0018..` is outside every translated region, so even a
+  naive vector jump would halt.
+
+**What the native run does instead:** it spins in the SDK wait loop
+`0x0201C6BC: ldrh r0,[r4]` with `r4 = 0x0206F460` (called from
+`lr = 0x0200BADC`), pacing with `svc 0x03 WaitByLoop` at `0x02000648`
+(28 052 107 HLE hits), until the 200 M step budget:
+`halt_pc=0x0201C6B4 halt=step budget exhausted`.  `[0x0206F460]` stays 0
+because in melonDS it is the *IRQ handler path* that raises it — i.e. the
+wait loop is waiting for exactly the interrupt the runtime never delivers.
+**Display init is behind this barrier, so no guest frame reaches
+`gx_display` this phase** (task option: honest stop-report).
+
+### Next model gaps, in order (measured)
+
+1. **IRQ delivery**: raise `IF` from real sources (first candidate: the
+   ARM7-initiated IPC interrupt — `IE=0x00040008` bit18, ARM7 posts start
+   at `a9idx 3 635 5xx`), then exception entry (LR_irq/SPSR/IRQ mode), then
+   the BIOS stub hop — either HLE the FreeBIOS-equivalent jump-to-user-
+   handler (user pointer -> `0x01FF8000`, already translated) or translate
+   a BIOS region — and `subs pc, lr, #4` return semantics (needs SPSR).
+2. **Pre-entry BIOS/ARM7 memory state**: `memwatch_preentry.txt` has all
+   114 972 writes measured; apply them as `guest_init` initial state (the
+   `0x02FFFC30` user-settings cell happened not to be read before the game
+   overwrote it, so the prefix matches without them — later boot will read
+   them).
+3. **ARM7 executed (or a longer script)**: only the measured event chain +
+   IPC sync/one FIFO pair exist; post-divergence `steps`-clock drift is
+   documented and every post is logged.
+4. CP15 cache/TLB/PU writes stay no-ops (nothing observed requires them).
+
+### Reproduce (Phase-4B)
+
+```
+# melonDS ground truth (patches: tools/add_cp15trace.py,
+# tools/widen_memwatch.py, tools/watch_preentry.py + the Phase-4A ptrace
+# patch): extended-window 10M capture
+MELONDS_ARM9TRACE_PATH=$S/melonds_arm9_trace_itcm.txt \
+MELONDS_ARM9TRACE_LO=0x01FF8000 MELONDS_ARM9TRACE_HI=0x02400000 \
+MELONDS_ARM9TRACE_N=10000000 MELONDS_ARM9TRACE_EXIT=1 \
+MELONDS_CP15TRACE_PATH=$S/melonds_cp15.txt MELONDS_ITCM_DUMP=$S/itcm_dump2.bin \
+xvfb-run -a /home/hermes/tools/melonDS/build-ptrace/melonDS "<ROM>"
+# ITCM image + merge + split build + run
+python3 tools/extract_itcm_blob.py /home/hermes/NiNoKuni/work/ghidra_src/arm9.bin $S/itcm_blob.bin
+python3 tools/mk_itcm_seeds.py $S/melonds_arm9_trace_itcm.txt 0x540 $S/seeds_itcm.tsv
+nnktool recompile-all $S/itcm_blob.bin $S/itcm_image.c --base 0x01FF8000 \
+    --entry 0x01FF8000 --seeds $S/seeds_itcm.tsv
+nnktool recompile-all work/ghidra_src/arm9.bin work/phase3a/arm9_thumb.c \
+    --base 0x02000000 --entry 0x02000800 --seeds work/phase3a/seeds_phase3a3.tsv
+python3 tools/merge_itcm_cases.py work/phase3a/arm9_thumb.c $S/itcm_image.c \
+    work/phase3a/arm9_thumb_itcm.c $S/melonds_arm9_trace_itcm.txt
+NNK_IMAGE_C=work/phase3a/arm9_thumb_itcm.c \
+NNK_CFLAGS_EXTRA="-DTRACE_LIMIT=20000000ull" tools/build_split.sh
+NNK_ROM_PATH="<ROM>" work/split/arm9_split work/phase3a/arm9_stored_padded.bin \
+    > $S/native.txt 2> $S/native_hle.txt
+python3 tools/cmp_pc_traces.py --lo 0x01FF8000 --hi 0x02400000 \
+    $S/melonds_arm9_trace_itcm.txt $S/native.txt
+```

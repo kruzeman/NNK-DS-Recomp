@@ -250,3 +250,35 @@ work/split/arm9_split     the linked runner                                     
 
 `work/` is gitignored in this repo (it is runtime/build state, never game data).
 Only the scripts and this document are committed.
+
+## 9. Phase-4B: the ITCM dispatch image (two-region merge)
+
+Code at `0x01FF8000..0x01FFFFFF` (the loader's auto-load block, 0x540
+bytes from image `0x0206C5C0`) has no cases in the flat-window image, and
+nnktool's recovery indexes its single image at `addr - base`, so the ITCM
+block is translated as a **second, independent image** and spliced in:
+
+```
+tools/extract_itcm_blob.py <decompressed-arm9.bin> <blob>   # 0x540 @0x0206C5C0
+tools/mk_itcm_seeds.py <extended melonDS trace> 0x540 <seeds.tsv>
+nnktool recompile-all <blob> <itcm.c> --base 0x01FF8000 --entry 0x01FF8000 --seeds <seeds.tsv>
+python3 tools/merge_itcm_cases.py <flat.c> <itcm.c> <merged.c> <trace>
+NNK_IMAGE_C=<merged.c> tools/build_split.sh
+```
+
+`merge_itcm_cases.py` splices every `case 0x01FF8xxxu:` block of the ITCM
+image into `run()` immediately after `switch (pc) {` (the structure
+`split_dispatch.py` expects) and reports observed trace PCs that got no
+case.  The splitter maps the single band below `GBASE`
+(`(0x01FF8000 - 0x02000000) >> 15 == -1`) to its own part
+`nnk_part_itcm.c` / `nnk_part_itcm`, dispatched by an explicit
+`pc >= NNK_ITCM_LO && pc < NNK_ITCM_HI` branch in `nnk_main.c`; the
+prototype is always in `nnk_rt.h` so the header (a cache key) stays stable
+when ITCM cases come and go.
+
+The merged image used for Phase-4B/4C runs:
+
+```
+NNK_IMAGE_C=/home/hermes/NiNoKuni/work/phase3a/arm9_thumb_itcm.c \
+NNK_CFLAGS_EXTRA="-DTRACE_LIMIT=20000000ull" tools/build_split.sh
+```

@@ -92,7 +92,14 @@ paragraph**: the 2026-10-29 boot depth is **step 3,634,038, halt at
 `0x020093E4` (`bl 0x01FF845C` — ITCM code execution, the next model gap)**,
 the `0x0201C4B8` wait(13,1) loop exits (ARM7 event-chain in RUNTIME_ALL),
 3,634,037-trace strict prefix vs melonDS = 100 % of the native trace —
-see the Phase-4A section of [IO_MAP.md](IO_MAP.md).  The register set below
+see the Phase-4A section of [IO_MAP.md](IO_MAP.md).  **Phase-4B supersedes
+the depth numbers again**: the ITCM/TCM memory model + ITCM dispatch cases
+(`NNK_IMAGE_C=work/phase3a/arm9_thumb_itcm.c`, see BUILD.md §9) push the
+strict prefix to **3,635,491 / 10,000,000** against the extended-window
+(`LO=0x01FF8000`) melonDS capture; the barrier is now the **first ARM9 IRQ
+delivery** (melonDS enters the SDK ITCM IRQ stub `0x01FF8000`, native
+spins in the `ldrh [0x0206F460]` wait loop until the step budget) — full
+stop-report in the Phase-4B section of [IO_MAP.md](IO_MAP.md).  The register set below
 was measured with the melonDS IO bus trace
 (`tools/melonds-io-trace.patch`, 204 685 accesses / 34 registers over the
 first 5 M ARM9 PCs) — and the honest implemented-vs-stubbed table live in
