@@ -654,6 +654,37 @@ def main():
                      "idle-loop probe")
     sys.stderr.write("Phase-4O: idle-loop IRQ probe spliced\n")
 
+    # ---- Phase-4Q: ARM7 IPC-FIFO responder (measured request -> reply) ---
+    # The u16[0x0206E93A] barrier (native step 18,554,864): the guest's card
+    # driver sets handler-mask bit 1 (pc 0x0200FB20) and then SENDS the ARM7
+    # two IPC-FIFO requests at pc 0x0200BAD4.  melonDS's ARM7 answers the
+    # first (0x80004046) with 0xC0204006 2,076 cycles later, and that "done"
+    # event runs the driver's finish tail (0x0200F784..0x0200F7A0) which
+    # clears the mask so the waiter at 0x0200FEFC proceeds.  This runtime
+    # dropped both requests ("unscripted IPCFIFO request"), so the reply, the
+    # IPC-recv IRQ and the mask clear never happened.  The measured table and
+    # the modelled latency live in tools/nnk_dma.inc (Phase-4Q section).
+    # Prototype: appended to the prelude element that carries the
+    # halt_reason forward declaration (that element also carries the
+    # VRAMCNT prototype block, so it must be extended, not replaced).
+    _hi = [i for i, l in enumerate(prelude)
+           if "void halt_reason(const char *msg);" in l]
+    if len(_hi) != 1:
+        die("Phase-4Q: halt_reason anchor matched %d lines" % len(_hi))
+    prelude[_hi[0]] = (prelude[_hi[0]].rstrip("\n")
+                       + "\nvoid nnk_ipc_send(uint32_t v);\n")
+    prelude = inject(prelude,
+                     '        halt_reason("ARM7 responder: unscripted IPCFIFO '
+                     'request (see log)");',
+                     "        nnk_ipc_send(v);",
+                     "Phase-4Q IPC responder hook")
+    prelude = inject(prelude,
+                     '        fprintf(stderr, "io: unscripted IPCFIFO request '
+                     '0x%08X at pc=0x%08X\\n", v, last_pc);',
+                     "        /* handled/notable log lives in nnk_ipc_send */",
+                     "Phase-4Q IPC responder log moved")
+    sys.stderr.write("Phase-4Q: ARM7 IPC-FIFO responder spliced\n")
+
     # ---- Phase-4K: firmware boot state (console MAC) --------------------
     # The guest reads the console WIFI MAC from 0x02FFFCF4; it is a console /
     # firmware property (melonDS serves DEFAULT_MAC there), not ROM data, and
