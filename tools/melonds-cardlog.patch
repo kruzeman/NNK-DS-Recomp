@@ -1,0 +1,199 @@
+diff --git a/src/DMA.cpp b/src/DMA.cpp
+index b154273e..e28254df 100644
+--- a/src/DMA.cpp
++++ b/src/DMA.cpp
+@@ -117,6 +117,25 @@ void DMA::WriteCnt(u32 val)
+     u32 oldcnt = Cnt;
+     Cnt = val;
+ 
++    // ---- Ni no Kuni Phase-4O: ARM9 DMA arm trace (MELONDS_DMALOG_PATH) ----
++    {
++        static FILE* DLFP = nullptr;
++        static bool DLTried = false;
++        if (!DLTried)
++        {
++            DLTried = true;
++            const char* p = getenv("MELONDS_DMALOG_PATH");
++            if (p && p[0]) { DLFP = fopen(p, "w"); if (DLFP) setvbuf(DLFP, nullptr, _IOLBF, 0); }
++        }
++        if (DLFP && CPU == 0)
++        {
++            u32 pc = (u32)(NDS.ARM9.R[15] - ((NDS.ARM9.CPSR & 0x20) ? 4 : 8));
++            fprintf(DLFP, "dmawr ts=%llu cpu=%u ch=%u pc=0x%08X old=0x%08X val=0x%08X mode=%u src=0x%08X dst=0x%08X halted=%u\n",
++                    (unsigned long long)NDS.ARM9Timestamp, CPU, Num, pc, oldcnt, val,
++                    (val >> 27) & 0x7, SrcAddr, DstAddr, (u32)NDS.ARM9.Halted);
++        }
++    }
++
+     if ((!(oldcnt & 0x80000000)) && (val & 0x80000000))
+     {
+         CurSrcAddr = SrcAddr;
+@@ -177,6 +196,22 @@ void DMA::Start()
+     else
+         IterCount = RemCount;
+ 
++    // ---- Ni no Kuni Phase-4O: DMA start trace -----------------------------
++    {
++        static FILE* SLFP = nullptr;
++        static bool SLTried = false;
++        if (!SLTried)
++        {
++            SLTried = true;
++            const char* p = getenv("MELONDS_DMALOG_PATH");
++            if (p && p[0]) { SLFP = fopen(p, "a"); if (SLFP) setvbuf(SLFP, nullptr, _IOLBF, 0); }
++        }
++        if (SLFP && CPU == 0)
++            fprintf(SLFP, "dmastart ts=%llu ch=%u mode=%u cnt=0x%08X rem=%u iter=%u src=0x%08X dst=0x%08X\n",
++                    (unsigned long long)NDS.ARM9Timestamp, Num, StartMode, Cnt,
++                    RemCount, IterCount, CurSrcAddr, CurDstAddr);
++    }
++
+     if ((Cnt & 0x01800000) == 0x01800000)
+         CurSrcAddr = SrcAddr;
+ 
+diff --git a/src/NDSCart.cpp b/src/NDSCart.cpp
+index 35394c90..5cd82b20 100644
+--- a/src/NDSCart.cpp
++++ b/src/NDSCart.cpp
+@@ -19,6 +19,9 @@
+ #include <string.h>
+ #include <inttypes.h>
+ #include <assert.h>
++#include <stdio.h>
++#include <stdarg.h>
++#include <stdlib.h>
+ #include "NDS.h"
+ #include "DSi.h"
+ #include "NDSCart.h"
+@@ -41,6 +44,42 @@ namespace melonDS
+ using Platform::Log;
+ using Platform::LogLevel;
+ 
++// ---------------------------------------------------------------------------
++// Ni no Kuni DS Phase-4O: card-interface trace (game card ROMCTL/AUXSPICNT).
++// Env-gated, inactive unless MELONDS_CARDLOG_PATH is set.  One line per card
++// engine state change, timestamped with the ARM9 timestamp plus the ARM9 PC
++// that caused it (this is the "producer" measurement: who arms a transfer).
++// ---------------------------------------------------------------------------
++namespace CardLog
++{
++static FILE* FP = nullptr;
++static bool Tried = false;
++static long Reads = 0;
++
++static inline bool Active() noexcept
++{
++    if (!Tried)
++    {
++        Tried = true;
++        const char* p = getenv("MELONDS_CARDLOG_PATH");
++        if (p && p[0])
++        {
++            FP = fopen(p, "w");
++            if (FP) setvbuf(FP, nullptr, _IOLBF, 0);
++        }
++    }
++    return FP != nullptr;
++}
++
++static inline void Log(const char* fmt, ...) noexcept
++{
++    if (!Active()) return;
++    va_list ap; va_start(ap, fmt);
++    vfprintf(FP, fmt, ap);
++    va_end(ap);
++}
++}
++
+ namespace NDSCart
+ {
+ 
+@@ -745,10 +784,15 @@ void NDSCartSlot::Interface::DoSavestate(Savestate* file)
+ void NDSCartSlot::Interface::WriteROMCnt(u32 val, u32 mask)
+ {
+     val &= mask;
++    u32 oldcnt = ROMCnt;
++    u32 arm_pc = (u32)(Parent.NDS.ARM9.R[15] - ((Parent.NDS.ARM9.CPSR & 0x20) ? 4 : 8));
+     u32 resetrel = (val & ~ROMCnt) & (1<<29);
+     u32 xferstart = (val & ~ROMCnt) & (1<<31);
+     ROMCnt = (ROMCnt & (~mask | 0x20800000)) | (val & 0xFF7F7FFF);
+ 
++    CardLog::Log("wr_romcnt ts=%llu pc=0x%08X old=0x%08X write=0x%08X mask=0x%08X new=0x%08X spicnt=0x%04X xferstart=%u\n",
++                 (unsigned long long)Parent.NDS.ARM9Timestamp, arm_pc, oldcnt, val, mask, ROMCnt, SPICnt, xferstart ? 1u : 0u);
++
+     if (resetrel)
+     {
+         if (Parent.CPUSelect == Num)
+@@ -775,8 +819,18 @@ void NDSCartSlot::Interface::WriteROMCnt(u32 val, u32 mask)
+ 
+     // transfers will only start when bit31 changes from 0 to 1
+     // and if AUXSPICNT is configured correctly
+-    if (!(SPICnt & (1<<15))) return;
+-    if (SPICnt & (1<<13)) return;
++    if (!(SPICnt & (1<<15)))
++    {
++        if (xferstart) CardLog::Log("start_reject ts=%llu pc=0x%08X why=spicnt_disabled spicnt=0x%04X romcnt=0x%08X\n",
++            (unsigned long long)Parent.NDS.ARM9Timestamp, arm_pc, SPICnt, ROMCnt);
++        return;
++    }
++    if (SPICnt & (1<<13))
++    {
++        if (xferstart) CardLog::Log("start_reject ts=%llu pc=0x%08X why=spi_mode spicnt=0x%04X romcnt=0x%08X\n",
++            (unsigned long long)Parent.NDS.ARM9Timestamp, arm_pc, SPICnt, ROMCnt);
++        return;
++    }
+     if (!xferstart) return;
+ 
+     u32 datasize = (ROMCnt >> 24) & 0x7;
+@@ -785,6 +839,13 @@ void NDSCartSlot::Interface::WriteROMCnt(u32 val, u32 mask)
+     else if (datasize > 0)
+         datasize = 0x100 << datasize;
+ 
++    CardLog::Log("start ts=%llu pc=0x%08X size=0x%08X spicnt=0x%04X romcnt=0x%08X irqen=%u cmd=%02X%02X%02X%02X%02X%02X%02X%02X\n",
++                 (unsigned long long)Parent.NDS.ARM9Timestamp, arm_pc, datasize, SPICnt, ROMCnt,
++                 (SPICnt & (1<<14)) ? 1u : 0u,
++                 ROMCommand[0], ROMCommand[1], ROMCommand[2], ROMCommand[3],
++                 ROMCommand[4], ROMCommand[5], ROMCommand[6], ROMCommand[7]);
++    CardLog::Reads = 0;
++
+     ROMTransferPos = 0;
+     ROMTransferLen = datasize;
+ 
+@@ -942,6 +1003,11 @@ void NDSCartSlot::Interface::ROMAdvanceSend()
+ 
+ void NDSCartSlot::Interface::ROMEndTransfer(u32 param)
+ {
++    u32 arm_pc = (u32)(Parent.NDS.ARM9.R[15] - ((Parent.NDS.ARM9.CPSR & 0x20) ? 4 : 8));
++    CardLog::Log("end ts=%llu pc=0x%08X romcnt=0x%08X spicnt=0x%04X irqen=%u len=0x%08X reads=%ld\n",
++                 (unsigned long long)Parent.NDS.ARM9Timestamp, arm_pc, ROMCnt, SPICnt,
++                 (SPICnt & (1<<14)) ? 1u : 0u, ROMTransferLen, CardLog::Reads);
++
+     ROMCnt &= ~(1<<31);
+ 
+     ROMTransferPos = 0;
+@@ -996,6 +1062,12 @@ void NDSCartSlot::Interface::CheckDMA()
+ 
+ u32 NDSCartSlot::Interface::ReadROMData()
+ {
++    CardLog::Reads++;
++    if (CardLog::Reads <= 3)
++        CardLog::Log("romdata ts=%llu pc=0x%08X halted=%u cpsr=0x%08X\n",
++            (unsigned long long)Parent.NDS.ARM9Timestamp,
++            (u32)(Parent.NDS.ARM9.R[15] - ((Parent.NDS.ARM9.CPSR & 0x20) ? 4 : 8)),
++            (u32)Parent.NDS.ARM9.Halted, Parent.NDS.ARM9.CPSR);
+     u32 ret = ROMData[ROMDataPosCPU];
+     if (ROMCnt & (1<<30))
+         return ret;
+@@ -1057,6 +1129,12 @@ void NDSCartSlot::Interface::WriteSPICnt(u16 val, u16 mask)
+ {
+     val &= mask;
+ 
++    if ((val & (1<<14)) != (SPICnt & (1<<14)) || (val & 0x8000) != (SPICnt & 0x8000))
++        CardLog::Log("wr_spicnt ts=%llu pc=0x%08X old=0x%04X write=0x%04X mask=0x%04X\n",
++            (unsigned long long)Parent.NDS.ARM9Timestamp,
++            (u32)(Parent.NDS.ARM9.R[15] - ((Parent.NDS.ARM9.CPSR & 0x20) ? 4 : 8)),
++            SPICnt, val, mask);
++
+     if (SPISelected && Parent.CartActive && Parent.CPUSelect == Num)
+     {
+         // Bit 13 selects between ROM and SPI modes.

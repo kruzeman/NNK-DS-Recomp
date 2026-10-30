@@ -574,6 +574,86 @@ def main():
                      "rule-based IRQ delivery")
     sys.stderr.write("Phase-4N: cart IRQ + rule-based delivery spliced\n")
 
+    # ---- Phase-4O: full cart-event trace (env NNK_CARDLOG) ---------------
+    # Phase-4N's card evidence was limited to the image's own 4 start logs, so
+    # "no start after card_cycles=7,812,062" was an artifact of the log cap,
+    # not of the guest.  This splices an unbounded start/end trace with the
+    # card-bus clock and the ARM9 PC of the instruction that caused it, so the
+    # native producer stream can be diffed against the melonDS ground truth
+    # (MELONDS_CARDLOG_PATH, NDSCart.cpp).  Inactive unless NNK_CARDLOG is set.
+    prelude = inject(prelude,
+                     "#include <string.h>",
+                     "#include <string.h>\n#include <stdarg.h>",
+                     "stdarg include")
+    prelude = inject(prelude,
+                     "static int card_xfer_log_n;",
+                     "static int card_xfer_log_n;          /* transfer-start logs emitted */\n"
+                     "/* Phase-4O: unbounded card-event trace, NNK_CARDLOG=path */\n"
+                     "static FILE* cardlog_fp = NULL;\n"
+                     "static int cardlog_tried = 0;\n"
+                     "static int irq_probe_n = 0;\n"
+                     "static void cardlog_ev(const char* fmt, ...) {\n"
+                     "    va_list ap;\n"
+                     "    if (!cardlog_tried) {\n"
+                     "        cardlog_tried = 1;\n"
+                     "        const char* p = getenv(\"NNK_CARDLOG\");\n"
+                     "        if (p && p[0]) { cardlog_fp = fopen(p, \"w\");\n"
+                     "            if (cardlog_fp) setvbuf(cardlog_fp, NULL, _IOLBF, 0); }\n"
+                     "    }\n"
+                     "    if (!cardlog_fp) return;\n"
+                     "    va_start(ap, fmt); vfprintf(cardlog_fp, fmt, ap); va_end(ap);\n"
+                     "}",
+                     "card event log helper")
+    prelude = inject(prelude,
+                     "    card_poll_n = 0;",
+                     "    card_poll_n = 0;\n"
+                     "    cardlog_ev(\"start step=%llu cyc=%llu pc=0x%08X cmd=%02X%02X%02X%02X"
+                     "%02X%02X%02X%02X size=0x%X spicnt=0x%04X romcnt=0x%08X\\n\",\n"
+                     "                (unsigned long long)steps,\n"
+                     "                (unsigned long long)card_cycles, last_pc,\n"
+                     "                card_cmd[0], card_cmd[1], card_cmd[2], card_cmd[3],\n"
+                     "                card_cmd[4], card_cmd[5], card_cmd[6], card_cmd[7],\n"
+                     "                datasize, spicnt, val);",
+                     "card start trace")
+    prelude = inject(prelude,
+                     "    if (spicnt & (1u << 14)) iflags |= 0x00080000u;",
+                     "    if (spicnt & (1u << 14)) iflags |= 0x00080000u;"
+                     "   /* ROMEndTransfer: IRQ_CartXferDone */\n"
+                     "    cardlog_ev(\"end step=%llu cyc=%llu pc=0x%08X iflags=0x%08X"
+                     " spicnt=0x%04X polls=%d\\n\",\n"
+                     "                (unsigned long long)steps,\n"
+                     "                (unsigned long long)card_cycles, last_pc, iflags,\n"
+                     "                spicnt, card_poll_n);",
+                     "card end trace")
+    prelude = inject(prelude,
+                     "    case 0x04000214: iflags &= ~v; return;",
+                     "    case 0x04000214:\n"
+                     "        if (v & 0x00080000u) cardlog_ev(\"if_clear step=%llu"
+                     " pc=0x%08X write=0x%08X old=0x%08X\\n\",\n"
+                     "            (unsigned long long)steps, last_pc, v, iflags);\n"
+                     "        iflags &= ~v; return;",
+                     "IF ack trace")
+    sys.stderr.write("Phase-4O: full card-event trace spliced\n")
+
+    # ---- Phase-4O: idle-loop IRQ state probe ----------------------------
+    # Records the delivery-relevant state the first few times the dispatch
+    # reaches the SDK idle loop 0x0200712C, so the "why does no IRQ wake it"
+    # question is answered with state (ime/ie/if/cpsr/irq_trig_n) rather than
+    # inferred from a halt PC.
+    prelude = inject(prelude,
+                     "        irq_tick();",
+                     "        irq_tick();\n"
+                     "        if (pc == 0x0200712Cu && irq_probe_n < 12) {\n"
+                     "            irq_probe_n++;\n"
+                     "            fprintf(stderr, \"irqprobe step=%llu ime=%u ie=0x%08X"
+                     " iflags=0x%08X cpsr=0x%02X irq_trig_n=%d irq_active=%d"
+                     " ieandif=0x%08X\\n\",\n"
+                     "                    (unsigned long long)steps, ime, ie, iflags,"
+                     " cpsr_ctl, irq_trig_n, irq_active, ie & iflags);\n"
+                     "        }",
+                     "idle-loop probe")
+    sys.stderr.write("Phase-4O: idle-loop IRQ probe spliced\n")
+
     # ---- Phase-4K: firmware boot state (console MAC) --------------------
     # The guest reads the console WIFI MAC from 0x02FFFCF4; it is a console /
     # firmware property (melonDS serves DEFAULT_MAC there), not ROM data, and
