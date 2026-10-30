@@ -64,7 +64,72 @@ static void nnk_dma_copy(int i) {
                      ? cnt : (cnt & ~0x80000000u);
 }
 
+/* Phase-4N: DMA start mode 3 = "special" = game card (melonDS DMA::WriteCnt
+ * StartMode 3 for ARM9 = NDSCart DRQ).  The storage-image read loop arms such
+ * a channel and then sleeps in the WFI idle loop at 0x0200712C waiting for the
+ * cart transfer-done IRQ.  Without a card-DRQ drain the transfer stalls at the
+ * 2-word FIFO, never reaches ROMEndTransfer, and the IRQ never fires
+ * (measured: p4n_wake.txt "irqwake ... enabled=0x00080000" once per transfer).
+ * The drain walks the card state machine forward to each scheduled event, so
+ * the transfer really completes and AUXSPICNT bit14 really raises IF bit19. */
+static unsigned nnk_dma_card_n;
+static void nnk_dma_card(int i) {
+    uint32_t cnt = dma_cnt[i];
+    uint32_t count = cnt & 0x001FFFFFu;
+    int word = (cnt & (1u << 26)) != 0;
+    uint32_t step = word ? 4u : 2u;
+    uint32_t dadir = (cnt >> 21) & 3u;
+    uint32_t d = dma_dad[i], done = 0;
+    if (!count) count = 0x00200000u;
+    while (done < count) {
+        uint32_t guard = 0x10000u;
+        while (!card_drq && card_next != CARD_NEVER && guard--) {
+            card_cycles = card_next;      /* advance the scheduled card event */
+            card_tick(0u);
+        }
+        if (!card_drq) break;             /* card idle: leave the channel armed */
+        {
+            uint32_t v = card_fifo[card_poscpu];
+            card_poscpu ^= 1;
+            if (card_count > 0) card_count--;
+            card_drq = 0;
+            if (card_pos < card_len) {
+                if (card_late) { card_late = 0; card_advance_receive(); }
+            } else {
+                if (card_count == 0) card_end_transfer();
+                else card_drq = 1;
+            }
+            if (word) st32(d, v); else st16(d, (uint16_t)v);
+        }
+        if (dadir == 1u) d -= step; else if (dadir != 2u) d += step;
+        done++;
+    }
+    if (done == count) {
+        dma_cnt[i] = (cnt & (1u << 25)) ? cnt : (cnt & ~0x80000000u);
+        if (nnk_dma_card_n < 8u) {
+            fprintf(stderr, "dma: card DMA%d drained %u %s words from 0x%08X "
+                    "to 0x%08X pc=0x%08X\n", i, done, word ? "word" : "half",
+                    dma_sad[i], dma_dad[i], last_pc);
+            nnk_dma_card_n++;
+        }
+    }
+}
+
 void nnk_dma_tick(void) {
+    /* Phase-4N probe: one-shot state dump at the ARM9 WFI idle loop. */
+    { static int lp_done;
+      if (!lp_done && last_pc == 0x02007134u) {
+          lp_done = 1;
+          fprintf(stderr, "loopprobe step=%llu card_cycles=%llu card_next=%lld "
+                  "endpend=%d romcnt=%08X spicnt=%08X card_pos=%u/%u count=%d late=%d drq=%d "
+                  "ie=%08X if=%08X ime=%u cpsr=%02X dma=%08X,%08X,%08X,%08X\n",
+                  (unsigned long long)steps, (unsigned long long)card_cycles,
+                  (long long)(card_next == CARD_NEVER ? -1 : (long long)card_next),
+                  card_end_pending, romcnt, spicnt, card_pos, card_len, card_count,
+                  card_late, card_drq, ie, iflags, ime, (unsigned)cpsr_ctl,
+                  dma_cnt[0], dma_cnt[1], dma_cnt[2], dma_cnt[3]);
+      }
+    }
     uint32_t vc = vcount();
     int vbedge = 0, hbedge = 0;
     if (nnk_dma_last_vc >= 0 && vc != (uint32_t)nnk_dma_last_vc) {
@@ -77,6 +142,7 @@ void nnk_dma_tick(void) {
         if (!(cnt & 0x80000000u)) continue;
         uint32_t mode = (cnt >> 27) & 7u;
         if (mode == 0u) { nnk_dma_copy(i); continue; }
+        if (mode == 3u) { nnk_dma_card(i); continue; }
         if ((mode == 1u && vbedge) || (mode == 2u && hbedge)) {
             if (nnk_dma_timed_n < 4u) {
                 fprintf(stderr, "dma: timed DMA%d mode=%u fired pc=0x%08X "

@@ -1268,7 +1268,7 @@ pub fn recompile_all(
     ));
     src.push_str(RUNTIME_ALL);
     src.push_str(
-        "static void run(void) {\n    uint32_t pc = ENTRY_CONST;\n    for (;;) {\n        if (++steps > step_limit) { halt_reason(\"step budget exhausted\"); return; }\n        arm7_evt_tick();\n        irq_tick();\n        if (irq_active && pc >= BIOS_IRQ_LO) { bios_irq_return(&pc); }\n        else if (!irq_active && irq_trig_n < IRQ_TRIG_N && steps > irq_trig_log[irq_trig_n]\n                 && ime && (ie & iflags) && !(cpsr_ctl & 0x80u)) {\n            irq_trig_n++;\n            irq_enter(&pc);\n        }\n        switch (pc) {\n",
+        "static void run(void) {\n    uint32_t pc = ENTRY_CONST;\n    for (;;) {\n        if (++steps > step_limit) { halt_reason(\"step budget exhausted\"); return; }\n        arm7_evt_tick();\n        irq_tick();\n        if (irq_active && pc >= BIOS_IRQ_LO) { bios_irq_return(&pc); }\n        else if (!irq_active\n                 && (irq_trig_n >= IRQ_TRIG_N || steps > irq_trig_log[irq_trig_n])\n                 && ime && (ie & iflags) && !(cpsr_ctl & 0x80u)) {\n            irq_trig_n++;\n            irq_enter(&pc);\n        }\n        switch (pc) {\n",
     );
     for (case, _) in cases.values() {
         src.push_str(case);
@@ -2197,9 +2197,13 @@ static void io_do_dma(int i) {
 }
 /* Card transfer state machine (melonDS NDSCart.cpp, see the state block). */
 static void card_advance_receive(void) {
-    if (card_pos >= card_len) return;
-    card_next = card_cycles +
-        (uint64_t)card_xfer * (4u + ((card_pos & 0x1FFu) ? 0u : card_gap2));
+    uint64_t d = (uint64_t)card_xfer * (4u + ((card_pos & 0x1FFu) ? 0u : card_gap2));
+    /* Phase-4N: ROMAdvanceSend schedules ROMTransfer_End after the last word
+     * of the transfer (melonDS NDSCart.cpp).  Without this the data-read
+     * transfer never completes: ROMCnt bit31 stays set and the cart IRQ the
+     * guest waits for in its WFI idle loop is never raised. */
+    if (card_pos >= card_len) { card_end_pending = 1; card_next = card_cycles + d; return; }
+    card_next = card_cycles + d;
 }
 /* ROMTransfer_ReceiveData: put the next word in the FIFO, then raise DRQ. */
 static void card_receive_data(void) {
@@ -2233,10 +2237,13 @@ static void card_end_transfer(void) {
     card_drq = 0;
     card_pos = 0; card_len = 0;
     card_next = CARD_NEVER; card_end_pending = 0;
-    /* melonDS also raises the cart IRQ here when AUXSPICNT bit14 is set; that
-     * raise is not in the measured melonDS IRQ log for this boot (there is no
-     * setirq bit=5 in melonds_irq.txt), so nothing is raised here: the
-     * runtime's IF writes stay exactly the measured script. */
+    /* ROMEndTransfer (melonDS NDSCart.cpp): raise the cart transfer-done IRQ
+     * when AUXSPICNT bit14 (transfer IRQ enable) is set.  Phase-4D left this
+     * out because the boot capture up to ts 23.1M had no such raise; Phase-4N
+     * measured it: the ARM9 WFI idle loop at 0x0200712C wakes on exactly this
+     * IRQ (IF/IE bit 19 = IRQ_CartXferDone) once per transfer, every ~21,700
+     * card-bus cycles (p4n_wake.txt "irqwake ... enabled=0x00080000"). */
+    if (spicnt & (1u << 14)) iflags |= 0x00080000u;
 }
 /* Called once per dispatched instruction with that instruction's measured
  * cost; fires any card event that has come due. */
