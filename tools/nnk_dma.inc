@@ -39,6 +39,62 @@ static int nnk_dma_last_vc = -1;
 static unsigned nnk_dma_shim_n;          /* transfers completed by this shim */
 static unsigned nnk_dma_timed_n;         /* vblank/hblank triggers */
 
+/* Phase-4P: a DMA that reads or writes IO space must go through the IO bus,
+ * not the flat memory accessor.  melonDS's DMA::Run9 calls ARM9Read32 /
+ * ARM9Write32, so a copy sourced from the cart data FIFO (0x04100010) POPS
+ * the card FIFO and advances the transfer.  With ld32() the FIFO never moved:
+ * measured at step 18534214, the guest's 1-word card DMA (DMA2CNT
+ * 0x85000001, SAD 0x04100010) left card_pos=0/512, count=0, drq=0, so the
+ * 0x200-byte transfer could never finish and the guest's next command stalled
+ * in the ROMCNT-busy wait at 0x020168A0. */
+static int nnk_is_io(uint32_t a) { return a >= 0x04000000u && a < 0x05000000u; }
+static uint32_t nnk_bus_rd32(uint32_t a) { return nnk_is_io(a) ? io_read32(a) : ld32(a); }
+static uint32_t nnk_bus_rd16(uint32_t a) { return nnk_is_io(a) ? io_read16(a) : ld16(a); }
+static void nnk_bus_wr32(uint32_t a, uint32_t v) { if (nnk_is_io(a)) io_write32(a, v); else st32(a, v); }
+static void nnk_bus_wr16(uint32_t a, uint32_t v) { if (nnk_is_io(a)) io_write16(a, v); else st16(a, v); }
+
+/* Phase-4P: ARM9 bus-stall (DMA ownership) model.
+ *
+ * melonDS's DMA::Run9 stops the CPU (CPUStop_DMA9_n) while a channel drains, so
+ * the guest cannot execute inside a cart transfer: it never observes a
+ * half-arrived 0x200 read.  Native counted guest instructions straight through
+ * the transfer, which is how the guest reached its 1-word FIFO DMA at step
+ * 18,534,214 only 69 instructions after the start (cmddelay is 8,180 cycles)
+ * and read an EMPTY FIFO — stranding the transfer at card_pos=8/512.
+ *
+ * Model: while a mode-5 (cart DRQ) channel is armed and a transfer is in
+ * flight, the transfer runs to completion in emulated card time before the
+ * guest gets its next instruction; the elapsed cycles are added to the ARM9
+ * clock (melonDS advances ARM9Timestamp across the halt exactly like this).
+ * Measured card time per 0x200 transfer: native 10,761 cycles vs melonDS
+ * 21,457 raw = 10,728 ARM9 cycles (ARM9ClockShift=1), 0.3%. */
+static void nnk_dma_card(int i);   /* defined below: mode-5 FIFO drain */
+static int nnk_dma_mode5_ch(void) {
+    for (int i = 0; i < 4; i++)
+        if ((dma_cnt[i] & 0x80000000u) && (((dma_cnt[i] >> 27) & 7u) == 5u)) return i;
+    return -1;
+}
+static void nnk_card_stall(void) {
+    int ch;
+    uint64_t t0;
+    unsigned guard = 0;
+    if (!(romcnt & 0x80000000u)) return;
+    ch = nnk_dma_mode5_ch();
+    if (ch < 0) return;
+    t0 = card_cycles;
+    while ((romcnt & 0x80000000u) && guard++ < 8192u) {
+        if (card_next != CARD_NEVER && card_next > card_cycles)
+            card_cycles = card_next;              /* engine time passes */
+        if (card_next != CARD_NEVER && card_next <= card_cycles)
+            card_tick(0u);                        /* receive a word, or end */
+        if (card_drq && (romcnt & 0x80000000u))
+            nnk_dma_card(ch);                     /* DMA pops what is due */
+        else if (!card_drq && card_next == CARD_NEVER)
+            break;
+    }
+    cycles += (card_cycles - t0);                 /* the ARM9 clock ran on */
+}
+
 static void nnk_dma_copy(int i) {
     uint32_t cnt = dma_cnt[i];
     uint32_t count = cnt & 0x001FFFFFu;
@@ -49,7 +105,8 @@ static void nnk_dma_copy(int i) {
     uint32_t s = dma_sad[i], d = dma_dad[i];
     if (!count) count = 0x00200000u;
     for (uint32_t k = 0; k < count; k++) {
-        if (word) st32(d, ld32(s)); else st16(d, (uint16_t)ld16(s));
+        if (word) nnk_bus_wr32(d, nnk_bus_rd32(s));
+        else nnk_bus_wr16(d, nnk_bus_rd16(s));
         if (sadir == 1u) s -= step; else if (sadir != 2u) s += step;
         if (dadir == 1u) d -= step; else if (dadir != 2u) d += step;
     }
@@ -144,6 +201,51 @@ static void nnk_dma_card(int i) {
 }
 
 void nnk_dma_tick(void) {
+    /* Phase-4P: cart-DMA bus ownership — the CPU does not execute while a
+     * mode-5 channel drains a transfer (melonDS CPUStop_DMA9_n). */
+    nnk_card_stall();
+    /* Phase-4P probe: who writes DMA2CNT (the card-DRQ channel) and what the
+     * card model looks like at that instant.  Polled, so no call site is
+     * needed in the generated io_write32. */
+    { static uint32_t seen[4]; static int init, wr_n;
+      for (int i = 0; i < 4; i++) {
+          uint32_t v = dma_cnt[i];
+          if (init && v != seen[i] && wr_n < 80) {
+              fprintf(stderr, "dmawr step=%llu pc=0x%08X ch=%d old=0x%08X new=0x%08X "
+                      "sad=0x%08X dad=0x%08X cardpos=%u/%u count=%d late=%d drq=%d "
+                      "next=%lld romcnt=%08X\n",
+                      (unsigned long long)steps, last_pc, i, seen[i], v,
+                      dma_sad[i], dma_dad[i], card_pos, card_len, card_count,
+                      card_late, card_drq,
+                      (long long)(card_next == CARD_NEVER ? -1 : (long long)card_next),
+                      romcnt);
+              wr_n++;
+          }
+          seen[i] = v;
+      }
+      init = 1;
+    }
+    /* Phase-4P probe: the guest's ROMCNT-busy wait (0x020168A0 ldr / 0x020168A4
+     * tst #0x80000000 / 0x020168A8 bne) spinning without the transfer's end
+     * event ever firing.  One-shot state dump after 100k consecutive loop
+     * dispatches. */
+    { static unsigned long stall_n; static int stall_done;
+      unsigned long long ticks_at_dump = (unsigned long long)card_cycles;
+      if (last_pc == 0x020168A0u || last_pc == 0x020168A4u || last_pc == 0x020168A8u) {
+          stall_n++;
+      } else stall_n = 0;
+      if (!stall_done && stall_n == 100000u) {
+          stall_done = 1;
+          fprintf(stderr, "busyprobe step=%llu card_cycles=%llu(%llu) card_next=%lld "
+                  "endpend=%d romcnt=%08X spicnt=%08X card_pos=%u/%u count=%d late=%d drq=%d "
+                  "dma2=%08X dad2=%08X if=%08X ie=%08X\n",
+                  (unsigned long long)steps, (unsigned long long)card_cycles,
+                  ticks_at_dump,
+                  (long long)(card_next == CARD_NEVER ? -1 : (long long)card_next),
+                  card_end_pending, romcnt, spicnt, card_pos, card_len, card_count,
+                  card_late, card_drq, dma_cnt[2], dma_dad[2], iflags, ie);
+      }
+    }
     /* Phase-4N probe: one-shot state dump at the ARM9 WFI idle loop. */
     { static int lp_done;
       if (!lp_done && last_pc == 0x02007134u) {
