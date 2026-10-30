@@ -1638,6 +1638,57 @@ static void io_load_rom(void) {
     fprintf(stderr, "io: card rom %zu bytes from %s\\n", rom_len, p);
 }
 
+/* ---- BIOS boot state (Phase-4C2) -----------------------------------------
+ * The runtime starts at the ARM9 entry, so everything the DS BIOS had written
+ * into main RAM before entry is initial state here (same precedent as the
+ * pre-entry EXMEMCNT value above).  Two measured blocks matter, both captured
+ * pre-entry from melonDS (tools/add_memwatch_window.py, memwatch dump):
+ *
+ *  (1) 0x027FFE00 — BIOS ARM9 boot params: a 0x200-byte copy of the cartridge
+ *      header.  The guest reads it through the main-RAM mirror as 0x02FFFE00;
+ *      at 0x02016FB8 it does `bl 0x02015B50` -> 0x02FFFE00 then
+ *      `ldr r0,[r0,#128]` and needs header word 0x80 (0x1D12663C) nonzero to
+ *      take `bl 0x020064F8` at 0x02016FC8.  With this block zero the guest
+ *      took the `popeq` path to 0x02015A8C and the PC trace diverged from
+ *      melonDS at index 3,638,594 — that is the Phase-4C2 first divergence.
+ *      The bytes come from the ROM the runtime already loads for the card
+ *      server (NNK_ROM_PATH), so no ROM data is stored in this source.  The
+ *      BIOS zeroes header bytes 0x160..0x1BF of the copy (measured: the only
+ *      byte that differs from the ROM header is offset 0x1BC, 0x60 in the ROM
+ *      vs 0 in the copied block).
+ *  (2) 0x027FF800 / 0x027FFC00 — BIOS/firmware boot params: the WifiFlash
+ *      chip id pair and the firmware user-settings block (0x027FFC40 = WFC
+ *      enabled, 0x027FFC80 = firmware version + nickname string, 0x027FFCE0 =
+ *      WIFI calibration).  Values are the measured pre-entry contents of the
+ *      melonDS firmware image it boots with; they are boot state, not game or
+ *      ROM data.  Written before the guest runs so a guest read of the
+ *      firmware area sees the same bytes melonDS returned. */
+static const struct { uint32_t a, v; } bios_bootparam[20] = {
+    {0x027FF800u, 0x0000FEC2u}, {0x027FF804u, 0x0000FEC2u},
+    {0x027FF808u, 0x1DE63A18u}, {0x027FF850u, 0x00005835u},
+    {0x027FF868u, 0x0001FE00u},
+    {0x027FFC00u, 0x0000FEC2u}, {0x027FFC04u, 0x0000FEC2u},
+    {0x027FFC08u, 0x1DE63A18u}, {0x027FFC10u, 0x00005835u},
+    {0x027FFC30u, 0x0000FFFFu}, {0x027FFC40u, 0x00000001u},
+    {0x027FFC80u, 0x01000005u}, {0x027FFC84u, 0x006D0001u},
+    {0x027FFC88u, 0x006C0065u}, {0x027FFC8Cu, 0x006E006Fu},
+    {0x027FFC90u, 0x00530044u}, {0x027FFC98u, 0x00070000u},
+    {0x027FFCDCu, 0x0FF00000u}, {0x027FFCE0u, 0xBFFF0BF0u},
+    {0x027FFCE4u, 0x00000031u}
+};
+static void bios_boot_seed(void) {
+    unsigned i;
+    if (rom_loaded && rom_len >= 0x200) {
+        memcpy(main_ram_ptr(0x027FFE00u), rom, 0x200);
+        memset(main_ram_ptr(0x027FFE00u) + 0x160, 0, 0x60);
+    } else {
+        fprintf(stderr, "bios: no ROM loaded; header copy at 0x027FFE00 stays zero\\n");
+    }
+    for (i = 0; i < sizeof bios_bootparam / sizeof bios_bootparam[0]; i++)
+        *(uint32_t *)main_ram_ptr(bios_bootparam[i].a) = bios_bootparam[i].v;
+    fprintf(stderr, "bios: boot state seeded (header copy 0x027FFE00, %u bootparam words)\\n", i);
+}
+
 static uint32_t io_read8(uint32_t a);
 static void io_write8(uint32_t a, uint32_t v);
 static uint32_t io_read16(uint32_t a);
@@ -2940,7 +2991,7 @@ static int hle_swi(uint32_t imm24, uint32_t at, int thumb) {
     }
 }
 
-static void guest_init(void) { memset(r, 0, sizeof r); n = z = c = v = 0; cp15_update_tcm(); io_load_rom(); }
+static void guest_init(void) { memset(r, 0, sizeof r); n = z = c = v = 0; cp15_update_tcm(); io_load_rom(); bios_boot_seed(); }
 "##;
 
 const RUNTIME_ALL_MAIN: &str = r##"int main(int argc, char **argv) {
