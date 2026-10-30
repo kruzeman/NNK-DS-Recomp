@@ -621,13 +621,21 @@ pub fn decode_arm(w: u32, addr: u32) -> Insn {
         } else {
             Ea::Reg { rm: (w & 15) as u8, kind: 0, amount: 0, pre, wb, up }
         };
+        // ARM ARM, extra load/store (bits 7-4 = 1SH1, S/H = bits 6-5, L = bit
+        // 20): SH=01 -> halfword, SH=10 -> signed byte (LDRSB) or, with L=0,
+        // doubleword (LDRD); SH=11 -> signed halfword (LDRSH) or, with L=0,
+        // doubleword store (STRD).  0xE19A80D7 `ldrsb r8,[sl,r7]` was matched
+        // as (h=2, L=1) => "ldrd", which loaded eight bytes and clobbered the
+        // pair's second register (r9) with path-string bytes: that is the
+        // Phase-4F divergence (SDK path parse at 0x0200C638 returned 0 ->
+        // guest took the 0x0210E388 abort arm).
         let (name, hk) = match (h, load) {
-            (2, false) => ("strd", HwKind::Strd),
-            (2, true) => ("ldrd", HwKind::Ldrd),
             (1, false) => ("strh", HwKind::Strh),
             (1, true) => ("ldrh", HwKind::Ldrh),
-            (3, true) => ("ldrsh", HwKind::Ldrsh),
-            _ => ("ldrsb", HwKind::Ldrsb),
+            (2, false) => ("ldrd", HwKind::Ldrd),
+            (2, true) => ("ldrsb", HwKind::Ldrsb),
+            (3, false) => ("strd", HwKind::Strd),
+            _ => ("ldrsh", HwKind::Ldrsh),
         };
         let text = if matches!(hk, HwKind::Strd | HwKind::Ldrd) {
             // binutils prints the even register of the pair only.

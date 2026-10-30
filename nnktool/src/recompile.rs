@@ -3144,16 +3144,51 @@ static void checkpoint_dump(uint32_t pc) {
 /* NNK_DEBUG_AT_PC=<hex> [+ NNK_DEBUG_N=<count, default 64>] dumps all guest
  * registers + flags to stderr each time the dispatch loop reaches that PC —
  * a poor man's breakpoint for arbitrating emulator-vs-emulator divergences
- * (e.g. the LZ decompressor flag stream at 0x0200098C). */
+ * (e.g. the LZ decompressor flag stream at 0x0200098C).
+ * Phase-4F: the line also carries the step index, NNK_DEBUG_MEM="a:len[,a:len]"
+ * + NNK_DEBUG_MEM_PATH=<file> appends a hexdump of each range on every hit
+ * (read through the guest data path, so DTCM ranges show the guest's view),
+ * and NNK_HALT_AT_PC=<hex> stops the run honestly at that PC. */
 static uint32_t dbg_pc;
+static uint32_t halt_at_pc;
 static int dbg_hits;
 static int dbg_limit = 64;
+static void debug_mem_dump(void) {
+    const char *spec = getenv("NNK_DEBUG_MEM");
+    const char *path = getenv("NNK_DEBUG_MEM_PATH");
+    if (!spec || !spec[0] || !path || !path[0]) return;
+    FILE *f = fopen(path, "a");
+    if (!f) return;
+    fprintf(f, "hit %d pc=0x%08X step=%llu\n", dbg_hits, dbg_pc, (unsigned long long)steps);
+    const char *q = spec;
+    int n = 0;
+    while (*q && n < 4) {
+        while (*q == ' ' || *q == ',') q++;
+        if (!*q) break;
+        uint32_t a = (uint32_t)strtoul(q, (char **)&q, 0);
+        while (*q == ' ' || *q == ':') q++;
+        uint32_t len = (uint32_t)strtoul(q, (char **)&q, 0);
+        if (!len) len = 0x100;
+        fprintf(f, "range 0x%08X len 0x%X\n", a, len);
+        for (uint32_t off = 0; off < len; off += 16) {
+            fprintf(f, "0x%08X:", a + off);
+            for (uint32_t i = 0; i < 16 && off + i < len; i++) {
+                uint32_t v = ld16(a + off + i);
+                fprintf(f, " %02X", (unsigned)(v & 0xFFu));
+            }
+            fputc('\n', f);
+        }
+        n++;
+    }
+    fclose(f);
+}
 static void debug_dump(uint32_t pc) {
     if (!dbg_pc || pc != dbg_pc || dbg_hits >= dbg_limit) return;
     dbg_hits++;
-    fprintf(stderr, "dbg%d pc=%08X r0=%08X r1=%08X r2=%08X r3=%08X r4=%08X r5=%08X r6=%08X r7=%08X r8=%08X r12=%08X r13=%08X r14=%08X nzcv=%d%d%d%d\n",
-            dbg_hits, pc, r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[12], r[13], r[14],
+    fprintf(stderr, "dbg%d step=%llu pc=%08X r0=%08X r1=%08X r2=%08X r3=%08X r4=%08X r5=%08X r6=%08X r7=%08X r8=%08X r12=%08X r13=%08X r14=%08X nzcv=%d%d%d%d\n",
+            dbg_hits, (unsigned long long)steps, pc, r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[12], r[13], r[14],
             (int)n, (int)z, (int)c, (int)v);
+    debug_mem_dump();
 }
 
 /* First-execution ITCM snapshot (Phase-4B): the loader's copy into ITCM is
@@ -3177,6 +3212,7 @@ static void itcm_dump_once(uint32_t pc) {
 static void trace_pc(uint32_t pc) {
     last_pc = pc;
     cycles++;                       /* coarse timing: ~1 cycle per instruction */
+    if (halt_at_pc && pc == halt_at_pc) { halt_reason("halt-at-pc"); step_limit = steps; return; }
     if (nnk_display_tick()) { halt_reason("SDL window closed"); step_limit = steps; }
     checkpoint_dump(pc);
     debug_dump(pc);
@@ -3332,6 +3368,8 @@ const RUNTIME_ALL_MAIN: &str = r##"int main(int argc, char **argv) {
       if (s && s[0]) dbg_pc = (uint32_t)strtoul(s, NULL, 0);
       const char *n2 = getenv("NNK_DEBUG_N");
       if (n2 && n2[0]) dbg_limit = (int)strtol(n2, NULL, 0); }
+    { const char *s = getenv("NNK_HALT_AT_PC");
+      if (s && s[0]) halt_at_pc = (uint32_t)strtoul(s, NULL, 0); }
     printf("nnk recompile-all ARM9 entry 0x%08X\n", ENTRY_CONST);
     printf("guest image %s: %zu bytes at 0x%08X\n", path, got, IMAGE_LOAD);
     run();
