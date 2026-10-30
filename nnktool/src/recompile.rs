@@ -1772,6 +1772,75 @@ static uint32_t div_ctrl = 0, div_quot = 0, div_rem = 0;
 static uint32_t sqrt_in_lo = 0, sqrt_in_hi = 0, sqrt_ctrl = 0, sqrt_res = 0;
 static uint32_t vramcnt[9]; static uint32_t wramcnt_map = 0;
 
+/* ---- Phase-4M: MMIO readback for the display-programming registers --------
+ * THREE measured barriers, one class: a register the guest READS through a
+ * read-modify-write sequence must return what it wrote (melonDS GPU::Read16/
+ * Read32 serve every one of these from the live GPU state).
+ *
+ * (a) VRAMCNT_A..I (0x04000240..0x04000248) were STORE-ONLY and 8-BIT-ONLY:
+ *     io_write16_sw/io_write32_sw had no case (a wide store was dropped) and
+ *     io_read16/io_read32 had none either (reads returned 0).  melonDS's own
+ *     sequence uses both wide forms first (W32 clear of A..D, W16 clear of
+ *     H..I) and then programs the banks byte-wise; the mapping those bytes
+ *     select is what the 2D compositor reads its layers through (gx_display
+ *     owns the MapVRAM_A..I table and the flat-view rebuild).
+ * (b) POWCNT1 (0x04000304) had NO readback.  The guest's display-init at
+ *     0x02002A3C..0x02002A64 is a read-modify-write over it; reading 0 made
+ *     the final store 0x0001 instead of melonDS's 0x820F, so the screen and
+ *     both 2D engines stayed OFF -> every frame was uniform black.
+ * (c) The engine B 2D register block (0x04001000..0x0400106F) had no
+ *     readback at all (those registers live only in gx_display, which is
+ *     write-only from the runtime).  The guest's RMW at 0x02041710 therefore
+ *     wrote DISPCNT_B = 0x00200010 instead of melonDS's 0x80211013, leaving
+ *     engine B in DS display mode 0 ("display off" = white) with no BG
+ *     enables -> uniform white frames.
+ *
+ * The model below reproduces melonDS: width-correct register file for the 2D
+ * blocks (DISPSTAT/VCOUNT stay live), width-correct VRAMCNT with VRAMSTAT
+ * derived from the ARM7-mapped banks, and POWCNT1 readback.  gx_display
+ * remains the authority for the RENDERING effect (every store is still
+ * forwarded to gxd_io_write with the guest's width); this is the guest's view.
+ * tools/nnk_vramcnt.inc carries the same model, plus write tracing and a
+ * bank-map report, for the already-generated image. */
+static int vrc_in(uint32_t a) { return a >= 0x04000240u && a <= 0x0400024Bu; }
+static void vrc_write(uint32_t a, uint32_t v, int width) {
+    int bank = (int)(a - 0x04000240u), i;
+    for (i = 0; i < width && bank + i < 9; i++) vramcnt[bank + i] = (v >> (8 * i)) & 0xFFu;
+}
+static uint32_t vrc_read(uint32_t a, int width) {
+    int bank = (int)(a - 0x04000240u), i; uint32_t r = 0;
+    for (i = 0; i < width && bank + i < 9; i++) r |= (vramcnt[bank + i] & 0xFFu) << (8 * i);
+    return r;
+}
+/* VRAMSTAT (0x0400024E): bit0 = VRAM_C mapped to ARM7, bit1 = VRAM_D. */
+static uint32_t vrc_stat(void) {
+    uint32_t s = 0;
+    if ((vramcnt[2] & 0x87u) == 0x82u) s |= 1u;
+    if ((vramcnt[3] & 0x87u) == 0x82u) s |= 2u;
+    return s;
+}
+/* 2D register-block shadow: what the guest wrote, byte for byte.
+ * DISPSTAT (0x04) and VCOUNT (0x06) are excluded - they are live. */
+static uint8_t io2d_sh[2][0x70];
+static int io2d_off(uint32_t a, int *eng, uint32_t *off) {
+    if (a >= 0x04000000u && a < 0x04000070u) { *eng = 0; *off = a - 0x04000000u; return 1; }
+    if (a >= 0x04001000u && a < 0x04001070u) { *eng = 1; *off = a - 0x04001000u; return 1; }
+    return 0;
+}
+static void io2d_write(uint32_t a, uint32_t v, int width) {
+    int e, i; uint32_t off;
+    if (!io2d_off(a, &e, &off) || off == 0x04u || off == 0x06u) return;
+    for (i = 0; i < width && off + (uint32_t)i < 0x70u; i++)
+        io2d_sh[e][off + (uint32_t)i] = (uint8_t)(v >> (8 * i));
+}
+static int io2d_read(uint32_t a, int width, uint32_t *out) {
+    int e, i; uint32_t off, r = 0;
+    if (!io2d_off(a, &e, &off) || off == 0x04u || off == 0x06u) return 0;
+    for (i = 0; i < width && off + (uint32_t)i < 0x70u; i++)
+        r |= (uint32_t)io2d_sh[e][off + (uint32_t)i] << (8 * i);
+    *out = r; return 1;
+}
+
 /* DIV (0x04000280 mode: 0=32/32, 1=64/32, 2=64/64) and SQRT computed on write. */
 static void io_div_do(void) {
     uint32_t mode = div_ctrl & 3u;
@@ -2209,6 +2278,10 @@ static void io_card_start(uint32_t val) {
     }
 }
 static uint32_t io_read32(uint32_t a) {
+    { uint32_t _s; if (io2d_read(a, 4, &_s)) return _s; }
+    if (vrc_in(a)) return vrc_read(a, 4);
+    if (a == 0x0400024Eu) return vrc_stat();
+    if ((a & ~3u) == 0x04000304u) return powerctl & 0xFFFFu;
     switch (a) {
     case 0x04000130: case 0x04000132: return io_read16(a);
     case 0x04000000: return dispcnt;
@@ -2279,6 +2352,7 @@ static uint32_t io_read32(uint32_t a) {
     }
 }
 static void io_write32_sw(uint32_t a, uint32_t v) {
+    if (vrc_in(a)) { vrc_write(a, v, 4); return; }
     switch (a) {
     case 0x04000000: dispcnt = v; return;
     case 0x04000004: dispstat = v & 0xFFF8u; return;
@@ -2331,6 +2405,7 @@ static void io_write32_sw(uint32_t a, uint32_t v) {
     }
 }
 static uint32_t io_read16(uint32_t a) {
+    { uint32_t _s; if (io2d_read(a, 2, &_s)) return _s; }
     switch (a) {
     case 0x04000130:
         /* KEYINPUT: live SDL keypad through gx_display; headless 0x03FF =
@@ -2360,6 +2435,7 @@ static uint32_t io_read16(uint32_t a) {
     }
 }
 static void io_write16_sw(uint32_t a, uint32_t v) {
+    if (vrc_in(a)) { vrc_write(a, v, 2); return; }
     switch (a) {
     case 0x04000004: dispstat = v & 0xFFF8u; return;
     case 0x04000180: { io_ipcsync_write(v); return; }
@@ -2373,14 +2449,13 @@ static void io_write16_sw(uint32_t a, uint32_t v) {
 }
 static uint32_t io_read8(uint32_t a) {
     if (a == 0x04000300) return postflg;
-    if (a >= 0x04000240u && a <= 0x04000248u) return vramcnt[a - 0x04000240u];
-    if (a == 0x04000247) return wramcnt_map;
+    if (vrc_in(a)) return vrc_read(a, 1);
+    { uint32_t _s; if (io2d_read(a, 1, &_s)) return _s; }
     return io_read16(a & ~1u) >> ((a & 1u) * 8);
 }
 static void io_write8_sw(uint32_t a, uint32_t v) {
     if (a == 0x04000300) { postflg = (uint8_t)v; return; }
-    if (a >= 0x04000240u && a <= 0x04000248u) { vramcnt[a - 0x04000240u] = v; return; }
-    if (a == 0x04000247) { wramcnt_map = v; return; }
+    if (vrc_in(a)) { vrc_write(a, v, 1); return; }
     io_write16_sw(a & ~1u, v);
 }
 
@@ -2393,18 +2468,21 @@ static void io_write8_sw(uint32_t a, uint32_t v) {
  * models used for internal read-modify-write composition (no second
  * forwarding, no double-width clobber of the display state). */
 static void io_write32(uint32_t a, uint32_t v) {
+    io2d_write(a, v, 4);
 #ifdef NNK_GX
     if (gxd) gxd_io_write(gxd, a, v, 4);
 #endif
     io_write32_sw(a, v);
 }
 static void io_write16(uint32_t a, uint32_t v) {
+    io2d_write(a, v, 2);
 #ifdef NNK_GX
     if (gxd) gxd_io_write(gxd, a, v, 2);
 #endif
     io_write16_sw(a, v);
 }
 static void io_write8(uint32_t a, uint32_t v) {
+    io2d_write(a, v, 1);
 #ifdef NNK_GX
     if (gxd) gxd_io_write(gxd, a, v, 1);
 #endif

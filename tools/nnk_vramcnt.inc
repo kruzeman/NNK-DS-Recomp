@@ -1,0 +1,285 @@
+/* tools/nnk_vramcnt.inc — Phase-4M: VRAMCNT_A..I bank-mapping model for the
+ * ALREADY-GENERATED dispatch image (work/phase3a/arm9_thumb_ovl_itcm_p4j.c).
+ *
+ * Spliced into the generated main TU by tools/split_dispatch.py (included next
+ * to nnk_boot.inc / nnk_dma.inc), and hooked into the prelude's IO accessors
+ * by explicit line substitutions in that script.  nnktool/src/recompile.rs
+ * carries the same model for the next image regeneration.
+ *
+ * WHY (measured, Phase-4L §8.3 + Phase-4M): 0x04000240..0x04000249 are the
+ * per-bank VRAMCNT registers (melonDS GPU::Write8/16/32 -> MapVRAM_A..I).  The
+ * generated image's IO model was STORE-ONLY and 8-BIT-ONLY:
+ *
+ *   io_write8_sw: vramcnt[a-0x04000240] = v;     (only width-1 stores land)
+ *   io_write16_sw / io_write32_sw: no case at all -> the store is dropped
+ *   io_read16 / io_read32: no case -> reads return 0
+ *   io_read8: returns vramcnt[] (so only 8-bit stores are ever visible)
+ *
+ * The guest really does use the wider forms (melonDS p4l_mel_io.txt):
+ *
+ *   W32 0x04000240 0x00000000 ts=19908841   ; clear A..D in one store
+ *   W16 0x04000248 0x00000000 ts=19908857   ; clear H..I in one store
+ *   W8  0x04000240 0x00000080 ts=19909691   ; then per-bank programming
+ *   ...
+ *   W8  0x04000242 0x0000008B ts=20853882   ; AOBJ / ABG / BBG / BOBJ / ...
+ *
+ * so a 32/16-bit clear (and any readback of it) was invisible to the runtime
+ * model.  This fragment makes the model WIDTH-CORRECT and READABLE, and adds
+ * the measurement surface Phase-4M needs (write trace, per-window store
+ * counts, final DISPCNT/VRAMCNT report).
+ *
+ * The MAPPING EFFECT itself is owned by gx_display (the merged gxrender API):
+ * every IO write is already forwarded to gxd_io_write() with the guest's
+ * width, and gx_display.c implements melonDS's MapVRAM_A..I table plus the
+ * flat-view rebuild that the 2D compositor reads.  This fragment therefore
+ * REPORTS the same mapping the renderer uses (nnk_vrc_dest()) so the log can
+ * be diffed against melonDS instead of being trusted.
+ *
+ * Env:  NNK_VRC_TRACE=1   log every VRAMCNT write (address, width, value, A..I)
+ *       (the final report prints unconditionally, one line group)
+ */
+#ifndef NNK_VRAMCNT_INC
+#define NNK_VRAMCNT_INC
+
+static unsigned nnk_vrc_writes;        /* VRAMCNT register stores */
+static unsigned nnk_vrc_reads;         /* VRAMCNT register reads */
+static unsigned nnk_vrc_stat_reads;    /* VRAMSTAT reads */
+static unsigned nnk_vrc_win[3];        /* stores: 0 palette, 1 VRAM windows, 2 OAM */
+static unsigned nnk_vrc_win5[5];       /* VRAM windows: ABG/BBG/AOBJ/BOBJ/LCDC */
+static unsigned long long nnk_vrc_win_first[3], nnk_vrc_win_last[3];
+static uint32_t nnk_vrc_dispcnt[2];    /* last DISPCNT seen (engine A, B) */
+static int nnk_vrc_trace = -1;
+
+/* 0x04000240..0x0400024B are the nine VRAMCNT bytes plus padding;
+ * 0x0400024C/4D are unused, 0x0400024E is VRAMSTAT (read-only). */
+static int nnk_vrc_in(uint32_t a) { return a >= 0x04000240u && a <= 0x0400024Bu; }
+
+static void nnk_vrc_trace_init(void)
+{
+    if (nnk_vrc_trace < 0) {
+        const char *s = getenv("NNK_VRC_TRACE");
+        nnk_vrc_trace = (s && s[0] && !(s[0] == '0' && s[1] == '\0')) ? 1 : 0;
+    }
+}
+
+/* Store `width` bytes of `v` (little-endian, as the guest wrote them) into the
+ * VRAMCNT register file.  melonDS keeps one byte per bank and a wider store
+ * simply covers the following banks (GPU::Write8 case 0x04000240+offs). */
+static void nnk_vrc_write(uint32_t a, uint32_t v, int width)
+{
+    int bank = (int)(a - 0x04000240u), i;
+    nnk_vrc_trace_init();
+    nnk_vrc_writes++;
+    for (i = 0; i < width && bank + i < 9; i++)
+        vramcnt[bank + i] = (v >> (8 * i)) & 0xFFu;
+    if (nnk_vrc_trace) {
+        fprintf(stderr, "vrc: W%d 0x%08X=0x%08X A..I=", width, a, v);
+        for (i = 0; i < 9; i++) fprintf(stderr, "%02X", (unsigned)vramcnt[i]);
+        fprintf(stderr, " step=%llu\n", (unsigned long long)steps);
+    }
+}
+
+/* Register readback: the written bytes, little-endian, zero-extended. */
+static uint32_t nnk_vrc_read(uint32_t a, int width)
+{
+    int bank = (int)(a - 0x04000240u), i;
+    uint32_t r = 0;
+    nnk_vrc_reads++;
+    for (i = 0; i < width && bank + i < 9; i++)
+        r |= (vramcnt[bank + i] & 0xFFu) << (8 * i);
+    return r;
+}
+
+/* VRAMSTAT (0x0400024E): bit0 = VRAM_C mapped to ARM7, bit1 = VRAM_D
+ * (melonDS GPU::Read8 / WriteVRAMSTAT semantics: the ARM7-owned banks). */
+static uint32_t nnk_vrc_stat(void)
+{
+    uint32_t s = 0;
+    nnk_vrc_stat_reads++;
+    if ((vramcnt[2] & 0x87u) == 0x82u) s |= 1u;
+    if ((vramcnt[3] & 0x87u) == 0x82u) s |= 2u;
+    return s;
+}
+
+/* Store accounting for the routed memory windows (measurement only). */
+static void nnk_vrc_mem(uint32_t a)
+{
+    int k = 2;
+    if (a >= 0x05000000u && a < 0x05000800u) k = 0;
+    else if (a >= 0x06000000u && a < 0x068A0000u) {
+        k = 1;
+        if (a < 0x06200000u)      nnk_vrc_win5[0]++;
+        else if (a < 0x06220000u) nnk_vrc_win5[1]++;
+        else if (a < 0x06440000u) nnk_vrc_win5[2]++;
+        else if (a < 0x06620000u) nnk_vrc_win5[3]++;
+        else                      nnk_vrc_win5[4]++;   /* LCDC window 0x06800000+ */
+    }
+    if (nnk_vrc_win[k]++ == 0u) nnk_vrc_win_first[k] = (unsigned long long)steps;
+    nnk_vrc_win_last[k] = (unsigned long long)steps;
+}
+
+/* DISPCNT shadow (engine A is in the runtime model; engine B is forwarded to
+ * gx_display only, so record it here for the report). */
+static void nnk_vrc_set_dispcnt(int n, uint32_t v) { nnk_vrc_dispcnt[n & 1] = v; }
+
+/* POWCNT1 writes seen by the runtime model (0 = never written). */
+static unsigned nnk_vrc_powcnt_n;
+static uint32_t nnk_vrc_powcnt_v;
+static void nnk_vrc_powcnt(uint32_t v) { nnk_vrc_powcnt_n++; nnk_vrc_powcnt_v = v & 0xFFFFu; }
+
+/* ---- 2D register-block readback shadow (Phase-4M) -----------------------
+ * WHY (measured, Phase-4M): the guest's display-init tail at 0x02041710.. is
+ * a read-modify-write over BOTH DISPCNT registers:
+ *
+ *   R32 0x04000000 0x0001110B   ; engine A readback (the runtime does have it)
+ *   W32 0x04000000 0x0021111B   ; native reproduces this exactly
+ *   R32 0x04001000 0x80011003   ; engine B readback  <- NOT modelled
+ *   W32 0x04001000 0x80211013   ; melonDS writes this; native wrote 0x00200010
+ *
+ * Engine B's whole 2D register block (0x04001000..0x0400106F) lives only in
+ * gx_display (write-only from the runtime's side), so guest reads of it
+ * returned 0 and every read-modify-write dropped the bits the guest had
+ * already programmed -- engine B stayed in DS display mode 0 ("display off",
+ * a white screen) instead of mode 1 with BG0/BG1 on.
+ *
+ * The shadow is the melonDS GPU2D register file as far as the guest can see
+ * it: it records every store with the guest's exact address and width, and
+ * serves reads for the two 2D blocks.  DISPSTAT/VCOUNT (offsets 0x04/0x06)
+ * are NOT shadowed -- the runtime derives them from the live frame clock.
+ */
+static uint8_t nnk_sh_2d[2][0x70];
+
+static int nnk_sh_addr(uint32_t a, int *eng, uint32_t *off)
+{
+    if (a >= 0x04000000u && a < 0x04000070u) { *eng = 0; *off = a - 0x04000000u; return 1; }
+    if (a >= 0x04001000u && a < 0x04001070u) { *eng = 1; *off = a - 0x04001000u; return 1; }
+    return 0;
+}
+
+static void nnk_sh_write(uint32_t a, uint32_t v, int width)
+{
+    int e, i;
+    uint32_t off;
+    if (!nnk_sh_addr(a, &e, &off)) return;
+    if (off == 0x04u || off == 0x06u) return;      /* DISPSTAT / VCOUNT */
+    for (i = 0; i < width && off + (uint32_t)i < 0x70u; i++)
+        nnk_sh_2d[e][off + (uint32_t)i] = (uint8_t)(v >> (8 * i));
+}
+
+static int nnk_sh_read(uint32_t a, int width, uint32_t *out)
+{
+    int e, i;
+    uint32_t off, r = 0;
+    if (!nnk_sh_addr(a, &e, &off)) return 0;
+    if (off == 0x04u || off == 0x06u) return 0;    /* live, not shadowed */
+    for (i = 0; i < width && off + (uint32_t)i < 0x70u; i++)
+        r |= (uint32_t)nnk_sh_2d[e][off + (uint32_t)i] << (8 * i);
+    *out = r;
+    return 1;
+}
+
+/* One bank -> destination name, per melonDS GPU::MapVRAM_A..I. */
+static const char *nnk_vrc_dest(int bank, char *buf, size_t n)
+{
+    uint32_t c = vramcnt[bank];
+    int ofs;
+    if (!(c & 0x80u)) { snprintf(buf, n, "off"); return buf; }
+    switch (bank) {
+    case 0: case 1:
+        ofs = (int)((c >> 3) & 3u);
+        switch (c & 3u) {
+        case 0: snprintf(buf, n, "LCDC"); break;
+        case 1: snprintf(buf, n, "ABG[%d]", ofs); break;
+        case 2: snprintf(buf, n, "AOBJ[%d]", (ofs & 1) * 8); break;
+        default: snprintf(buf, n, "TEX[%d]", ofs); break;
+        }
+        break;
+    case 2: case 3:
+        ofs = (int)((c >> 3) & 7u);
+        switch (c & 7u) {
+        case 0: snprintf(buf, n, "LCDC"); break;
+        case 1: snprintf(buf, n, "ABG[%d]", ofs); break;
+        case 2: snprintf(buf, n, "ARM7[%d]", ofs & 1); break;
+        case 3: snprintf(buf, n, "TEX[%d]", ofs & 3); break;
+        case 4: snprintf(buf, n, "%s", bank == 2 ? "BBG" : "BOBJ"); break;
+        default: snprintf(buf, n, "reserved%d", (int)(c & 7u)); break;
+        }
+        break;
+    case 4:
+        switch (c & 7u) {
+        case 0: snprintf(buf, n, "LCDC"); break;
+        case 1: snprintf(buf, n, "ABG[0..3]"); break;
+        case 2: snprintf(buf, n, "AOBJ[0..3]"); break;
+        case 3: snprintf(buf, n, "TEXPAL[0..3]"); break;
+        case 4: snprintf(buf, n, "ABGEXT[0..3]"); break;
+        default: snprintf(buf, n, "reserved%d", (int)(c & 7u)); break;
+        }
+        break;
+    case 5: case 6: {
+        int base = (int)(((c >> 3) & 1u) + (((c >> 3) & 2u) << 1));
+        switch (c & 7u) {
+        case 0: snprintf(buf, n, "LCDC"); break;
+        case 1: snprintf(buf, n, "ABG[%d,%d]", base, base + 2); break;
+        case 2: snprintf(buf, n, "AOBJ[%d,%d]", base, base + 2); break;
+        case 3: snprintf(buf, n, "TEXPAL[%d]", base); break;
+        case 4: snprintf(buf, n, "ABGEXT[%d]", (base & 1) << 1); break;
+        case 5: snprintf(buf, n, "AOBJEXT"); break;
+        default: snprintf(buf, n, "reserved%d", (int)(c & 7u)); break;
+        }
+        break;
+    }
+    case 7:
+        switch (c & 3u) {
+        case 0: snprintf(buf, n, "LCDC"); break;
+        case 1: snprintf(buf, n, "BBG[0,1,4,5]"); break;
+        case 2: snprintf(buf, n, "BBGEXT[0..3]"); break;
+        default: snprintf(buf, n, "reserved%d", (int)(c & 3u)); break;
+        }
+        break;
+    case 8:
+        switch (c & 3u) {
+        case 0: snprintf(buf, n, "LCDC"); break;
+        case 1: snprintf(buf, n, "BBG[2,3,6,7]"); break;
+        case 2: snprintf(buf, n, "BOBJ[0..7]"); break;
+        default: snprintf(buf, n, "BOBJEXT"); break;
+        }
+        break;
+    }
+    return buf;
+}
+
+/* One-line-per-bank report at exit: the state the renderer used last. */
+static void nnk_vrc_report(void)
+{
+    char d[9][24];
+    int i;
+    for (i = 0; i < 9; i++) nnk_vrc_dest(i, d[i], sizeof d[i]);
+    fprintf(stderr, "vrc: writes=%u reads=%u stat_reads=%u stores: palette=%u vram=%u oam=%u\n",
+            nnk_vrc_writes, nnk_vrc_reads, nnk_vrc_stat_reads,
+            nnk_vrc_win[0], nnk_vrc_win[1], nnk_vrc_win[2]);
+    fprintf(stderr, "vrc: store window first/last step: palette=%llu..%llu vram=%llu..%llu oam=%llu..%llu\n",
+            nnk_vrc_win_first[0], nnk_vrc_win_last[0],
+            nnk_vrc_win_first[1], nnk_vrc_win_last[1],
+            nnk_vrc_win_first[2], nnk_vrc_win_last[2]);
+    fprintf(stderr, "vrc: VRAM window split: ABG=%u BBG=%u AOBJ=%u BOBJ=%u LCDC=%u\n",
+            nnk_vrc_win5[0], nnk_vrc_win5[1], nnk_vrc_win5[2],
+            nnk_vrc_win5[3], nnk_vrc_win5[4]);
+    fprintf(stderr, "vrc: runtime model: powerctl=0x%08X dispcnt=0x%08X exmemcnt=0x%08X "
+                    "powcnt_writes=%u last=0x%04X\n",
+            powerctl, dispcnt, exmemcnt, nnk_vrc_powcnt_n, nnk_vrc_powcnt_v);
+    fprintf(stderr, "vrc: DISPCNT A=0x%08X B=0x%08X (A: mode=%u bg=%u obj=%u | B: mode=%u bg=%u obj=%u)\n",
+            nnk_vrc_dispcnt[0], nnk_vrc_dispcnt[1],
+            (nnk_vrc_dispcnt[0] >> 16) & 3u, nnk_vrc_dispcnt[0] & 0x1Fu,
+            (nnk_vrc_dispcnt[0] >> 4) & 1u,
+            (nnk_vrc_dispcnt[1] >> 16) & 3u, nnk_vrc_dispcnt[1] & 0x1Fu,
+            (nnk_vrc_dispcnt[1] >> 4) & 1u);
+    fprintf(stderr, "vrc: A=%02X->%s B=%02X->%s C=%02X->%s D=%02X->%s E=%02X->%s "
+                    "F=%02X->%s G=%02X->%s H=%02X->%s I=%02X->%s\n",
+            (unsigned)vramcnt[0], d[0], (unsigned)vramcnt[1], d[1],
+            (unsigned)vramcnt[2], d[2], (unsigned)vramcnt[3], d[3],
+            (unsigned)vramcnt[4], d[4], (unsigned)vramcnt[5], d[5],
+            (unsigned)vramcnt[6], d[6], (unsigned)vramcnt[7], d[7],
+            (unsigned)vramcnt[8], d[8]);
+}
+
+#endif /* NNK_VRAMCNT_INC */
