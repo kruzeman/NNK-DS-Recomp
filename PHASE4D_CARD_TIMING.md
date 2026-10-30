@@ -34,7 +34,7 @@ capture share this shape):
 | cmddelay | 1632 | `8 + (ROMCnt & 0x1FFF) + ((ROMCnt>>16)&0x3F)` = 8+1623+1 |
 | first word | 8180 cycles | `xfercycle*(cmddelay+4)` = 5*1636 |
 | word-to-word | 20 cycles | `xfercycle*(4 [+gap2 at pos%0x200==0])` |
-| ROMCNT polls before first DRQ | **909** | 8180 / 9-cycle poll iteration |
+| ROMCNT reads until DRQ set | **914** | 909 with DRQ clear, DRQ on the 910th |
 | guest poll iteration | **9 cycles** | dts poll->poll 9 |
 | DRQ-poll -> ROMDATA read | 6 cycles | dts 6 |
 | ROMDATA read -> next poll | 9 cycles | dts 9 |
@@ -65,7 +65,10 @@ the "premature DRQ" bug of Phase-4C2, confirmed and fixed.
 
 Offline model check: `tools/card_sim_model.py` (faithful transcription of the
 melonDS state machine + the measured loop costs) reproduces `first = 909`.
-Runtime log agrees: `io: card drq after 909 polls card_cycles=6749013`.
+Runtime log agrees: `io: card drq after 910 polls card_cycles=6747834` (the
+counter counts every ROMCNT read while busy, the DRQ read included, exactly as
+`tools/p4d_loopcount.py` counts visits of 0x02016B30 in the trace: **910 in both
+traces**).
 
 ## 4. The 0x4E IPC request and the SDK shutdown: NOT a DRQ-timing artefact
 
@@ -84,26 +87,37 @@ Measured facts:
   emitted `0x4E` + shutdown.
 
 With the measured `0xB8` answer the shutdown path and the `0x4E` request are
-**gone**: the run executes 12,213,632 steps across 4,367 distinct PCs
+**gone**: the run executes 12,217,380 traced steps across 4,367 distinct PCs
 (Phase-4C2: ~20M steps inside a 2,152-PC halt loop) with `hle_hits=7251`.
 
 ## 5. Strict prefix (honest numbers, `tools/cmp_pc_traces.py`)
 
 ```
 melonDS trace : 10,000,000 PCs      native trace : 12,213,631 PCs
-strict common prefix        : 3,643,455   (Phase-4C2: 3,638,915, +4,540)
-first divergence at 3,643,455: melonDS 0x02016B4C vs native 0x02016B3C
+strict common prefix        : 3,643,483   (Phase-4C2: 3,638,915, +4,568)
+first divergence at 3,643,483: melonDS 0x02016B4C vs native 0x02016B3C
 in-order matched after resync: 3,645,532
 ```
 
-Remaining first divergence, root-caused: still the *same* transfer, but now a
-**loop-phase** offset, not a DRQ-semantics error — the runtime raises DRQ after
-the measured 909 polls (log above), yet its data read lands 5 PCs (one poll
-iteration) earlier in the trace than melonDS's, because the pre-loop stretch
-`str ROMCnt; pop {r3,pc}; mov; ldr ROMCnt` costs 23 master cycles in melonDS's
-pipeline versus 12 in the static cost table. Making the trace exact requires
-melonDS's ARMv5 pipeline cost model for every instruction class, not the
-measured four-class table.
+Remaining first divergence, root-caused: still inside the *same* transfer, but
+it is now a **pre-loop pipeline-cost offset**, not a DRQ-semantics error.
+Both traces perform the measured card poll shape — 910 visits of 0x02016B30 and
+the first ROMDATA read 6 cycles later — but the runtime's loop is entered 5 PCs
+(one poll iteration) earlier in trace-index terms, because melonDS's ARMv5
+pipeline charges 23 master cycles for the stretch
+`str ROMCnt; pop {r3,pc}; mov; ldr ROMCnt` while the measured four-class cost
+table charges 3.  A sweep of that single return cost does not close it, it only
+moves the offset (run -> loop visits before the first word -> strict prefix):
+
+| return cost | loop visits | strict prefix |
+|---|---|---|
+| 3 (kept) | 910 | 3,643,483 |
+| 12 | 909 | 3,643,455 |
+| 21 | 908 | 3,643,450 |
+
+Closing it needs melonDS's per-instruction pipeline model (ARM.cpp `Cycles`
+accounting), not a single fitted constant, so the table stays at the dts-measured
+values and the residual is documented.
 
 ## 6. New barrier in front of display init (honest stop-report)
 

@@ -233,17 +233,17 @@ struct EmitOutcome {
 fn card_cost(kind: &Kind) -> u32 {
     match kind {
         Kind::Mem { load, .. } => if *load { 1 } else { 3 },
-        /* LDM/STM.  A loaded PC (a return) additionally pays melonDS's
-         * pipeline refill: measured from the same capture, the sequence
-         * `str ROMCNT (0x02016930); pop {r3,pc}; mov; ldr ROMCNT (poll)`
-         * spans 23 master cycles in melonDS, while the bare per-instruction
-         * table gives 3.  A return therefore costs 12 here (calibrated inside
-         * that measured 23-cycle envelope: it makes the model reproduce the
-         * measured *909* ROMCNT polls before the first DRQ instead of 910 —
-         * see "io: card drq after N polls" in the runtime log). */
-        Kind::LdmStm { load, list, .. } => {
-            if *load { if *list & 0x8000u16 != 0 { 12 } else { 1 } } else { 3 }
-        },
+        /* LDM/STM.  A loaded PC (a return) costs the same as any other load in
+         * this four-class table.  melonDS's ARMv5 pipeline charges far more
+         * for it — measured: `str ROMCnt (0x02016930); pop {r3,pc}; mov;
+         * ldr ROMCnt (poll)` spans 23 master cycles against 3 here — and that
+         * residual is exactly the remaining 5-PC trace offset documented in
+         * PHASE4D_CARD_TIMING.md.  Fitting this single cost does NOT help:
+         * measured sweep (run, loop visits before the first word, strict
+         * prefix) = (3, 910, 3,643,483), (12, 909, 3,643,455),
+         * (21, 908, 3,643,450) — it only trades one offset for another, so
+         * the value stays at the honest dts-measured 1/3/3/1 table. */
+        Kind::LdmStm { load, .. } => if *load { 1 } else { 3 },
         Kind::Swp { .. } => 3,
         Kind::B { .. } | Kind::Bx { .. } | Kind::BlxImm { .. } => 3,
         _ => 1,
