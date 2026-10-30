@@ -87,8 +87,13 @@ exhausted; 1032 distinct PCs).  10 M PC trace vs melonDS: **3 633 818 /
 (melonDS `0x0201C4C0` vs native `0x0201C4AC`).
 
 **IO model status.**  Nothing is implemented yet; every `0x04000000+`
-access is a stub (reads 0, writes dropped).  The exact register set the
-boot touches — measured with the new melonDS IO bus trace
+access is a stub (reads 0, writes dropped).  **Phase-4A supersedes this
+paragraph**: the 2026-10-29 boot depth is **step 3,634,038, halt at
+`0x020093E4` (`bl 0x01FF845C` — ITCM code execution, the next model gap)**,
+the `0x0201C4B8` wait(13,1) loop exits (ARM7 event-chain in RUNTIME_ALL),
+3,634,037-trace strict prefix vs melonDS = 100 % of the native trace —
+see the Phase-4A section of [IO_MAP.md](IO_MAP.md).  The register set below
+was measured with the melonDS IO bus trace
 (`tools/melonds-io-trace.patch`, 204 685 accesses / 34 registers over the
 first 5 M ARM9 PCs) — and the honest implemented-vs-stubbed table live in
 **[IO_MAP.md](IO_MAP.md)**.  Next IO-model target order by observed boot

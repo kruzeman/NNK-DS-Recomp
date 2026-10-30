@@ -110,3 +110,64 @@ Nothing in the table above is "made to look successful": an unmodelled
 register reads 0 / drops the write, an unscripted IPC FIFO request halts the
 run with a log line, and an unmodelled card command logs its opcode — any
 boot code that polls a non-zero hardware flag diverges visibly at that point.
+
+## Phase-4A — the 0x0201C4B8 poll loop broken; next halt = ITCM execution
+
+**Root cause of the Phase-3A3 halt.**  Subroutine `0x0200BA4C` (called by the
+loop at `0x0201C4B8`) is the SDK `test_bit(bit=r0, word_index=r1)`: it tests
+bit r0 of `[0x02FFFC00 + r1*4 + 0x388]`.  The loop is `wait(13,1)` → bit 13
+of **`[0x02FFFF8C]`** — *not* an IO register: it is main RAM at 4 MiB-mirror
+offset `0x3FFF8C`, the **ARM7's IPC event-mask word** (melonDS routes both
+CPUs' `0x02000000..0x03FFFFFF` to `MainRAM[addr & 0x3FFFFF]`; the ARM7's SDK
+mirrors the same cell at `0x027FFF8C`, its own mask at `+0x38C`, the ARM9's
+mask at `[0x02FFFF88]`).  The real ARM7's IRQ-driven init posts event bits
+there one at a time; our scripted ARM7 never did → infinite poll.
+
+**Ground truth (new melonDS harness, all env-gated, captured this phase):**
+
+* `MELONDS_MEMWATCH_PATH` (NDS.cpp, all six write dispatchers): logs every
+  write into main-RAM `0x3FFF80..0x3FFFB0` with BOTH CPUs' PCs and
+  `a9idx` = the ARM9 PC-trace index at that moment (via
+  `ARM9TracePCCount()` in ARM.cpp).  The ARM7 posts (15 writes, from
+  `pc7=0x037FE3D4`, a handler in shared WRAM) arrive in the order
+  bit12, bit13, bit16, bit17, bit7, bit11, bit14, bit5, bit10, bit6, bit9,
+  bit8, bit4 at a9idx 3,633,523 / 3,633,806 / 3,635,544 / 3,635,618 /
+  3,650,209 / 3,650,651 / 3,650,668 / 3,652,929 / 3,654,408 / 3,768,189×4.
+  bit13 lands while the ARM9 is *inside* `test_bit` of wait(13,1) iteration 2
+  (`pc9=0x0200BA64`) — melonDS exits that loop on iteration 3.
+* `MELONDS_ARM7TRACE_PATH` (ARM.cpp, ARMv4 interpreter): ARM7 PC trace.
+* `MELONDS_ITCM_DUMP` (ARM.cpp): one-shot 32 KiB ITCM dump at first ITCM
+  execution — fires exactly at `pc=0x01FF845C`.
+
+**Fix (nnktool `recompile.rs` RUNTIME_ALL + emitted `run()` prologue).**  An
+**ARM7 init-event chain** (`arm7_evt_tick`, once per dispatch after
+`++steps`) writes the measured word values into `[0x02FFFF8C]` at step
+thresholds = the measured `a9idx` values (`steps` == a9idx throughout the
+matched prefix).  Both the splitter (prologue kept verbatim) and mono builds
+carry it; stderr logs each post (`arm7 evt step=… val=…`).
+
+**Result (honest depth).**  `tools/build_split.sh` binary on the stored
+padded image: the wait(13,1) loop **exits on iteration 3 exactly like
+melonDS**, streams re-align; native reaches **step 3,634,038 / trace
+3,634,037 PCs**, new halt at **`0x020093E4` → `bl 0x01FF845C` (ITCM)**:
+"dispatch to untranslated pc".  cmp_pc_traces vs the 10 M melonDS capture:
+**strict common prefix 3,634,037 / 10,000,000 — 100 % of the native trace
+matches melonDS** (was 3,633,818 with the loop-exit divergence at 3,633,818
+melonDS `0x0201C4C0` vs native `0x0201C4AC` — gone).  Root cause of the new
+halt: **ITCM code execution** — the boot copies/constructs code into
+`0x01FF8000..0x01FFFFFF` and calls it (the dumped routine at `0x01FF845C` is
+the SDK DMA-start helper: OS lock (`bl 0x02008D20`), program channel
+SAD/DAD/CNT at `0x040000B0+ch*12` — which the runtime's DMA1 engine already
+executes — plus a flag-gated completion wait).  The runtime has no ITCM
+region: the guest's fill stores are dropped (out of window) and the fetch
+has no case.  The bytes are **not** in the ARM9 stored/decompressed images
+nor the ARM7 image (signature search) — they are constructed at runtime;
+`tools/add_itcmwatch.py` (not yet applied) adds the CP15.cpp write watch that
+identifies the writer, and `tools/find_itcm_src.py` searches for sources.
+
+**Next model gaps after ITCM, in order (measured):** (1) ITCM region +
+dispatch of ITCM PCs; (2) **IRQ delivery** — at a9idx ≈ 3,650,000 the
+melonDS ARM9 runs in its BIOS IRQ handler (`pc9=0xFFFF01DC`, IME=1); the
+native runtime latches IE/IF/IME but never dispatches exceptions; (3) the
+ARM7 is still scripted — event-chain clock = `steps`, so timing degrades
+after the first post-divergence (each post logged).
