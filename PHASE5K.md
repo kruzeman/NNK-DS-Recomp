@@ -128,10 +128,24 @@ is why §1's fix has to be a per-site encoding decision rather than a map fix.
 $ cd nnktool && cargo test
 test result: ok. 28 passed; 0 failed        # 25 -> 28 (classes F/G/H)
 
+$ SKIP_MELONDS=1 sh tools/verify_phase2a.sh
+1) strict common prefix        : 1000 / 1000 melonDS PCs (100.0%)
+   melonDS trace fully reproduced
+2) window-filtered prefix      : 1000 / 1000 (window 0x02000000..0x02400000)
+3) in-order matched after resync: 1000 / 1000 melonDS PCs (100.0%)
+rc=0
+
 run: 42,038,854 (halt)  ->  80,000,001 (NNK_STEP_LIMIT), 19,470 distinct PCs
      halt_pc=0x02009118 halt="step budget exhausted"
      frames: 148 presented
 ```
+
+Sweep H was also verified end-to-end on a real regeneration: the mono image
+`work/phase2a/arm9_all.c` now carries 72,959 case markers (72,908 arm / 51
+thumb) and 3,693 `nnk_smc_note_branch(_t);` sites, and a marker stamped on one
+case that the addr+2 heuristic called Thumb (`0x020D128C`) removes it from
+`nnk_smc_map.h`, i.e. the marker is authoritative and the heuristic is only the
+fallback for markerless images.
 
 Reproduce:
 
