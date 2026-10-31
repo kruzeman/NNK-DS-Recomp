@@ -203,7 +203,19 @@ splash.
   against the decoder's answer.
 * Suite: 29 → **31** tests, all green (`cd nnktool && cargo test`).
 
-## 7. Reproduce
+## 7. Acceptance checks on this branch
+
+```
+$ SKIP_MELONDS=1 bash tools/verify_phase2a.sh   # branch code, worktree
+RESULT: PASS   (rc=0)
+1) strict common prefix        : 1000 / 1000 melonDS PCs (100.0%)
+2) window-filtered prefix      : 1000 / 1000 (window 0x02000000..0x02400000)
+3) in-order matched after resync: 1000 / 1000 melonDS PCs (100.0%)
+$ cd nnktool && cargo test
+test result: ok. 31 passed; 0 failed
+```
+
+## 8. Reproduce
 
 ```sh
 ln -sfn /home/hermes/NiNoKuni/work work
