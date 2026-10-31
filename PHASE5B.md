@@ -135,6 +135,11 @@ as Phase-5A), reached through the *second* divergence below.
 PNGs: `/home/hermes/NiNoKuni/shots/p5b_kp.p5b_sh.000{60,70}.{top,bot}.png`
 (source PPMs `p5b_sh.000{60,70}.*.ppm` in the scratch dir).
 
+Per-pixel diff against melonDS's composed frame (`p5b_framediff.py`), frame 70:
+`p5b_sh.00070.top.ppm` vs `f00070.scr` **0 differing pixels, max channel
+delta 0**; `p5b_sh.00070.bot.ppm` vs `f00070.scr` **0 differing pixels** — the
+display path is still pixel-exact with melonDS at this boot stage.
+
 ## 5. Numbers
 
 ```
@@ -147,7 +152,11 @@ strict prefix    155/155 native PCs == melonDS after the dispatch point
 object state     [0x021A7560] = 0 at the 4th call (was 1); key word
                  [0x021A755C] = 0x0000 (was 0x2C00)
 cargo test       14 passed (unchanged — data/IO-model class, no decoder change)
-verify_phase2a   see §7 (SKIP_MELONDS=1 on this branch)
+verify_phase2a   RESULT PASS, rc 0 on this branch (SKIP_MELONDS=1):
+                 strict common prefix 1000/1000 melonDS PCs (100.0%),
+                 window-filtered 1000/1000, in-order after resync 1000/1000
+                 (log `p5b_verify.log`)
+frames           f70 top+bot vs melonDS f00070.scr: 0 differing pixels
 ```
 
 ## 6. The next barrier (named, measured)
