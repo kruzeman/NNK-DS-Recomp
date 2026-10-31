@@ -504,11 +504,20 @@ fn emit_insn(
             let src = if thumb { reg_c_t(*rm, addr) } else { reg_c(*rm, addr) };
             pc_written = true;
             if *link {
-                // BLX rm (either state): the return address is the next
-                // instruction, and it is a THUMB address — BLX always
-                // returns to Thumb state, so the link gets bit0 set (the
-                // dispatcher masks it again on the way back).
-                body.push(format!("r[14] = 0x{:08X}u;", addr.wrapping_add(4) | 1));
+                // BLX rm: the return address is the next instruction, and it
+                // is a THUMB address — BLX always returns to Thumb state, so
+                // the link gets bit0 set (the dispatcher masks it again on the
+                // way back).  Phase-4Y: the link OFFSET is state-dependent —
+                // Thumb `blx Rm` is a 2-byte instruction (ARM ARM B1.3.3 T1:
+                // LR = addr+2, bit0 set), ARM BLX Rm is 4 bytes (addr+4).
+                // The old unconditional addr+4 made every Thumb vtable call
+                // return 2 bytes past its caller's epilogue (measured: the
+                // overlay dispatcher's `blx r3` at 0x020D1A1C returned to
+                // 0x020D1A20 instead of 0x020D1A1E, falling into the next
+                // function and calling the not-yet-downloaded module entry
+                // 0x02988AA0).
+                let linkv = if thumb { addr.wrapping_add(2) | 1 } else { addr.wrapping_add(4) | 1 };
+                body.push(format!("r[14] = 0x{:08X}u;", linkv));
             }
             if *rm == 14 && !*link {
                 if global {
