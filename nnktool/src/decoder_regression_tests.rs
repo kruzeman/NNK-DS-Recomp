@@ -541,3 +541,59 @@ fn runtime_smc_redecoder_interworks_on_ldm_pc_and_links_arm_blx_even() {
         "regression: Thumb pop{{pc}} no longer forces the Thumb state"
     );
 }
+
+// ---------------------------------------------------------------- class 8 ---
+// Thumb BL(1)/BLX(1) immediate PC base (Phase-5E).  ARMv5T ARM ARM:
+//   BL(1)  (suffix 11111): target = PC + offset, PC = addr + 4
+//   BLX(1) (suffix 11101): target = Align(PC,4) + offset  (H forced 0,
+//                          because the target is ARM code, word-aligned)
+// The decoder used addr+4 for BOTH forms, so a BLX whose instruction lives at
+// a 2 (mod 4) address landed 2 bytes past the real target.  Measured word:
+// the overlay dispatch helper at 0x020D2426 = F779 EFE6, which binutils
+// decodes as `blx 0x0204C3F4` and which melonDS *executes* at 0x0204C3F4
+// (MELONDS_ARM9TRACE window 0x0204C3C0..0x0204C440: 3f4 3f8 3fc 400 ...).
+// Native reached 0x0204C3F6 instead — two bytes into the ARM function body,
+// so `push {r4,r5,r6,r7,lr}` never ran; the ARM epilogue word E8BD8078 later
+// decoded as a Thumb `pop {r3,r4,r5,r6,pc}` off a frame that was never
+// pushed and returned the stale stack word 0x00000002 (step 39,238,304).
+#[test]
+fn thumb_blx_immediate_aligns_the_pc_base() {
+    let insn = decode_thumb(0xF779, 0xEFE6, 0x020D_2426, 4);
+    match insn.kind {
+        Kind::BlxImm { target } => assert_eq!(
+            target, 0x0204_C3F4,
+            "F779 EFE6 at 0x020D2426 is `blx 0x0204C3F4` (binutils + melonDS)"
+        ),
+        other => panic!("expected Thumb BLX immediate, got {:?}", other),
+    }
+}
+
+#[test]
+fn thumb_bl_immediate_keeps_the_unaligned_pc_base() {
+    // F7FF FF8D at 0x020D136E = `bl 0x020D128C` (binutils).  The aligned base
+    // (0x020D1370) would land 2 bytes low at 0x020D128A, so this guard pins
+    // that BL(1) is NOT changed by the BLX(1) alignment rule.
+    let insn = decode_thumb(0xF7FF, 0xFF8D, 0x020D_136E, 4);
+    match insn.kind {
+        Kind::B { link: true, target, .. } => assert_eq!(
+            target, 0x020D_128C,
+            "F7FF FF8D at 0x020D136E is `bl 0x020D128C` (binutils)"
+        ),
+        other => panic!("expected Thumb BL immediate, got {:?}", other),
+    }
+}
+
+#[test]
+fn runtime_smc_redecoder_aligns_the_thumb_blx_base() {
+    let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../tools/nnk_smc.inc");
+    let src = std::fs::read_to_string(&p)
+        .unwrap_or_else(|e| panic!("cannot read {}: {}", p.display(), e));
+    assert!(
+        src.contains("uint32_t base = (hw2 & 0x1000u) ? (pc + 4u) : ((pc + 4u) & ~3u);"),
+        "regression: the C re-decoder no longer aligns the BLX(1) PC base"
+    );
+    assert!(
+        !src.contains("*npc = (pc + 4u + (uint32_t)o) & ~1u;"),
+        "regression: the unaligned Thumb BL/BLX base came back"
+    );
+}

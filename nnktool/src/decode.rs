@@ -823,8 +823,18 @@ pub fn decode_thumb(h: u16, h2: u16, addr: u32, size: usize) -> Insn {
         if s != 0 {
             off |= 0xFE00_0000; // sign-extend the 25-bit offset
         }
-        let target = addr.wrapping_add(4).wrapping_add(off);
+        // ARMv5T BL(1)/BLX(1) differ in the PC base (verified by assembling
+        // the ROM's own words back through binutils):
+        //   BL(1)  suffix 11111: target = (addr + 4) + offset
+        //   BLX(1) suffix 11101: target = Align(addr + 4, 4) + offset
+        // BLX calls ARM code, and its H bit is forced 0, hence the align.
         let blx = h2 & 0x1000 == 0;
+        let base = if blx {
+            addr.wrapping_add(4) & !3
+        } else {
+            addr.wrapping_add(4)
+        };
+        let target = base.wrapping_add(off);
         let target = if blx { target & !3 } else { target };
         text = format!("{} 0x{:08x}", if blx { "blx" } else { "bl" }, target);
         kind = Kind::B { link: true, target, cond: 14 };
