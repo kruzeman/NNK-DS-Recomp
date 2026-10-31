@@ -154,6 +154,11 @@ the `0xF600`-cannot-separate / `0xFE00`-does sanity assertions),
 half: no `0xF600` format-13 mask, both `0xFE00` arms present with PUSH before
 POP, and the POP arm still pops list bit 8 into `npc`).
 
+Red-on-old, measured: putting the two `0xF600` masks back makes
+`runtime_smc_redecoder_masks_the_form13_rbit` fail with
+"regression: smc_exec_thumb is masking format 13 with 0xF600 again (bit 11
+hidden)"; restoring `0xFE00` is green again.
+
 ## Red-on-old / green-on-current proof
 
 Reverting the four fix lines (in a throw-away copy of the crate, so the tree

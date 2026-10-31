@@ -89,8 +89,14 @@ baseline (Phase-4Z code)  halt step 39,001,760 pc 0x020D1A8E distinct_pcs 15,783
                           pop 0x020D1A1E -> 0x020D1646 (was 0x020D1A20)
                           state_fallbacks 2 -> 2, on_demand 844 -> 1,413
                           melonDS PCs matched after the dispatch: 62 (see §5)
-cargo test (nnktool)      14 passed (3 new class-5 tests)
-verify_phase2a.sh         RESULT PASS on this branch (SKIP_MELONDS=1)
+cargo test (nnktool)      14 passed (3 new class-5 tests; the source-level one
+                          goes red when the 0xF600 mask is put back:
+                          "regression: smc_exec_thumb is masking format 13
+                          with 0xF600 again (bit 11 hidden)")
+verify_phase2a.sh         RESULT PASS, rc 0 on this branch (SKIP_MELONDS=1):
+                          strict common prefix 1000/1000 melonDS PCs (100.0%),
+                          window-filtered 1000/1000, in-order after resync
+                          1000/1000
 ```
 
 ## 4. The picture: uniform frames are CORRECT at this point (operator steer)
