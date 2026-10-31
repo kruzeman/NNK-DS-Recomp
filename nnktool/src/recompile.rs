@@ -204,6 +204,12 @@ struct EmitOutcome {
     pc_written: bool,
     shimmed: bool,
     halts: bool,
+    /// Phase-5K: the instruction state this body was emitted FROM.  Emitted as
+    /// a `/* nnk_state=thumb|arm */` marker on the case label so
+    /// tools/split_dispatch.py can build an EXACT nnk_pc_is_thumb() instead of
+    /// the addr+2 fall-through heuristic (barrier-class E/F: the live
+    /// re-decoder guessed the state of unrooted PCs).
+    thumb: bool,
 }
 
 /// Emit C statements for one instruction in either state.
@@ -526,9 +532,24 @@ fn emit_insn(
                     // address in both states, so just mask it — this is the
                     // ARM<->Thumb interworking return path in both
                     // directions.
+                    //
+                    // Phase-5K (follow-up G): masking the dispatch key is not
+                    // enough — the LIVE re-decoder needs the state the return
+                    // goes to, and the only place it exists is that bit0.
+                    // Without the note, an ARM function's `bx lr` returning
+                    // into ARM code was resolved by the map/register/sticky
+                    // guess and re-decoded as Thumb (measured: 0x02043C00/
+                    // 0x02043C04 is ARM `add sp,#12; pop {pc}`, its target
+                    // 0x0207D2D8 is ARM `ldr r0,[r10,#0x1AC]`; run as Thumb it
+                    // walked 0x0207E828.. through the guest's own string table,
+                    // the ASCII word 0x49552F61 at 0x0207E94C decoded as an
+                    // ARM `ldmia` that loaded r13 from RAM and sp became 0).
+                    // melonDS A_BX: JumpTo(Rm) takes bit0 (ARMInterpreter_
+                    // Branch.cpp), so the raw register value is the carrier.
                     flow = Flow::Indirect(None);
                     body.push("{ uint32_t _t = r[14];".into());
-                    body.push("pc = _t & ~1u; }".into());
+                    body.push("pc = _t & ~1u;".into());
+                    body.push("nnk_smc_note_branch(_t); }".into());
                 } else {
                     flow = Flow::Return;
                     body.push("pc = r[14];".into());
@@ -537,9 +558,15 @@ fn emit_insn(
                 // Register-indirect jump/call.  Bit0 of the target selects
                 // the instruction state; the switch keys are even addresses
                 // in both states, so the target's case is the state.
+                // Phase-5K (follow-up G): the STATE BIT itself has to reach
+                // the live re-decoder when the case is not compiled — this is
+                // the `bx`/`blx Rm` half of the Phase-5J class that only the
+                // LDM/pop form carried.  melonDS BX/BLX_REG both JumpTo(Rm),
+                // which takes bit0.
                 flow = Flow::Indirect(None);
                 body.push(format!("{{ uint32_t _t = {};", src));
-                body.push("pc = _t & ~1u; }".into());
+                body.push("pc = _t & ~1u;".into());
+                body.push("nnk_smc_note_branch(_t); }".into());
             }
         }
         Kind::Clz { rd, rm } => {
@@ -786,7 +813,7 @@ fn emit_insn(
     }
 
     EmitOutcome { cycles: card_cost(&insn.kind), body, flow, guarded, cond: ce,
-                  pc_written, shimmed, halts }
+                  pc_written, shimmed, halts, thumb }
 }
 
 /// Emit C for one ARM-state instruction (condition code from bits 31..28).
@@ -831,7 +858,8 @@ fn pad(stmts: &[String], p: &str) -> String {
 /// `Flow::Indirect` with the body already assigning `pc`.
 fn case_string(addr: u32, next: u32, text: &str, oc: &EmitOutcome) -> String {
     let mut s = String::new();
-    s.push_str(&format!("        case 0x{:08X}u:\n", addr));
+    s.push_str(&format!("        case 0x{:08X}u: /* nnk_state={} */\n", addr,
+                        if oc.thumb { "thumb" } else { "arm" }));
     s.push_str(&format!("            trace_pc(0x{:08X}u);\n", addr));
     s.push_str(&format!("            card_tick({}u);\n", oc.cycles));
     s.push_str(&format!("            /* 0x{:08X}: {} */\n", addr, text.replace("*/", "* /")));

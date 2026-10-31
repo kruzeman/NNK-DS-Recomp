@@ -47,6 +47,11 @@ REGROW = re.compile(r'^\s*r\[\d+\] = ld32\(_a \+ \d+u\);\s*$')
 BLOCK = re.compile(r'^(\s*)\{ uint32_t _base = ')
 NOTE = 'nnk_smc_note_branch(_t);'
 NOTE_SINGLE = 'nnk_smc_note_branch(_t | 1u);'
+# Phase-5K: the single-register ARM form takes `& ~1u` (melonDS A_LDM), and
+# tools/p5k_note_branch.py may already have written it.  Without this the
+# patcher would insert a SECOND, contradicting note (and re-introduce the
+# Thumb tag that made sp=0 at 0x0207EA20).
+NOTE_ARM_SINGLE = 'nnk_smc_note_branch(_t & ~1u);'
 
 
 def main(argv):
@@ -69,7 +74,7 @@ def main(argv):
             # a LDM/`pop` with pc: one register left in the list == pc alone
             note = NOTE_SINGLE if regs_in_block == 0 else NOTE
             nxt = lines[i + 1] if i + 1 < len(lines) else ''
-            if nxt.strip() in (NOTE, NOTE_SINGLE):
+            if nxt.strip() in (NOTE, NOTE_SINGLE, NOTE_ARM_SINGLE):
                 already += 1
             else:
                 out.append(m.group(1) + note)
