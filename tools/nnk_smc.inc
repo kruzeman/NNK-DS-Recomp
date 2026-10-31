@@ -46,6 +46,7 @@
 
 static uint8_t *smc_img;                  /* generation 0: compiled image bytes */
 static int smc_armed;                     /* tracking on (snapshot present) */
+static int smc_f8log = -1;                /* NNK_F8LOG: live Thumb format-8 log cap */
 static uint8_t smc_dirty[SMC_BAND_N + 2]; /* band has seen a guest store */
 static uint32_t smc_gen[SMC_BAND_N + 2];  /* per-band store generation */
 static uint32_t smc_icnt[SMC_BAND_N + 2]; /* re-decoded instructions per band */
@@ -797,7 +798,46 @@ static int smc_exec_thumb(uint32_t pc, uint32_t *npc, uint32_t *costp) {
          * here exactly as nnktool/src/decode.rs (bit9 test, B=bit10, offset
          * R[Ro], no shift); format 8 still returns 0 so an unimplemented
          * halfword form halts honestly instead of executing as a word. */
-        if (hw & 0x0200u) return 0;                  /* format 8: signed/half */
+        if (hw & 0x0200u) {                          /* format 8: halfword/signed */
+            /* Phase-5M: format 8 is `0101 H S 1 Ro Rb Rd` with bit 11 = H
+             * and bit 10 = S: (H,S) = (0,0) STRH, (0,1) LDRSB, (1,0) LDRH,
+             * (1,1) LDRSH — exactly what nnktool/src/decode.rs:1077-1085
+             * decodes.  Phase-5L left this arm returning 0 (honest halt); it
+             * is now implemented so the Mobiclip player's register-offset
+             * halfword accesses execute instead of halting the run. */
+            unsigned H = (unsigned)((hw >> 11) & 1u);
+            unsigned S = (unsigned)((hw >> 10) & 1u);
+            unsigned ro = (unsigned)((hw >> 6) & 7u);
+            rd = hw & 7u;
+            ea = r[(hw >> 3) & 7u] + r[ro];
+            if (smc_f8log < 0) {
+                const char *e = getenv("NNK_F8LOG");
+                smc_f8log = (e && e[0]) ? atoi(e) : 0;
+            }
+            {   /* Phase-5M measurement hook: every live-decoded format 8,
+                 * with the exact effective address and both values. */
+                static int f8n;
+                if (smc_f8log && f8n < smc_f8log) {
+                    f8n++;
+                    fprintf(stderr, "f8: n=%d step=%llu pc=0x%08X hw=0x%04X HS=%u%u "
+                            "ro=%u rb=%u rd=%u ea=0x%08X r=0x%08X\n",
+                            f8n, (unsigned long long)steps, pc, (unsigned)hw,
+                            H, S, ro, (unsigned)((hw >> 3) & 7u), (unsigned)rd,
+                            ea, r[rd]);
+                }
+            }
+            if (H) {
+                r[rd] = S ? (uint32_t)(int32_t)(int16_t)ld16(ea) : ld16(ea);
+                *costp = 1;
+            } else if (S) {
+                r[rd] = (uint32_t)(int32_t)(int8_t)ld8(ea);
+                *costp = 1;
+            } else {
+                st16(ea, (uint16_t)r[rd]);
+                *costp = 3;
+            }
+            return 1;
+        }
         {
             unsigned L = (unsigned)((hw >> 11) & 1u);
             unsigned B = (unsigned)((hw >> 10) & 1u);
@@ -1040,11 +1080,26 @@ int nnk_smc_exec_any(uint32_t *pcp) {
     uint32_t pc = *pcp, o, w, npc = 0, cost = 0;
     int thumb, rc;
 
-    if ((pc & 0xFF000000u) != GBASE) return 0;
-    o = pc & 0x3FFFFFu;
-    if (o + 4u > GSIZE) return 0;
-    w = (uint32_t)gmem[o] | ((uint32_t)gmem[o + 1u] << 8) |
-        ((uint32_t)gmem[o + 2u] << 16) | ((uint32_t)gmem[o + 3u] << 24);
+    if (pc >= ITCM_LO && pc < ITCM_HI) {
+        /* Phase-5M: the ITCM window is a SECOND live-code region.  The band
+         * dispatch routes ITCM PCs to the compiled nnk_part_itcm, but that
+         * image only carries the ITCM PCs the recovery roots reached; an
+         * unrooted ITCM PC (measured: 0x01FF8540, the Mobiclip player's
+         * `blx r1` target at 0x0207B218, step 2,256,160,152) returned 0 from
+         * the part and then died here, because this hook only knew the main
+         * RAM window.  ITCM code is fetched from the live 32 KiB array the
+         * guest itself filled (ld16/st16 already bind it), so decode it here
+         * exactly like a main-RAM PC. */
+        const uint8_t *q = itcm + (pc & (ITCM_PHYS - 1u));
+        w = (uint32_t)q[0] | ((uint32_t)q[1] << 8) |
+            ((uint32_t)q[2] << 16) | ((uint32_t)q[3] << 24);
+    } else {
+        if ((pc & 0xFF000000u) != GBASE) return 0;
+        o = pc & 0x3FFFFFu;
+        if (o + 4u > GSIZE) return 0;
+        w = (uint32_t)gmem[o] | ((uint32_t)gmem[o + 1u] << 8) |
+            ((uint32_t)gmem[o + 2u] << 16) | ((uint32_t)gmem[o + 3u] << 24);
+    }
     smc_ntry++;
     smc_nany++;
     trace_pc(pc);
