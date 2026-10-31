@@ -3608,3 +3608,9 @@ const RUNTIME_ALL_MAIN: &str = r##"int main(int argc, char **argv) {
     return 0;
 }
 "##;
+
+// Decoder regression tests (bug classes locked from the boot-chain work).
+// `cargo test` only; not part of the release build.
+#[cfg(test)]
+#[path = "decoder_regression_tests.rs"]
+mod decoder_regression_tests;
