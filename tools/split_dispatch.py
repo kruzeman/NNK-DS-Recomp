@@ -639,15 +639,22 @@ def main():
                      "/* Phase-5F: NNK_WFI_PROBE=1 -> state dump at the ARM9 WFI\n"
                      " * helper 0x02009118 and the idle-loop head 0x02009110. */\n"
                      "static int nnk_wfi_probe = -1;\n"
-                     "static int nnk_wfi_n = 0;",
+                     "static int nnk_wfi_n = 0;\n"
+                     "/* Phase-5H: NNK_WFI_LO gates the probe to a step window.\n"
+                     " * The Phase-5F cap (20,000 hits) was consumed at step\n"
+                     " * 23,490,852, so the LATE idle-loop state (the stall at\n"
+                     " * 39M+) could never be sampled; the window is data now. */\n"
+                     "static unsigned long long nnk_wfi_lo = 0;",
                      "Phase-5F WFI probe statics")
     prelude = inject(prelude,
                      "        else if (!irq_active && (irq_trig_n >= IRQ_TRIG_N || steps > irq_trig_log[irq_trig_n])",
                      "        if (nnk_wfi_probe < 0) {\n"
                      "            const char *s = getenv(\"NNK_WFI_PROBE\");\n"
                      "            nnk_wfi_probe = (s && s[0]) ? 1 : 0;\n"
+                     "            s = getenv(\"NNK_WFI_LO\");\n"
+                     "            nnk_wfi_lo = (s && s[0]) ? strtoull(s, NULL, 0) : 0;\n"
                      "        }\n"
-                     "        if (nnk_wfi_probe && nnk_wfi_n < 20000\n"
+                     "        if (nnk_wfi_probe && nnk_wfi_n < 20000 && steps >= nnk_wfi_lo\n"
                      "            && (pc == 0x02009110u || pc == 0x02009118u)) {\n"
                      "            nnk_wfi_n++;\n"
                      "            fprintf(stderr, \"wfiprobe n=%d pc=0x%08X step=%llu ime=%u ie=0x%08X if=0x%08X cpsr=%02X \"\n"
