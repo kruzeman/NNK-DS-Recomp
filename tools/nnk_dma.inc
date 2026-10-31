@@ -341,8 +341,12 @@ static int nnk_ipc_reply_pend;
 static unsigned nnk_ipc_handled_n;      /* log cap */
 void nnk_ipc_send(uint32_t v);
 static void nnk_ipc_tick(void);
+/* Phase-4S: the ARM7 request EFFECT (measured card-phase completion) */
+static void nnk_p4s_request(uint32_t v);
+static void nnk_p4s_tick(void);
 
 void nnk_ipc_send(uint32_t v) {
+    if ((v & 0x1Fu) == 7u) nnk_p4s_request(v);   /* Phase-4S: class-7 card req */
     if (v == 0x80004046u) {
         nnk_ipc_reply_word = 0xC0204006u;
         nnk_ipc_reply_at = cycles + 2076u;   /* measured request->reply gap */
@@ -374,6 +378,7 @@ static void nnk_p4r_arm(uint64_t t0);
 static void nnk_p4r_schedule(void);
 
 static void nnk_ipc_tick(void) {
+    nnk_p4s_tick();                    /* Phase-4S: card-phase completion */
     if (nnk_ipc_reply_pend && cycles >= nnk_ipc_reply_at) {
         nnk_ipc_reply_pend = 0;
         if (arm9_recv_n < 16u) arm9_recv_fifo[arm9_recv_n++] = nnk_ipc_reply_word;
@@ -401,9 +406,10 @@ static void nnk_ipc_tick(void) {
                 uint32_t seq = p ? ld32(p) : 0u;
                 fprintf(stderr, "ipc: p4r ARM7 -> 0x%08X queued if=0x%08X "
                         "ie=0x%08X ime=%u cpsr=%02X recv_n=%u snap=%08X "
-                        "seq=%08X step=%llu\n",
+                        "seq=%08X ptr=%08X seqobj=%08X step=%llu\n",
                         w, iflags, ie, ime, (unsigned)cpsr_ctl,
-                        (unsigned)arm9_recv_n, snap, seq,
+                        (unsigned)arm9_recv_n, snap, seq, p,
+                        ld32(0x0206CAA0u),
                         (unsigned long long)steps);
             }
             memmove(nnk_p4r_q, nnk_p4r_q + 1,
@@ -489,5 +495,113 @@ static void nnk_p4r_schedule(void) {
             nnk_p4r_enqueue(nnk_p4r_stream[i].word, nnk_p4r_stream[i].next);
             nnk_p4r_stream[i].next += nnk_p4r_stream[i].period;
         }
+    }
+}
+
+/* ---- Phase-4S: the ARM7 request EFFECT — the card phase behind the requests
+ *
+ * THE PHASE-4R BARRIER, NOW MEASURED IN BOTH RUNS.  The SDK wait at
+ * 0x0200ACC8 compares the snapshot *(0x0206CA5C) against the mailbox sequence
+ * *(*(0x0206E580)) — i.e. against *(0x0206CAA0), the object the ARM9's own
+ * init (pc 0x0200AC78) installs the pointer for right after the reply
+ * 0xC0204006.  melonDS's ARM7 performs the requested card phase and
+ * INCREMENTS THAT SEQUENCE (writer pc7 = 0x03802590, ARM7 WRAM), which is
+ * what ends the wait; native's scripted ARM7 acked the request (Phase-4Q) but
+ * never did the work, so the sequence stayed 0 and the wait never woke.
+ *
+ * MEASURED (melonDS; new instruments: MemWatch window + the ts on the
+ * register probe; both captures in the scratch dir):
+ *
+ *   event                                              ts (ARM9 cycles)
+ *   reply 0xC0204006 read                             28,709,423   (t0)
+ *   ARM9 installs *(0x0206E580) = 0x0206CAA0, inits   ~28,717,247
+ *   send 0x81B34807 (class 7)                         28,720,406
+ *   send 0x81B34E07 (class 7)                         28,732,873
+ *   wait 0x0200ACC8 entered (flags=1)                 28,732,934
+ *   ARM7 writes *(0x0206CAA0) 0 -> 1 (pc7 0x03802590) 28,873,928   (t0+164,505)
+ *   wait exits: r0=1 r1=0                             28,874,017
+ *   ARM7 writes 1 -> 2                                29,213,542   (t0+504,119)
+ *   ARM7 writes 2 -> 3                                29,548,696   (t0+839,273)
+ *   ARM7 writes 3 -> 4                                29,883,744   (t0+1,174,321)
+ *
+ *  The later increments ride the ARM7's 100 Hz tick (335,104 ts measured in
+ *  Phase-4R): they land +396/+446/+390 ts after each 0x00008007 word, i.e.
+ *  the completion of the request the guest sent at the PREVIOUS tick (the
+ *  guest sends 0x81B36C07 at 29,218,077, +5,061 after tick 1, and its
+ *  completion is the 29,548,696 bump — 4,007 ts after that send would be
+ *  wrong, so the rule modelled below is "next tick slot", not a fixed delay).
+ *  Every wait exit lands one poll period (~89..109 ts) after the write: the
+ *  wait's own delay chunk is 109 ts (regprobe: compares at 28,733,053,
+ *  28,733,162, ...).
+ *
+ *  Modelled effect (nnk_p4s_*): class-7 request -> one completion at
+ *  t0+164,505 (measured), then one per next tick slot (+396), each doing the
+ *  real shared-RAM write the ARM7 does.  Nothing is faked: the sequence word
+ *  really increments and the guest's wait really re-reads it.
+ */
+#define NNK_P4S_MAX 4
+static uint64_t nnk_p4s_at[NNK_P4S_MAX];
+static unsigned nnk_p4s_n;
+static unsigned nnk_p4s_done, nnk_p4s_log;
+static int nnk_p4s_first;
+
+static void nnk_p4s_arm_at(uint64_t at) {
+    if (nnk_p4s_n >= NNK_P4S_MAX) return;
+    if (nnk_p4s_n && at <= nnk_p4s_at[nnk_p4s_n - 1]) return;  /* keep order */
+    nnk_p4s_at[nnk_p4s_n++] = at;
+}
+
+static void nnk_p4s_fire(void) {
+    uint32_t p = ld32(0x0206E580u);          /* the ARM9's sequence pointer */
+    uint32_t obj = p ? p : 0x0206CAA0u;      /* measured ARM7 write target   */
+    uint32_t s = ld32(obj);
+    st32(obj, s + 1u);
+    nnk_p4s_done++;
+    if (nnk_p4s_done <= 8u || (nnk_p4s_done & 63u) == 0u) {
+        fprintf(stderr, "p4s: ARM7 card-phase effect seq 0x%08X -> 0x%08X "
+                "obj=0x%08X ptr=0x%08X snap=0x%08X step=%llu cyc=%llu\n",
+                s, s + 1u, obj, p, ld32(0x0206CA5Cu),
+                (unsigned long long)steps, (unsigned long long)cycles);
+    }
+    if (!p && nnk_p4s_log++ < 4u)
+        fprintf(stderr, "p4s: sequence pointer *(0x0206E580) is 0 — the ARM9 "
+                "init (pc 0x0200AC78) has not run; bumped 0x0206CAA0 anyway "
+                "step=%llu\n", (unsigned long long)steps);
+}
+
+static void nnk_p4s_request(uint32_t v) {
+    if (!nnk_p4s_first) {
+        nnk_p4s_first = 1;
+        /* measured: first completion = reply + 164,505 (A); next = tick slot */
+        if (nnk_p4r_armed) {
+            uint64_t t0 = nnk_p4r_stream[0].next - 423472u;
+            nnk_p4s_arm_at(t0 + 164505u);
+            nnk_p4s_arm_at(nnk_p4r_stream[1].next + 396u);
+        } else {
+            nnk_p4s_arm_at(cycles + 143205u);
+        }
+        if (nnk_p4s_log++ < 4u)
+            fprintf(stderr, "p4s: class-7 card request 0x%08X -> completion "
+                    "at +%llu (measured A/B) step=%llu\n", v,
+                    nnk_p4r_armed ? 164505u : 143205u,
+                    (unsigned long long)steps);
+        return;
+    }
+    /* one completion per request cycle: the next tick slot if none pending */
+    if (!nnk_p4s_n && nnk_p4r_armed && nnk_p4r_stream[1].next) {
+        nnk_p4s_arm_at(nnk_p4r_stream[1].next + 396u);
+        if (nnk_p4s_log++ < 4u)
+            fprintf(stderr, "p4s: class-7 card request 0x%08X -> completion "
+                    "at next tick slot cyc=%llu step=%llu\n", v,
+                    (unsigned long long)(nnk_p4r_stream[1].next + 396u),
+                    (unsigned long long)steps);
+    }
+}
+
+static void nnk_p4s_tick(void) {
+    while (nnk_p4s_n && cycles >= nnk_p4s_at[0]) {
+        nnk_p4s_fire();
+        memmove(nnk_p4s_at, nnk_p4s_at + 1,
+                (--nnk_p4s_n) * sizeof nnk_p4s_at[0]);
     }
 }
