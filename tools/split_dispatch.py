@@ -374,12 +374,35 @@ def main():
 
     # ---- Phase-4J: SMC support files -----------------------------------
     # (1) Thumb-16 map.  The runtime re-decoder (tools/nnk_smc.inc) has to know
-    # WHICH state a re-decoded PC is in.  A case whose emitter-written
-    # fall-through is addr+2 IS a 16-bit Thumb instruction; that is exact and
-    # needs no guest-image input.  Everything else is treated as ARM, and the
-    # runtime falls back to a Thumb decode when the ARM decode is undefined.
+    # WHICH state a re-decoded PC is in.
+    #
+    # Phase-5K (follow-up H): the emitter now stamps EVERY case label with the
+    # state it was emitted from --
+    #         case 0x0207D2D8u: /* nnk_state=arm */
+    # -- and that marker is authoritative.  It is the only exact record: the
+    # old rule ("a case whose emitter-written fall-through is addr+2 IS a
+    # 16-bit Thumb instruction") is a HEURISTIC and it is wrong for exactly the
+    # cases that end in a branch (every `pop {..,pc}`, `bx`, `b*` case has a
+    # fall-through that is not addr+2), so the live re-decoder had to GUESS the
+    # state of every unrooted PC it reached from them.  That guess is the
+    # barrier-class E/F family (Phase-5J: 0x020F5CC4; Phase-5K: 0x0207D2D8).
+    # Markerless images (frozen Phase-4F/5J artifacts) keep the old rule, so
+    # nothing regresses for an image the emitter did not produce.
+    STATE_MARK = re.compile(r"/\*\s*nnk_state=(thumb|arm)\s*\*/")
     thumb16 = set()
+    marked = 0
     for (addr, first, past) in blocks:
+        state = None
+        for k in range(first, past):
+            m = STATE_MARK.search(lines[k])
+            if m:
+                state = m.group(1)
+                break
+        if state is not None:
+            marked += 1
+            if state == "thumb":
+                thumb16.add(addr)
+            continue
         needle = "pc = 0x%08Xu;" % (addr + 2)
         if any(needle in lines[k] for k in range(first, past)):
             thumb16.add(addr)
@@ -406,8 +429,9 @@ def main():
         fh.write("        else return 1;\n")
         fh.write("    }\n    return 0;\n}\n")
         fh.write("#endif\n")
-    sys.stderr.write("Phase-4J: %d Thumb-16 cases in %d runs -> nnk_smc_map.h\n"
-                     % (len(thumb16), len(runs)))
+    sys.stderr.write("Phase-4J: %d Thumb-16 cases in %d runs -> nnk_smc_map.h "
+                     "(%d cases classified by the Phase-5K nnk_state marker)\n"
+                     % (len(thumb16), len(runs), marked))
     # (2) the runtime SMC fragment itself, next to the generated TU
     here = os.path.dirname(os.path.abspath(__file__))
     shutil.copyfile(os.path.join(here, "nnk_smc.inc"),

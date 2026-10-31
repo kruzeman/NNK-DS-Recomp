@@ -782,3 +782,90 @@ fn interworking_targets_carry_their_state_across_the_dispatch() {
         "regression: the ARM LDM arm no longer masks bit0 for a one-register list"
     );
 }
+
+#[test]
+fn compiled_bx_and_blx_rm_carry_the_target_state() {
+    // Phase-5K, follow-up G: the Phase-5J class (13) fixed the LDM/`pop {..,pc}`
+    // form only.  A compiled `bx Rm` / `blx Rm` still emitted
+    //     pc = _t & ~1u;
+    // with NO state note, so the live re-decoder had to guess the state of an
+    // uncompiled target.  melonDS A_BX / A_BLX_REG both `JumpTo(Rm)`, and
+    // JumpTo takes bit0 (ARMInterpreter_Branch.cpp) - the register value IS the
+    // carrier, in both states.
+    let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/recompile.rs");
+    let em = std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("cannot read {}: {}", p.display(), e));
+    let at = em.find("Kind::Bx { rm, link } =>").expect("Kind::Bx arm missing");
+    let end = em.find("Kind::Clz").expect("Kind::Clz arm missing");
+    let block = &em[at..end];
+    assert!(
+        block.matches("nnk_smc_note_branch(_t);").count() >= 2,
+        "regression: compiled bx/blx Rm (or the bx lr return form) drops the target's state bit again"
+    );
+    assert!(
+        block.contains("body.push(\"nnk_smc_note_branch(_t); }\".into());"),
+        "regression: the register-indirect branch no longer notes the state it transfers to"
+    );
+}
+
+#[test]
+fn frozen_image_patch_decides_the_ldm_form_from_the_compiled_word() {
+    // Phase-5K, barrier F: tools/p5j_note_branch.py spliced
+    // `nnk_smc_note_branch(_t | 1u)` for EVERY one-register LDM-pc site, i.e.
+    // the Thumb T_POP rule on ARM code.  melonDS A_LDM does the opposite
+    // (`if (cpu->Num == 1) pc &= ~0x1;`), so the ARM epilogue at 0x02043C04
+    // (`ldmfd sp!,{pc}`, word 0xE8BD8000) returned to ARM 0x0207D2D8 tagged
+    // Thumb; the live re-decoder ran that ARM function as Thumb, walked the
+    // string table at 0x0207E828.., the ASCII word 0x49552F61 at 0x0207E94C
+    // decoded as an ARM `ldmia` with r13 in its list and sp became 0 (halt
+    // 0x0207EA20, 42,038,854 steps).
+    let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../tools/p5k_note_branch.py");
+    let tool = std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("cannot read {}: {}", p.display(), e));
+    assert!(
+        tool.contains("(w & 0x0E000000) == 0x08000000") && tool.contains("(w & 0x00008000) != 0"),
+        "regression: the LDM-form test no longer recognises an ARM LDM with pc in the list"
+    );
+    assert!(
+        tool.contains("want = '& ~1u' if form == 'arm' else '| 1u'"),
+        "regression: the single-register note is no longer chosen by the encoding's FORM"
+    );
+    // the Phase-5J patcher must not re-insert a contradicting Thumb tag on a
+    // site the Phase-5K pass already corrected.
+    let p5j = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../tools/p5j_note_branch.py");
+    let p5j = std::fs::read_to_string(&p5j).unwrap_or_else(|e| panic!("cannot read {}: {}", p5j.display(), e));
+    assert!(
+        p5j.contains("NOTE_ARM_SINGLE") && p5j.contains("(NOTE, NOTE_SINGLE, NOTE_ARM_SINGLE)"),
+        "regression: the Phase-5J splice would duplicate the note (and re-tag an ARM return as Thumb)"
+    );
+    assert_eq!(0xE8BD8000u32 & 0x0E000000, 0x08000000, "fixture sanity: ARM ldmfd sp!,{{pc}}");
+    assert_eq!(0xE8BD8000u32 & 0x00100000, 0x00100000, "fixture sanity: A_LDM load bit");
+    assert_eq!(0xE8BD8000u32 & 0x00008000, 0x00008000, "fixture sanity: pc in the list");
+}
+
+#[test]
+fn case_labels_carry_the_exact_state_marker() {
+    // Phase-5K, follow-up H: nnk_pc_is_thumb() was built from the addr+2
+    // fall-through heuristic, which is wrong for every case that ends in a
+    // branch, so the live re-decoder had to guess.  The emitter now stamps the
+    // state it decoded FROM on the case label and split_dispatch.py prefers
+    // that marker, keeping the heuristic only for markerless (frozen) images.
+    let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/recompile.rs");
+    let em = std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("cannot read {}: {}", p.display(), e));
+    assert!(
+        em.contains("case 0x{:08X}u: /* nnk_state={} */"),
+        "regression: the emitted case label no longer records the instruction state"
+    );
+    assert!(
+        em.contains("halts, thumb }"),
+        "regression: the emit outcome no longer carries the state the body came from"
+    );
+    let p2 = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../tools/split_dispatch.py");
+    let sd = std::fs::read_to_string(&p2).unwrap_or_else(|e| panic!("cannot read {}: {}", p2.display(), e));
+    assert!(
+        sd.contains("nnk_state=(thumb|arm)"),
+        "regression: split_dispatch.py no longer reads the per-case state marker"
+    );
+    assert!(
+        sd.contains("if state is not None:") && sd.contains("needle = \"pc = 0x%08Xu;\" % (addr + 2)"),
+        "regression: the marker is no longer authoritative over the addr+2 heuristic"
+    );
+}
