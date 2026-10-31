@@ -3405,7 +3405,14 @@ static void trace_pc(uint32_t pc) {
     last_pc = pc;
     cycles++;                       /* coarse timing: ~1 cycle per instruction */
     if (halt_at_pc && pc == halt_at_pc) { halt_reason("halt-at-pc"); step_limit = steps; return; }
-    if (nnk_display_tick()) { halt_reason("SDL window closed"); step_limit = steps; }
+    if (nnk_display_tick()) {
+#ifdef NNK_GX
+        fprintf(stderr, "nnk: quit path at step=%llu gxd=%p frames=%u should_quit=%d\n",
+                (unsigned long long)steps, (void *)gxd, gxd_frames,
+                gxd ? gxd_should_quit(gxd) : -1);
+#endif
+        halt_reason("SDL window closed"); step_limit = steps;
+    }
     checkpoint_dump(pc);
     debug_dump(pc);
     itcm_dump_once(pc);

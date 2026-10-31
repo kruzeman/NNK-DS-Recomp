@@ -576,7 +576,18 @@ pub fn decode_arm(w: u32, addr: u32) -> Insn {
                 base, cs, if s { "s" } else { "" },
                 REGS[rdlo as usize], REGS[rdhi as usize], REGS[rm as usize], REGS[rs as usize]
             ),
-            kind: Kind::Mul { kind: mk, s, rd: rdhi, rn: rdlo, rm, ra: rs },
+        // Kind::Mul's rd/rn carry the CODEGEN's convention (recompile.rs):
+        // rd receives the LOW word and rn the HIGH word of a long multiply
+        // (for MUL/MLA, rd = destination and rn = the accumulate operand).
+        // Phase-4V measured: passing rdhi/rdlo here made the static image
+        // assign `umull r1, r0, r8, r2` as r0=_lo, r1=_hi (SWAPPED) — the
+        // SDK's divide-by-10 loop at 0x0201E814 then computed
+        // (low32(x*0xCCCCCCCD))>>3 instead of (high32>>3), never converged,
+        // and its digit store loop ran from sp+24=0x027E3888 up through the
+        // DTCM IRQ vector at 0x027E3FFC (step 25,214,182).  The runtime SMC
+        // re-decoder (tools/nnk_smc.inc) already had the correct rdlo/rdhi
+        // order; this makes the static image match it.
+            kind: Kind::Mul { kind: mk, s, rd: rdlo, rn: rdhi, rm, ra: rs },
         };
     }
     // ---- SWP ----
