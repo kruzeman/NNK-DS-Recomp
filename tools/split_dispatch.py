@@ -418,6 +418,9 @@ def main():
     # (4) Phase-4M: the VRAMCNT_A..I bank-mapping model
     shutil.copyfile(os.path.join(here, "nnk_vramcnt.inc"),
                     os.path.join(outdir, "nnk_vramcnt.inc"))
+    # (5) Phase-4W: the SDL keyboard input model
+    shutil.copyfile(os.path.join(here, "nnk_input.inc"),
+                    os.path.join(outdir, "nnk_input.inc"))
 
     # ---- Phase-4M: VRAMCNT_A..I model hooks -----------------------------
     # The generated image's IO model is store-only AND 8-bit-only for
@@ -761,6 +764,17 @@ def main():
                for l in prelude]
     sys.stderr.write("Phase-4K: console MAC seeding spliced into guest_init\n")
 
+    # ---- Phase-4W: SDL keyboard input (tools/nnk_input.inc) ---------------
+    # io_read16() gets one early-out line at the top: observe guest KEYINPUT
+    # (0x04000130) reads for the input trace and serve EXTKEYIN (0x04000136)
+    # from the runtime's key state (melonDS NDS.cpp:3892 semantics).
+    io16 = "static uint32_t io_read16(uint32_t a) {"
+    if sum(1 for l in prelude if io16 in l) != 1:
+        die("io_read16() definition line not found in the prelude")
+    prelude = [l.replace(io16, io16 + "\n    { uint32_t _k; if (nnk_input_ioread16(a, &_k)) return _k; }")
+               if io16 in l else l for l in prelude]
+    sys.stderr.write("Phase-4W: KEYINPUT read trace + EXTKEYIN spliced into io_read16\n")
+
     # ---- main TU: prelude + band table + dispatch + tail
     prelude = list(prelude)          # un-static'd copy
     tf_idx = next((i for i, l in enumerate(prelude)
@@ -771,6 +785,8 @@ def main():
     with open(main_path, "w") as fh:
         fh.write('#include "nnk_rt.h"\n\n')
         fh.write("static void nnk_boot_firmware(void);\n")
+        fh.write("static int nnk_input_ioread16(uint32_t a, uint32_t *out);\n")
+        fh.write("static void nnk_input_tick(void);\n")
         fh.writelines(prelude[:tf_idx])
         fh.write('#include "nnk_boot.inc"\n\n')
         # Phase-4L: DMA completion/timing shim (tools/nnk_dma.inc) — included
@@ -779,6 +795,10 @@ def main():
         # Phase-4M: VRAMCNT_A..I model (tools/nnk_vramcnt.inc) — its hooks are
         # spliced into the prelude above; it sees the same runtime statics.
         fh.write('#include "nnk_vramcnt.inc"\n\n')
+        # Phase-4W: SDL keyboard -> KEYINPUT/EXTKEYIN (tools/nnk_input.inc) —
+        # same runtime statics visible; io_read16 hook spliced into the
+        # prelude above, tick called once per dispatch below.
+        fh.write('#include "nnk_input.inc"\n\n')
         fh.write("static const NnkPartFn nnk_band_table[NNK_BAND_COUNT] = {\n")
         for bi in sorted(bands):
             if bi == ITCM_BAND:
@@ -797,6 +817,7 @@ def main():
         fh.write("             * dispatches, the compiled case is from a stale image generation:\n")
         fh.write("             * re-decode it from live RAM and skip the band switch. */\n")
         fh.write("            nnk_dma_tick();\n")
+        fh.write("            nnk_input_tick();\n")
         fh.write("            if (nnk_smc_try(&pc)) continue;\n")
         if ITCM_BAND in bands:
             # ITCM-resident code: band -1, below the flat window, dispatched
