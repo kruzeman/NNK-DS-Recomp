@@ -901,4 +901,44 @@ int nnk_smc_exec_any(uint32_t *pcp) {
     return 1;
 }
 
+/* ==========================================================================
+ * Phase-5B — the ARM7's shared keypad/touch mirror at main-RAM 0x3FFFA8.
+ *
+ * MEASURED (melonDS memwatch capture `p5b_mel_top2.txt`, ARM7 write dispatch):
+ * the ARM7 stores W16 0x2C00 to 0x027FFFA8 (main-RAM offset 0x3FFFA8; the
+ * ARM9 reads it at 0x02FFFFA8) as a PERIODIC publish, first at master-cycle
+ * ts 8,421,838 and then every ~267,000 cycles (267,088 / 266,158 / 267,983 /
+ * ... — 267 writes before ts 27.0M, every one of them 0x00002C00; every
+ * write comes from ARM7 pc 0x037FE688, i.e. one ARM7 handler).
+ *
+ * WHY IT MATTERS: the game's keypad EDGE detector at 0x02049B0C does
+ *     ldrh ip,=0x02FFFFA8 ; ldrh r2,[ip] ; ... ; ldrh r3,=KEYINPUT
+ *     orr  r2,r3,r2 ; eor r2,r2,ip,lsr#12 (=0x2FFF) ; and r2,r2,0x2FFF
+ *     strh r2,[r0,#8]                       ; the "key state" word
+ * i.e. it ORs its own KEYINPUT read (0x03FF idle: bits 0..9 = released) with
+ * the ARM7's published word and inverts ONLY the bits the ARM7 marks as
+ * hardware-present (0x2C00 = bits 10,11,13, bit 12 = pen).  With the word
+ * left at 0 (no ARM7 model) the OR yields 0x03FF, the inverted word is
+ * 0x2C00 instead of 0, and the edge detector believes keys 10/11/13 are held
+ * from boot: object state 1 instead of 0, so 0x02049BDC branches into
+ * 0x02049C18 where melonDS falls through to 0x02049BF4.  That single missing
+ * ARM7 store is the whole Phase-5A divergence.
+ *
+ * TIMING: native `cycles` is a coarse ~1-per-instruction counter, melonDS ts
+ * is the master cycle; the measured scale at the same program point is
+ * 1.542 (mel ts 27,127,554 at native step 17,589,766).  The measured mel
+ * numbers therefore land at native cycles 5,461,000 (first publish) and
+ * 173,150 (cadence).  Only the VALUE is observable by the guest (it is a
+ * constant), so the schedule just has to precede the first ARM9 read — the
+ * measured first read is at cycle 17,589,7xx, ~12M cycles later.
+ * ========================================================================== */
+#define NNK_KP_MIRROR 0x02FFFFA8u
+static uint64_t nnk_kp_next;
+void arm7_publish_keypad(void) {
+    if (nnk_kp_next == 0) nnk_kp_next = 5461000ull;
+    if (cycles < nnk_kp_next) return;
+    nnk_kp_next += 173150ull;
+    st16(NNK_KP_MIRROR, 0x2C00u);        /* bits 10,11,13 = 1, pen (12) = 0 */
+}
+
 #endif /* NNK_SMC_INC */

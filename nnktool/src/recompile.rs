@@ -3413,6 +3413,10 @@ static void itcm_dump_once(uint32_t pc) {
 static void trace_pc(uint32_t pc) {
     last_pc = pc;
     cycles++;                       /* coarse timing: ~1 cycle per instruction */
+    /* Phase-5B: the ARM7's periodic keypad/touch publish (main-RAM 0x3FFFA8,
+     * see tools/nnk_smc.inc).  Declared block-scope because the definition
+     * lives in the nnk_smc.inc fragment spliced in after this prelude. */
+    { extern void arm7_publish_keypad(void); arm7_publish_keypad(); }
     if (halt_at_pc && pc == halt_at_pc) { halt_reason("halt-at-pc"); step_limit = steps; return; }
     if (nnk_display_tick()) {
 #ifdef NNK_GX
