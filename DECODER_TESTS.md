@@ -1,13 +1,13 @@
-# Decoder regression tests — the four bug classes that stalled the boot chain
+# Decoder regression tests — the five bug classes that stalled the boot chain
 
-nnktool's decoder is now covered by `cargo test` for the four decode/emit bugs
+nnktool's decoder is now covered by `cargo test` for the five decode/emit bugs
 that were found the hard way (each one cost a boot-chain debugging phase).  The
 fixes were already in master; these tests exist so they cannot regress
 silently.
 
 ```
 cd nnktool
-cargo test              # 11 tests, one command, no external crates
+cargo test              # 14 tests, one command, no external crates
 cargo test ldrsb        # one class (test-name filter)
 ```
 
@@ -28,6 +28,7 @@ arm-none-eabi-objdump -D -b binary -marm w.bin
 | 2 | `E0801298` | `umull r1, r0, r8, r2` | emitted `r[0] = _lo; r[1] = _hi;` (swap) |
 | 3 | `4798` (Thumb) | `blx r3` | linked `addr+4\|1` instead of `addr+2\|1` |
 | 4 | `E12FFF3C` | `blx ip` | SMC re-decoder ran it as `teq pc, ip, lsr pc` |
+| 5 | `B570` / `BD70` (Thumb) | `push {r4,r5,r6,lr}` / `pop {r4,r5,r6,pc}` | SMC re-decoder's `0xF600` mask made every POP execute as a PUSH (POP arm unreachable) |
 
 ## Class 1 — LDRSB vs LDRD (Phase-4F)
 
@@ -122,6 +123,37 @@ instead — the honest option, and it does go red if the case is deleted.
   exists, sits **before** the `0x0C000000u` data-processing catch-all, and
   still links `pc+4|1`).
 
+## Class 5 — Thumb PUSH/POP format-13 mask (Phase-5A)
+
+`tools/nnk_smc.inc:smc_exec_thumb` format 13 (`1011 L 10 R <low list>`) tested
+PUSH first with `(hw & 0xF600) == 0xB400` and POP with `(hw & 0xF600) ==
+0xBC00`.  0xF600 keeps bits 15,14,13,12,10,9 — **bit 11 (`L`) is not in the
+mask**, so push and pop compare equal (`0xBD70 & 0xF600 == 0xB400`).  Every
+POP therefore executed the PUSH arm and the POP arm was unreachable dead code.
+
+* Fixtures (objdump-verified): `B570` = `push {r4,r5,r6,lr}` (the prologue at
+  `0x020D19B8`), `BD70` = `pop {r4,r5,r6,pc}` (the epilogue at `0x020D1A1E`).
+* Old behaviour, measured: the `bl` at `0x020D1642` linked `0x020D1647` and the
+  `push` stored it correctly (`0x027E3AA8: 00000000 02143158 00000000
+  020D1647`), but at the epilogue the pop pushed a second frame and the guest
+  fell through to `0x020D1A20` (the literal pool) instead of returning to
+  `0x020D1646`, walking `0x020D1A20..0x020D1A8E` as code and halting at step
+  39,001,760.  (That fall-through is also why Phase-4Z read the symptom as
+  "the pop returns 0x020D1A21" — `0x020D1A20|1`.)
+* Fix: mask `0xFE00` on both arms (`0xB4xx` push, `0xBCxx` pop).  The Rust
+  half re-tested the L bit and so never mis-executed, but its mask is now
+  `0xFE00` with both arms matched explicitly — and the new positive test
+  caught that a `0xB400`-only match turns every pop into `Kind::Undef`.
+* Reference: `PHASE5A.md`.
+
+Tests: `thumb_push_and_pop_split_on_the_l_bit` (both fixtures: text, `LdmStm`
+load flag, list `0x4070`/`0x8070`, `pu` 2/1), `thumb_pop_never_decodes_as_push`
+(negative guard: `0xBD70` never `push`, always `LdmStm { load: true }`, plus
+the `0xF600`-cannot-separate / `0xFE00`-does sanity assertions),
+`runtime_smc_redecoder_masks_the_form13_rbit` (source-level lock for the C
+half: no `0xF600` format-13 mask, both `0xFE00` arms present with PUSH before
+POP, and the POP arm still pops list bit 8 into `npc`).
+
 ## Red-on-old / green-on-current proof
 
 Reverting the four fix lines (in a throw-away copy of the crate, so the tree
@@ -161,20 +193,21 @@ On current master:
 
 ```
 $ cd nnktool && cargo test
-running 11 tests
-test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+running 14 tests
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 ```
 
 ## Coverage / limits
 
-* Positive assertions: 11 tests, ≥1 per class (class 2 and 3 have three each).
+* Positive assertions: 14 tests, ≥1 per class (class 2 and 3 have three each,
+  class 5 has three).
 * Negative guards that pin the old buggy shape: 6 (LDRD match, swapped
   `(rd,rn)==(0,1)`, swapped `r[0] = _lo` emission, `addr+4|1` Thumb link,
   `Kind::Dp`/`teq` fall-through, missing SMC BX case).
 * Not covered by automated tests, stated honestly:
-  * the C runtime half of class 4 beyond the source invariant (no C harness
-    for `nnk_smc.inc`; a real test would need the generated dispatch image and
-    live guest state);
+  * the C runtime half of class 4 and class 5 beyond their source invariants
+    (no C harness for `nnk_smc.inc`; a real test would need the generated
+    dispatch image and live guest state);
   * the Phase-4K long-multiply **mask** fix in `tools/nnk_smc.inc`
     (`0x0FC000F0` → `0x0F0000F0`) — different bug from class 2's field swap,
     and likewise C-side only.

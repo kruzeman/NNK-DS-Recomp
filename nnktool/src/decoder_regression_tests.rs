@@ -304,3 +304,89 @@ fn runtime_smc_redecoder_keeps_its_bx_case_before_the_dp_catchall() {
         "regression: smc BLX(register) no longer links pc+4|1"
     );
 }
+
+// ---------------------------------------------------------------- class 5 ---
+// Thumb-1 PUSH/POP, format 13 (Phase-5A).  Encoding `1011 L 10 R <low list>`:
+// bit 11 is L (0 = PUSH, 1 = POP) and bit 8 is R (LR for PUSH, PC for POP).
+// The runtime's C re-decoder (tools/nnk_smc.inc) matched both arms with
+// `hw & 0xF600`, a mask that leaves bit 11 out, and tested PUSH first — so
+// every POP took the PUSH arm and the POP arm was unreachable dead code.
+// Measured at the overlay dispatcher's epilogue 0x020D1A1E (`pop
+// {r4,r5,r6,pc}` = 0xBD70): the frame the `push {r4,r5,r6,lr}` at 0x020D19B8
+// had written (r4, r5, r6, 0x020D1647 at 0x027E3AA8..0x027E3AB4) was never
+// popped; the guest fell through to 0x020D1A20 (the literal pool) instead of
+// returning to 0x020D1646, walked 0x020D1A20..0x020D1A8E as code and halted
+// at step 39,001,760.  The Rust half re-tested the L bit and so stayed
+// correct, but its mask is tightened to 0xFE00 as well so both halves key on
+// the same field.
+
+const T_PUSH_R4_R5_R6_LR: u16 = 0xB570; // push {r4, r5, r6, lr}  (0x020D19B8)
+const T_POP_R4_R5_R6_PC: u16 = 0xBD70; //  pop  {r4, r5, r6, pc}  (0x020D1A1E)
+
+#[test]
+fn thumb_push_and_pop_split_on_the_l_bit() {
+    let push = decode_thumb(T_PUSH_R4_R5_R6_LR, 0, 0x020D_19B8, 2);
+    assert_eq!(push.text, "push {r4, r5, r6, lr}");
+    match push.kind {
+        Kind::LdmStm { load: false, rn: 13, wb: true, list: 0x4070, pu: 2, .. } => {}
+        other => panic!("B570 must be push {{r4,r5,r6,lr}} via sp (list 0x4070), got {:?}", other),
+    }
+
+    let pop = decode_thumb(T_POP_R4_R5_R6_PC, 0, 0x020D_1A1E, 2);
+    assert_eq!(pop.text, "pop {r4, r5, r6, pc}");
+    match pop.kind {
+        Kind::LdmStm { load: true, rn: 13, wb: true, list: 0x8070, pu: 1, .. } => {}
+        other => panic!("BD70 must be pop {{r4,r5,r6,pc}} from sp (list 0x8070), got {:?}", other),
+    }
+}
+
+#[test]
+fn thumb_pop_never_decodes_as_push() {
+    // NEGATIVE guard on the exact field that the old 0xF600 mask hid: with
+    // 0xF600 the two encodings are indistinguishable, which is why the C
+    // re-decoder's PUSH arm swallowed every POP.
+    assert_eq!(
+        T_POP_R4_R5_R6_PC & 0xF600,
+        T_PUSH_R4_R5_R6_LR & 0xF600,
+        "fixture sanity: 0xF600 cannot separate push from pop"
+    );
+    assert_eq!(T_PUSH_R4_R5_R6_LR & 0xFE00, 0xB400, "PUSH (L=0) under 0xFE00");
+    assert_eq!(T_POP_R4_R5_R6_PC & 0xFE00, 0xBC00, "POP (L=1) under 0xFE00");
+
+    let pop = decode_thumb(T_POP_R4_R5_R6_PC, 0, 0x020D_1A1E, 2);
+    assert!(!pop.text.starts_with("push"), "regression: BD70 decoded as {}", pop.text);
+    match pop.kind {
+        Kind::LdmStm { load, .. } => assert!(load, "regression: BD70 decoded as a store"),
+        other => panic!("BD70 must stay Kind::LdmStm, got {:?}", other),
+    }
+}
+
+#[test]
+fn runtime_smc_redecoder_masks_the_form13_rbit() {
+    // Source-level lock for the C half (same honest option as class 4 — the
+    // include has no C test harness): format 13 must be matched with 0xFE00 so
+    // bit 11 is part of the comparison, and the POP arm must exist after the
+    // PUSH arm.  The Phase-5A pre-fix state (0xF600 for both) makes this red.
+    let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../tools/nnk_smc.inc");
+    let src = std::fs::read_to_string(&p)
+        .unwrap_or_else(|e| panic!("cannot read {}: {}", p.display(), e));
+
+    assert!(
+        !src.contains("0xF600u) == 0xB400u") && !src.contains("0xF600u) == 0xBC00u"),
+        "regression: smc_exec_thumb is masking format 13 with 0xF600 again (bit 11 hidden)"
+    );
+    let push = src
+        .find("0xFE00u) == 0xB400u")
+        .expect("regression: smc_exec_thumb lost its PUSH arm (0xB4xx under 0xFE00)");
+    let pop = src
+        .find("0xFE00u) == 0xBC00u")
+        .expect("regression: smc_exec_thumb lost its POP arm (0xBCxx under 0xFE00) — a pop falls through or is pushed");
+    assert!(push < pop, "regression: POP arm now sits before the PUSH arm");
+    // The POP arm must take the pc from the top of the list (0x8000 for the
+    // R bit) and write it to npc, not to r[15]'s slot in the register file.
+    let block = &src[pop..(pop + 700).min(src.len())];
+    assert!(
+        block.contains("0x8000u") && block.contains("*npc = tv & ~1u;"),
+        "regression: POP no longer pops bit-8 R as the return address into npc"
+    );
+}
