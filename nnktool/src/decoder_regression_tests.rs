@@ -390,3 +390,93 @@ fn runtime_smc_redecoder_masks_the_form13_rbit() {
         "regression: POP no longer pops bit-8 R as the return address into npc"
     );
 }
+
+// ---------------------------------------------------------------- class 6 ---
+// Thumb BLX (immediate) forces ARM state for its target (Phase-5C).
+//
+// The T bit is part of the processor state, not of the PC: `bl` stays in
+// Thumb, `blx <imm>` always switches to ARM (ARM ARM A7.1.4).  The live C
+// re-decoder derived the state from the compiled map plus a sticky last-state
+// guess, so an ARM target reached by `blx <imm>` was re-decoded as Thumb.
+//
+// Measured site: 0x020D2418 `blx 0x020E7968` (halfwords 0xF015 0xEAA6) in the
+// reloaded overlay; the target holds the ARM `push {r3,r4,r5,lr}` (0xE92D4038).
+// The shipped Phase-5B build re-decoded that word as Thumb
+// (`stmdb sp!,{ip,lr}`), walked the pointer table at 0x02160394 for 25,284 PCs
+// through the 0x0214xxxx-0x0217xxxx band and halted at 0x02178E9E on the data
+// word 0x1C36F000 — a "coprocessor" encoding, i.e. data executed as code.
+const T_BLX_IMM_H1: u16 = 0xF015; // blx prefix, S=0
+const T_BLX_IMM_H2: u16 = 0xEAA6; // blx suffix: 11101 (bit12 = 0)
+const T_BL_IMM_H2: u16 = 0xFAA6; //  bl  suffix: 11111 (bit12 = 1)
+const BLXI_SITE: u32 = 0x020D_2418;
+const BLXI_TARGET: u32 = 0x020E_7968;
+
+#[test]
+fn thumb_blx_immediate_target_is_arm_state() {
+    let insn = decode_thumb(T_BLX_IMM_H1, T_BLX_IMM_H2, BLXI_SITE, 4);
+    match insn.kind {
+        Kind::BlxImm { target } => assert_eq!(
+            target, BLXI_TARGET,
+            "0xF015 0xEAA6 at 0x020D2418 is `blx 0x020E7968`"
+        ),
+        other => panic!("F015 EAA6 must decode as Kind::BlxImm, got {:?}", other),
+    }
+    match thumb_flow(BLXI_SITE, &insn) {
+        Flow::Call(target, callee_is_thumb) => {
+            assert_eq!(target, BLXI_TARGET);
+            assert!(
+                !callee_is_thumb,
+                "regression: Thumb `blx <imm>` marked its target as Thumb state"
+            );
+        }
+        other => panic!("F015 EAA6 must be Flow::Call, got {:?}", other),
+    }
+}
+
+#[test]
+fn thumb_bl_immediate_stays_in_thumb_state() {
+    // NEGATIVE neighbour of the same encoding pair: only bit 12 of the suffix
+    // separates BL from BLX, so a fix that switches state for both would be as
+    // wrong as the old behaviour (it would run every Thumb call in ARM).
+    let insn = decode_thumb(T_BLX_IMM_H1, T_BL_IMM_H2, BLXI_SITE, 4);
+    match thumb_flow(BLXI_SITE, &insn) {
+        Flow::Call(target, callee_is_thumb) => {
+            assert_eq!(target, BLXI_TARGET);
+            assert!(callee_is_thumb, "regression: Thumb `bl` marked its target ARM");
+        }
+        other => panic!("F015 FAA6 must be Flow::Call, got {:?}", other),
+    }
+    assert_eq!(T_BLX_IMM_H2 & 0x1000, 0x0000, "blx suffix: bit12 = 0");
+    assert_eq!(T_BL_IMM_H2 & 0x1000, 0x1000, "bl suffix: bit12 = 1");
+}
+
+#[test]
+fn runtime_smc_redecoder_carries_the_blx_state() {
+    // Source-level lock for the C half (same honest option as classes 4/5 —
+    // tools/nnk_smc.inc has no C test harness).  The live decoder must record
+    // the interworking state at the BL/BLX site and honour it at dispatch; the
+    // Phase-5B state (state inferred from the compiled map + sticky only) is
+    // what produced the 0x0214..0x0217 data walk.
+    let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../tools/nnk_smc.inc");
+    let src = std::fs::read_to_string(&p)
+        .unwrap_or_else(|e| panic!("cannot read {}: {}", p.display(), e));
+    assert!(
+        src.contains("smc_branch_mode(*npc | ((hw2 & 0x1000u) ? 1u : 0u));"),
+        "regression: the Thumb BL/BLX arm no longer carries the target's state"
+    );
+    assert!(
+        src.contains("static int smc_carried_thumb(uint32_t pc, int *state)"),
+        "regression: the live re-decoder lost its carried-state lookup"
+    );
+    let uses = src.matches("if (smc_carried_thumb(pc, &st))").count();
+    assert!(
+        uses >= 2,
+        "regression: carried state is not consumed by both dispatch hooks (found {})",
+        uses
+    );
+    assert!(
+        src.contains("steps != smc_t_step + 1ull"),
+        "regression: the carried state is no longer one-step-scoped — a loop \
+         revisiting the same target would inherit a stale state"
+    );
+}
