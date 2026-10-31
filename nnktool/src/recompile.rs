@@ -631,6 +631,28 @@ fn emit_insn(
                         // state, the dispatch key is its even address.
                         body.push(format!("uint32_t _t = ld32(_a + {}u);", idx * 4));
                         body.push("pc = _t & ~1u;".into());
+                        // Phase-5J: hand the RAW word to the runtime so the
+                        // state survives into the next dispatch.  Dropping
+                        // bit0 here was measured: the compiled
+                        // `pop {r3,r4,r5,r6,r7,pc}` at 0x020F5C88 returned to
+                        // the unrooted 0x020F5CC4, the live re-decoder had no
+                        // state for it and replayed two Thumb ops as one ARM
+                        // `ldrsh`, so `andcs sp,r1,r1` wrecked sp and the
+                        // frame popped 0 into pc (halt step 40,768,913).
+                        // melonDS A_POP/A_LDM: JumpTo(loaded word) with bit0
+                        // selecting the state (ARMInterpreter_LoadStore.cpp).
+                        // For a SINGLE-register list melonDS instead forces the
+                        // tag: `if (Num==1) pc |= 0x1` in T_POP, `pc &= ~0x1`
+                        // in A_LDM (Phase-5J).
+                        if regs.len() == 1 {
+                            body.push(if thumb {
+                                "nnk_smc_note_branch(_t | 1u);".into()
+                            } else {
+                                "nnk_smc_note_branch(_t & ~1u);".into()
+                            });
+                        } else {
+                            body.push("nnk_smc_note_branch(_t);".into());
+                        }
                         pc_written = true;
                         flow = Flow::Indirect(None);
                     } else if user_bank && *rr == 13 {

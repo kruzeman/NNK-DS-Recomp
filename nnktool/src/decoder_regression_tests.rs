@@ -397,10 +397,17 @@ fn runtime_smc_redecoder_masks_the_form13_rbit() {
     assert!(push < pop, "regression: POP arm now sits before the PUSH arm");
     // The POP arm must take the pc from the top of the list (0x8000 for the
     // R bit) and write it to npc, not to r[15]'s slot in the register file.
-    let block = &src[pop..(pop + 700).min(src.len())];
+    let block = &src[pop..(pop + 1600).min(src.len())];
     assert!(
-        block.contains("0x8000u") && block.contains("*npc = tv & ~1u;"),
+        block.contains("0x8000u") && block.contains("*npc = raw & ~1u;"),
         "regression: POP no longer pops bit-8 R as the return address into npc"
+    );
+    // Phase-5J: the forced Thumb tag is the SINGLE-register form only
+    // (melonDS T_POP `if (cpu->Num==1) pc |= 0x1`); a multi-register
+    // pop{..,pc} interworks on the loaded word's bit0.
+    assert!(
+        block.contains("uint32_t raw = (cnt == 1u) ? (tv | 1u) : tv;"),
+        "regression: the Thumb POP arm forces Thumb for every register list again"
     );
 }
 
@@ -517,9 +524,12 @@ fn runtime_smc_redecoder_interworks_on_ldm_pc_and_links_arm_blx_even() {
     let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../tools/nnk_smc.inc");
     let src = std::fs::read_to_string(&p)
         .unwrap_or_else(|e| panic!("cannot read {}: {}", p.display(), e));
-    // (1) the ARM LDM with PC in the list carries the loaded word's state
+    // (1) the ARM LDM with PC in the list carries the loaded word's state,
+    //     except for the one-register list where melonDS masks bit0
+    //     (A_LDM: `if (cpu->Num == 1) pc &= ~0x1;`) — Phase-5J.
     assert!(
-        src.contains("if (i == 15u) { *npc = lv & ~1u; smc_branch_mode(lv); }"),
+        src.contains("uint32_t raw = (cnt == 1u) ? (lv & ~1u) : lv;")
+            && src.contains("*npc = raw & ~1u; smc_branch_mode(raw);"),
         "regression: an ARM `pop/LDM {{..,pc}}` no longer interworks on the loaded word"
     );
     // (2) ARM BLX (register) must link an EVEN pc+4 — the `| 1u` form tagged
@@ -535,10 +545,15 @@ fn runtime_smc_redecoder_interworks_on_ldm_pc_and_links_arm_blx_even() {
         src.contains("if (rd == 15u) *npc = tv & ~1u;"),
         "regression: an ARM LDR into PC started interworking (melonDS masks bit0)"
     );
-    // (4) a Thumb pop{pc} always stays Thumb on the ARM9
+    // (4) a Thumb pop{..,pc} takes the state from the popped word's bit0;
+    //     only the SINGLE-register form forces Thumb (melonDS T_POP:
+    //     `if (cpu->Num==1) pc |= 0x1; cpu->JumpTo(pc);`).  Phase-5D made
+    //     the |1u unconditional and re-entered the ARM caller 0x0207CAC4 in
+    //     Thumb state (Phase-5J).
     assert!(
-        src.contains("if (k == 15u) { *npc = tv & ~1u; smc_branch_mode(tv | 1u); }"),
-        "regression: Thumb pop{{pc}} no longer forces the Thumb state"
+        src.contains("uint32_t raw = (cnt == 1u) ? (tv | 1u) : tv;")
+            && src.contains("smc_branch_mode(raw);"),
+        "regression: Thumb pop{{..,pc}} lost the Num==1-only forced Thumb tag"
     );
 }
 
@@ -687,5 +702,83 @@ fn runtime_smc_redecoder_splits_the_thumb_imm_halfword_form() {
     assert!(
         block.contains("(((hw >> 6) & 0x1Fu) << 1)") && block.contains("ld16(ea)"),
         "regression: the Thumb immediate halfword arm no longer reads a 16-bit element (imm5 scaled by 2)"
+    );
+}
+
+#[test]
+fn runtime_smc_redecoder_splits_add_sp_from_sub_sp() {
+    // Phase-5J, class 12: Thumb `1011 0000 0 imm7` is ADD SP,#imm*4 and
+    // `1011 0000 1 imm7` is SUB SP,#imm*4 (ARM ARM A6.6.4).  The C
+    // re-decoder matched the whole 0xB000..0xB0FF block as ADD, so every
+    // `sub sp,#imm` RAISED sp.  Measured at 0x020DDE72 (`sub sp,#16`, word
+    // 0xB084) inside the frame that ends at 0x020DDE6E: sp sat 0x20 too high,
+    // the [sp,#8]/[sp,#12] locals read the wrong words and the epilogue's
+    // `pop {r4,r5,r6,r7,pc}` popped 0 into pc (halt step 41,720,639).
+    let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../tools/nnk_smc.inc");
+    let src = std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("cannot read {}: {}", p.display(), e));
+    assert!(
+        src.contains("/* format 12: ADD/SUB SP,#imm */"),
+        "regression: the C re-decoder no longer separates ADD SP from SUB SP"
+    );
+    let at = src.find("/* format 12: ADD/SUB SP,#imm */").expect("format 12 arm missing");
+    let block = &src[at..(at + 900).min(src.len())];
+    assert!(
+        block.contains("if (hw & 0x80u) r[13] -= (hw & 0x7Fu) << 2;")
+            && block.contains("else            r[13] += (hw & 0x7Fu) << 2;"),
+        "regression: SUB SP (0xB080..0xB0FF) is added instead of subtracted again"
+    );
+    assert_eq!(0xB084 & 0x80, 0x80, "fixture sanity: 0xB084 has bit7 set (SUB)");
+    assert_eq!(0xB019 & 0x80, 0x00, "fixture sanity: 0xB019 has bit7 clear (ADD)");
+}
+
+#[test]
+fn interworking_targets_carry_their_state_across_the_dispatch() {
+    // Phase-5J, classes 13/14: the target of an interworking transfer carries
+    // its instruction state in bit0 of the transferred word — melonDS
+    // JumpTo() (`if (addr & 0x1) CPSR |= 0x20`), T_POP `if (Num==1) pc |= 0x1`
+    // and A_LDM `if (Num==1) pc &= ~0x1` for one-register lists
+    // (src/ARMInterpreter_LoadStore.cpp:436/745).
+    // (a) the EMITTER records that word for the compiled cases, which used to
+    //     drop it (`pc = _t & ~1u;` alone) — measured at 0x020F5C88
+    //     `pop {r3,r4,r5,r6,r7,pc}` returning to the unrooted 0x020F5CC4.
+    let em = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/recompile.rs");
+    let em = std::fs::read_to_string(&em).unwrap_or_else(|e| panic!("cannot read {}: {}", em.display(), e));
+    assert!(
+        em.contains("nnk_smc_note_branch(_t);"),
+        "regression: the emitter drops an LDM/pop-with-pc target's state bit again"
+    );
+    assert!(
+        em.contains("nnk_smc_note_branch(_t | 1u);") && em.contains("nnk_smc_note_branch(_t & ~1u);"),
+        "regression: the single-register LDM form no longer forces the tag (Num==1 rule)"
+    );
+    // (b) the RUNTIME exposes the one-step carry the emitter calls, and BOTH
+    //     live hooks resolve an unclassified PC the same way (the stale-band
+    //     hook used to have no state resolution at all).
+    let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../tools/nnk_smc.inc");
+    let src = std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("cannot read {}: {}", p.display(), e));
+    assert!(
+        src.contains("void nnk_smc_note_branch(uint32_t raw) { smc_branch_mode(raw); }"),
+        "regression: the runtime lost the interworking-state hook the band TUs call"
+    );
+    let hdr = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../tools/split_dispatch.py");
+    let hdr = std::fs::read_to_string(&hdr).unwrap_or_else(|e| panic!("cannot read {}: {}", hdr.display(), e));
+    assert!(
+        hdr.contains("void nnk_smc_note_branch(uint32_t raw);"),
+        "regression: nnk_rt.h no longer declares the state hook for the band TUs"
+    );
+    assert!(
+        src.matches("smc_state_from_regs(pc)").count() >= 2,
+        "regression: only one of the two live dispatch hooks resolves the target state"
+    );
+    // (c) a multi-register Thumb pop{..,pc} must NOT force Thumb: returning to
+    //     an ARM caller (0x0207CAC4, the ARM BLX caller of 0x020F5C98) has to
+    //     resume in ARM state.
+    assert!(
+        src.contains("uint32_t raw = (cnt == 1u) ? (tv | 1u) : tv;"),
+        "regression: the Thumb POP arm forces bit0 for every register list again"
+    );
+    assert!(
+        src.contains("uint32_t raw = (cnt == 1u) ? (lv & ~1u) : lv;"),
+        "regression: the ARM LDM arm no longer masks bit0 for a one-register list"
     );
 }

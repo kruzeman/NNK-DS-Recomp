@@ -553,6 +553,11 @@ def main():
         for idx in range(band_count):
             fh.write("%s\n" % (PART_PROTO % idx))
         fh.write("int nnk_part_itcm(uint32_t *pc_io);\n")
+        # Phase-5J: the band TUs hand an interworking transfer's RAW target
+        # word (bit0 = state) to the runtime, implemented in tools/nnk_smc.inc
+        # (nnk_main.c's TU).  Always declared: the header is a cache key, so it
+        # must not depend on which image is being built.
+        fh.write("void nnk_smc_note_branch(uint32_t raw);\n")
         fh.write("#endif\n")
 
     # ---- Phase-4N: cart transfer-done IRQ + rule-based delivery ----------

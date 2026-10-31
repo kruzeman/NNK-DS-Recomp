@@ -56,6 +56,13 @@ static unsigned long long smc_nhalt;      /* unsupported live instruction */
 static unsigned long long smc_nfb;        /* state fallback taken */
 static unsigned long long smc_nany;       /* Phase-4L: decode-on-demand hits */
 static int smc_trace_left;                /* NNK_SMC_TRACE budget */
+static unsigned long long smc_trace_from; /* NNK_SMC_TRACE_FROM: suppress
+                                           * trace lines before this step.
+                                           * The budget used to count down from
+                                           * the FIRST live decode, so a probe
+                                           * aimed at step 40M was always
+                                           * spent long before the interesting
+                                           * window (Phase-5J). */
 static int smc_t_sticky;                  /* Phase-4Z: last resolved T bit */
 /* Phase-5C: the processor state CARRIED by an interworking branch.  The T bit
  * is part of the ARM9 state, not of the PC: a Thumb `blx <imm>` branches to an
@@ -82,6 +89,21 @@ static int smc_carried_thumb(uint32_t pc, int *state) {
     *state = smc_t_val;
     return 1;
 }
+
+/* Phase-5J: the compiled image records the state of an INTERWORKING transfer.
+ * The recompiler's emitted `pop {..,pc}` / `ldm ..,{..,pc}` sets
+ *     pc = _t & ~1u;
+ * and drops bit0 — the only place the target's state exists (melonDS
+ * A_POP/A_LDM JumpTo(pc) with bit0).  The live re-decoder then had no state
+ * for the target at all and fell back to `smc_t_sticky` (the last on-demand
+ * decode's state, arbitrarily stale).  Emitted cases now call this hook, which
+ * is exactly the same one-step-scoped carry the live decoder uses for its own
+ * interworking branches (Phase-5C).  Non-static: the band TUs call it.
+ * Measured: 0x020F5C88 `pop {r3,r4,r5,r6,r7,pc}` returned to 0x020F5CC4, the
+ * live decoder ran the pop's Thumb bytes as an ARM `ldrsh`+`pc=pc+4`, sp was
+ * then clobbered by an ARM `andcs sp,r1,r1` at 0x020F5CE8 and the frame's
+ * epilogue popped 0 into pc. */
+void nnk_smc_note_branch(uint32_t raw) { smc_branch_mode(raw); }
 
 /* Emitted next to the dispatch image by tools/split_dispatch.py.  A mono
  * (recompile-all -> cc) build has no generated map, so fall back to ARM-only
@@ -180,6 +202,8 @@ static void smc_arm(void) {
     smc_armed = 1;
     p = getenv("NNK_SMC_TRACE");
     if (p && p[0]) smc_trace_left = atoi(p);
+    p = getenv("NNK_SMC_TRACE_FROM");
+    if (p && p[0]) smc_trace_from = strtoull(p, NULL, 0);
     fprintf(stderr, "smc: armed, %d generation-0 segments, %d bands%s\n",
             smc_seg_n, (int)SMC_BAND_N, smc_trace_left ? ", tracing" : "");
 }
@@ -542,7 +566,16 @@ static int smc_exec_arm(uint32_t pc, uint32_t w, uint32_t *npc, uint32_t *costp)
             if (!(list & (1u << i))) continue;
             if (L) {
                 uint32_t lv = ld32(addr + k * 4u);
-                if (i == 15u) { *npc = lv & ~1u; smc_branch_mode(lv); }
+                if (i == 15u) {
+                    /* Phase-5J: melonDS A_LDM (ARMInterpreter_LoadStore.cpp
+                     * :436) masks bit0 for a SINGLE-register list
+                     * (`if (cpu->Num == 1) pc &= ~0x1;`) and otherwise lets
+                     * JumpTo take the loaded word's bit0.  The unconditional
+                     * smc_branch_mode(lv) fabricated an interworking on the
+                     * one-register form. */
+                    uint32_t raw = (cnt == 1u) ? (lv & ~1u) : lv;
+                    *npc = raw & ~1u; smc_branch_mode(raw);
+                }
                 else if (user_bank && i == 13u) bank13_set_usr(lv);
                 else if (user_bank && i == 14u) bank14_set_usr(lv);
                 else r[i] = lv;
@@ -805,8 +838,17 @@ static int smc_exec_thumb(uint32_t pc, uint32_t *npc, uint32_t *costp) {
         r[rd] = ((hw & 0x0800u) ? r[13] : ((pc + 4u) & ~3u)) + ((hw & 0xFFu) << 2);
         return 1;
     }
-    if ((hw & 0xFF00u) == 0xB000u) {                 /* format 12: ADD SP,#imm */
-        r[13] += (hw & 0x7Fu) << 2;
+    if ((hw & 0xFF00u) == 0xB000u) {                 /* format 12: ADD/SUB SP,#imm */
+        /* Phase-5J: bit7 of the low byte selects the direction (ARM ARM
+         * A6.6.4: `1011 0000 0 imm7` = ADD SP, `1011 0000 1 imm7` = SUB SP);
+         * both imm7 fields are <<2.  The old arm matched the whole 0xB000..0xB0FF
+         * block as ADD, so every `sub sp,#imm` RAISED the stack pointer.
+         * Measured at 0x020DDE72 (`sub sp,#16`, word 0xB084) in the frame that
+         * ends at 0x020DDE6E: sp sat 0x20 too high, the `[sp,#8]`/`[sp,#12]`
+         * locals read the wrong words and `pop {r4,r5,r6,r7,pc}` popped 0 into
+         * pc (halt step 41,720,639). */
+        if (hw & 0x80u) r[13] -= (hw & 0x7Fu) << 2;
+        else            r[13] += (hw & 0x7Fu) << 2;
         return 1;
     }
     /* Phase-5A: format 13 is `1011 L 10 R <list>` and bit 11 is the L bit that
@@ -834,15 +876,26 @@ static int smc_exec_thumb(uint32_t pc, uint32_t *npc, uint32_t *costp) {
     if ((hw & 0xFE00u) == 0xBC00u) {                 /* POP */
         unsigned list = (hw & 0xFFu) | ((hw & 0x0100u) ? 0x8000u : 0u);
         uint32_t sp = r[13];
-        unsigned k, idx = 0u;
+        unsigned k, idx = 0u, cnt = 0u;
+        for (k = 0; k < 16u; k++) if (list & (1u << k)) cnt++;
         for (k = 0; k < 16u; k++) {
             if (!(list & (1u << k))) continue;
             tv = ld32(sp + idx * 4u);
             idx++;
-            /* Phase-5D: melonDS A_POP (src/ARMInterpreter_LoadStore.cpp:745)
-             * forces bit0 on the ARM9 (`if (Num==1) pc |= 0x1`), so a Thumb
-             * pop{pc} always continues in Thumb state. */
-            if (k == 15u) { *npc = tv & ~1u; smc_branch_mode(tv | 1u); }
+            if (k == 15u) {
+                /* Phase-5J: melonDS T_POP (ARMInterpreter_LoadStore.cpp:745)
+                 * is `if (cpu->Num==1) pc |= 0x1; cpu->JumpTo(pc);` — the
+                 * forced Thumb tag belongs to a SINGLE-register pop only.  For
+                 * a multi-register `pop {r3,r4,r5,r6,r7,pc}` JumpTo takes the
+                 * loaded word's bit0, so returning to an ARM caller resumes in
+                 * ARM.  Phase-5D made the |1u unconditional, which re-entered
+                 * ARM code at 0x0207CAC4 (the ARM BLX caller of 0x020F5C98)
+                 * in Thumb state: word 0xE587000C = `str r0,[r7,#12]` was run
+                 * as two Thumb ops and the run halted at 0x0207D274. */
+                uint32_t raw = (cnt == 1u) ? (tv | 1u) : tv;
+                *npc = raw & ~1u;
+                smc_branch_mode(raw);
+            }
             else r[k] = tv;
         }
         r[13] = sp + idx * 4u; *costp = 1;
@@ -910,7 +963,23 @@ int nnk_smc_try(uint32_t *pcp) {
 
     trace_pc(pc);
     thumb = nnk_pc_is_thumb(pc);
-    { int st; if (smc_carried_thumb(pc, &st)) thumb = st; }   /* Phase-5C */
+    { int st;
+      if (smc_carried_thumb(pc, &st)) thumb = st;             /* Phase-5C */
+      else if (!thumb) {
+        /* Phase-5J: the stale-band hook reused the map + carried state only,
+         * so a PC the map cannot classify (any case whose emitted flow is not
+         * the addr+2 fall-through — every `pop {..,pc}`/branch — and every
+         * unrooted PC) fell straight to the ARM decode, whose
+         * Thumb-bytes-as-ARM decode succeeds silently.  Same resolution as
+         * nnk_smc_exec_any (Phase-4Z): a register still carrying the tagged
+         * target, else the last resolved state.
+         * Measured: 0x020F5CC4 (`adds r0,r4,#0;` + `pop {..,pc}`) executed
+         * here as one ARM `ldrsh` (word 0xBDF81C20) instead of two Thumb ops,
+         * which turned sp into 0x02E7FFF0 at the next ARM `andcs sp,r1,r1`. */
+        int m = smc_state_from_regs(pc);
+        if (m < 0) m = smc_t_sticky;
+        thumb = (m > 0);
+      } }
     rc = thumb ? smc_exec_thumb(pc, &npc, &cost) : smc_exec_arm(pc, w, &npc, &cost);
     if (!rc && thumb) {
         rc = smc_exec_arm(pc, w, &npc, &cost);
@@ -929,7 +998,8 @@ int nnk_smc_try(uint32_t *pcp) {
         return 1;
     }
     card_tick(cost);
-    if (smc_trace_left > 0) {
+    smc_t_sticky = thumb;                 /* Phase-5J: this pc's resolved state */
+    if (smc_trace_left > 0 && steps >= smc_trace_from) {
         smc_trace_left--;
         fprintf(stderr, "smc: redecoded step=%llu pc=0x%08X img=0x%08X word=0x%08X "
                 "state=%s gen=%u -> 0x%08X\n",
@@ -996,10 +1066,10 @@ int nnk_smc_exec_any(uint32_t *pcp) {
     smc_t_sticky = thumb;                 /* Phase-4Z: the T bit this pc resolved to */
     smc_ninsn++;
     card_tick(cost);
-    if (smc_trace_left > 0) {
+    if (smc_trace_left > 0 && steps >= smc_trace_from) {
         smc_trace_left--;
-        fprintf(stderr, "smc: on-demand step=%llu pc=0x%08X word=0x%08X state=%s -> 0x%08X\n",
-                (unsigned long long)steps, pc, w, thumb ? "thumb" : "arm", npc);
+        fprintf(stderr, "smc: on-demand step=%llu pc=0x%08X word=0x%08X state=%s sticky=%d -> 0x%08X\n",
+                (unsigned long long)steps, pc, w, thumb ? "thumb" : "arm", smc_t_sticky, npc);
     }
     *pcp = npc;
     return 1;
