@@ -364,8 +364,16 @@ static int smc_exec_arm(uint32_t pc, uint32_t w, uint32_t *npc, uint32_t *costp)
         unsigned link = (w & 0x30u) == 0x30u;
         unsigned bxm = (unsigned)(w & 0xFu);
         uint32_t tgt = (bxm == 15u) ? (pc + 8u) : r[bxm];
-        if (link) r[14] = (pc + 4u) | 1u;
+        /* Phase-5D: ARM BLX (register) links pc+4 with bit0 CLEAR.  melonDS
+         * A_BLX_REG (src/ARMInterpreter_Branch.cpp:57): `u32 lr = R[15]-4;
+         * JumpTo(Rm); R[14] = lr;` - R[15] is pc+8 in ARM state, so lr = pc+4
+         * and no interworking bit is added.  The old `| 1u` tagged the return
+         * address Thumb; with the Phase-5D LDM interworking carry that made a
+         * `pop {pc}` return to an ARM caller in Thumb state (measured at
+         * 0x0215AC20, whose bytes are ARM `E1A02005`, step 13,146,7xx). */
+        if (link) r[14] = pc + 4u;             /* BX (no L) leaves LR as-is */
         *npc = tgt & ~1u;
+        smc_branch_mode(tgt);              /* Phase-5D: bx/blx rM interworks */
         *costp = 3;
         return 1;
     }
@@ -491,6 +499,9 @@ static int smc_exec_arm(uint32_t pc, uint32_t w, uint32_t *npc, uint32_t *costp)
         ea = P ? (U ? base + off : base - off) : base;
         if (L) {
             tv = B ? ld8(ea) : ld32(ea);
+            /* Phase-5D: melonDS ARMv5 A_LDR0 `if (Num==1) val &= ~0x1` then
+             * JumpTo(val) - an LDR into PC does NOT interwork on the ARM9.
+             * Measured (src/ARMInterpreter_LoadStore.cpp:95..121). */
             if (rd == 15u) *npc = tv & ~1u;
             else r[rd] = tv;
             *costp = 1;
@@ -524,7 +535,7 @@ static int smc_exec_arm(uint32_t pc, uint32_t w, uint32_t *npc, uint32_t *costp)
             if (!(list & (1u << i))) continue;
             if (L) {
                 uint32_t lv = ld32(addr + k * 4u);
-                if (i == 15u) *npc = lv & ~1u;
+                if (i == 15u) { *npc = lv & ~1u; smc_branch_mode(lv); }
                 else if (user_bank && i == 13u) bank13_set_usr(lv);
                 else if (user_bank && i == 14u) bank14_set_usr(lv);
                 else r[i] = lv;
@@ -590,6 +601,10 @@ static int smc_exec_arm(uint32_t pc, uint32_t w, uint32_t *npc, uint32_t *costp)
         if (op < 8u || op > 11u) {
             if (rd == 15u) {
                 *npc = tv & ~1u;
+                /* Phase-5D: melonDS A_DataProcessing writes PC with
+                 * `JumpTo(res & ~1)` (src/ARMInterpreter_ALU.cpp:321) - no
+                 * interworking on MOV/ADD/SUB pc, only the S-form restores
+                 * CPSR.  Bit0 stays stripped, state unchanged. */
                 if (setflags && op < 8u && mode_priv()) {   /* exception return */
                     uint32_t spsr = spsr_bank[mode_cur];
                     cpsr_set_ctl(spsr & 0xFFu);
@@ -780,7 +795,10 @@ static int smc_exec_thumb(uint32_t pc, uint32_t *npc, uint32_t *costp) {
             if (!(list & (1u << k))) continue;
             tv = ld32(sp + idx * 4u);
             idx++;
-            if (k == 15u) *npc = tv & ~1u;
+            /* Phase-5D: melonDS A_POP (src/ARMInterpreter_LoadStore.cpp:745)
+             * forces bit0 on the ARM9 (`if (Num==1) pc |= 0x1`), so a Thumb
+             * pop{pc} always continues in Thumb state. */
+            if (k == 15u) { *npc = tv & ~1u; smc_branch_mode(tv | 1u); }
             else r[k] = tv;
         }
         r[13] = sp + idx * 4u; *costp = 1;

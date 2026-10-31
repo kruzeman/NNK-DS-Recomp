@@ -484,3 +484,19 @@ index 3937a994..9056bba4 100644
                  if (CheckCondition(CurInstr >> 28))
                  {
                      u32 icode = ((CurInstr >> 4) & 0xF) | ((CurInstr >> 16) & 0xFF0);
+
+# --- Phase-5D addendum: the loop window is data, not baked in --------------
+# The hook above hard-codes the Phase-4N WFI idle loop (0x0200712C..0x02007140).
+# Applying the Phase-5D hunk makes the window env-driven so the SAME hook
+# instruments the 0x020078E8 "wait for VCOUNT==0" helper (measured: enter
+# ts=12,287,887, leave ts=12,324,209, iters=7,263, post 0x02007958 ->
+# 0x0202986C -> 0x02046244 -> 0x02007AC0) without a rebuild per window.
+#
+#   MELONDS_LOOPWATCH_LO=0x020078E8 MELONDS_LOOPWATCH_HI=0x02007904
+#
+# @@ -322,6 +322,11 @@ (in LoopWatch::Init, after the AFTER parse)
+# +    /* Phase-5D: the window is data, not baked in.  The same hook serves the
+# +     * Phase-4N WFI idle loop (0x0200712C) and the Phase-5D VCOUNT==0 wait
+# +     * helper (0x020078E8). */
+# +    if ((s = getenv("MELONDS_LOOPWATCH_LO"))) LoopLo = (u32)strtoul(s, nullptr, 0);
+# +    if ((s = getenv("MELONDS_LOOPWATCH_HI"))) LoopHi = (u32)strtoul(s, nullptr, 0);
