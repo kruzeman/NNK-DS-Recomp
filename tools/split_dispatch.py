@@ -582,6 +582,70 @@ def main():
                      "rule-based IRQ delivery")
     sys.stderr.write("Phase-4N: cart IRQ + rule-based delivery spliced\n")
 
+    # ---- Phase-5F: periodic VBlank IRQ producer (unbounded) ---------------
+    # Measurement (PHASE5F.md): the runtime raises IF only from (a) the finite
+    # Phase-4C script table, whose last entry is step 9,097,800, and (b) the
+    # card-transfer-end raise of Phase-4N.  There is no periodic, guest-visible
+    # interrupt source at all, while melonDS keeps the ARM9's idle WFI supplied
+    # for the whole boot (`p5f/wfi3.txt`: 25,232 wakes at 0x0200911C over
+    # ts 56.5M..2.16B, IE=0x00040019, enabled bits 0/3/4/18/19).
+    #
+    # melonDS source (GPU.cpp:1272 SetDispStatIRQ(0,0) at VCount==192):
+    # IF bit 0 is raised when the DISPSTAT VBlank flag makes its 0->1 edge AND
+    # DISPSTAT bit 3 (VBlank IRQ enable) is set -- edge-triggered, not a level.
+    # This runtime's DISPSTAT flag is derived from VCOUNT (io_dispstat_read),
+    # so the same edge is the VCOUNT==192 transition.  The producer is bounded
+    # only by the frame clock (CYCLES_PER_SCANLINE * SCANLINES), i.e. unbounded
+    # in run time, and it does not depend on any captured trace.
+    prelude = inject(prelude,
+                     "    cycles++;                       /* coarse timing: ~1 cycle per instruction */",
+                     "    cycles++;                       /* coarse timing: ~1 cycle per instruction */\n"
+                     "    {   /* Phase-5F: VBlank IRQ producer (melonDS GPU.cpp VCount==192\n"
+                     "         * -> SetDispStatIRQ(0,0), gated on DISPSTAT bit 3). */\n"
+                     "        static uint32_t p5f_vc_last = 0xFFFFFFFFu;\n"
+                     "        uint32_t p5f_vc = vcount();\n"
+                     "        if (p5f_vc != p5f_vc_last) {\n"
+                     "            if (p5f_vc == 192u && (dispstat & 0x8u)) iflags |= 0x1u;\n"
+                     "            p5f_vc_last = p5f_vc;\n"
+                     "        }\n"
+                     "    }",
+                     "Phase-5F VBlank IRQ producer")
+    sys.stderr.write("Phase-5F: periodic VBlank IRQ producer spliced\n")
+
+    # ---- Phase-5F: WFI / idle-loop state probe (env NNK_WFI_PROBE) --------
+    # The Phase-5E stop-report could only say "the guest spins at 0x02009110".
+    # This probe prints the delivery-relevant state at that PC (and at the WFI
+    # instruction itself) so the next worker can read WHY no wake happens
+    # instead of inferring it: IE/IF/CPSR.I, the card state machine (card_next
+    # / ROMCNT / SPI CNT / DMA2 CNT) and DISPSTAT.  Inactive unless
+    # NNK_WFI_PROBE is set; capped so a runaway run cannot fill the disk.
+    prelude = inject(prelude,
+                     "static uint32_t dispstat = 0, dispcnt = 0;",
+                     "static uint32_t dispstat = 0, dispcnt = 0;\n"
+                     "/* Phase-5F: NNK_WFI_PROBE=1 -> state dump at the ARM9 WFI\n"
+                     " * helper 0x02009118 and the idle-loop head 0x02009110. */\n"
+                     "static int nnk_wfi_probe = -1;\n"
+                     "static int nnk_wfi_n = 0;",
+                     "Phase-5F WFI probe statics")
+    prelude = inject(prelude,
+                     "        else if (!irq_active && (irq_trig_n >= IRQ_TRIG_N || steps > irq_trig_log[irq_trig_n])",
+                     "        if (nnk_wfi_probe < 0) {\n"
+                     "            const char *s = getenv(\"NNK_WFI_PROBE\");\n"
+                     "            nnk_wfi_probe = (s && s[0]) ? 1 : 0;\n"
+                     "        }\n"
+                     "        if (nnk_wfi_probe && nnk_wfi_n < 20000\n"
+                     "            && (pc == 0x02009110u || pc == 0x02009118u)) {\n"
+                     "            nnk_wfi_n++;\n"
+                     "            fprintf(stderr, \"wfiprobe n=%d pc=0x%08X step=%llu ime=%u ie=0x%08X if=0x%08X cpsr=%02X \"\n"
+                     "                    \"cardnext=%llu romcnt=0x%08X spicnt=0x%04X dma2=0x%08X dispstat=0x%04X\\\\n\",\n"
+                     "                    nnk_wfi_n, pc, (unsigned long long)steps, ime, ie, iflags, cpsr_ctl,\n"
+                     "                    (unsigned long long)card_next, romcnt, (unsigned)spicnt,\n"
+                     "                    dma_cnt[2], (unsigned)dispstat);\n"
+                     "        }\n"
+                     "        else if (!irq_active && (irq_trig_n >= IRQ_TRIG_N || steps > irq_trig_log[irq_trig_n])",
+                     "Phase-5F WFI probe hook")
+    sys.stderr.write("Phase-5F: WFI state probe spliced (NNK_WFI_PROBE)\n")
+
     # ---- Phase-4O: full cart-event trace (env NNK_CARDLOG) ---------------
     # Phase-4N's card evidence was limited to the image's own 4 start logs, so
     # "no start after card_cycles=7,812,062" was an artifact of the log cap,
