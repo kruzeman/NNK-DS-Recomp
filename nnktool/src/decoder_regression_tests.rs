@@ -869,3 +869,61 @@ fn case_labels_carry_the_exact_state_marker() {
         "regression: the marker is no longer authoritative over the addr+2 heuristic"
     );
 }
+
+// --------------------------------------------------------------- class 16 ---
+// Thumb format 7 (`0101 L B 0 Ro Rb Rd`) — LDR/STR/LDRB/STRB with REGISTER
+// offset.  Phase-5L, measured at 0x020F6560 inside the Mobiclip player: the
+// live C re-decoder refused EVERY 0x5xxx word because it read B and L out of
+// bit12/bit11 and then bailed with `if (hw & 0x1000u) return 0;` — bit12 is
+// part of the 0x5 prefix and is set for the whole block, so a plain
+// `ldrb r1,[r0,r1]` (0x5C41) could not be decoded and the run halted at step
+// 2,255,768,127 with `dispatch to untranslated pc` (smcfail hw0=0x5C41
+// hw1=0x1C02).  The Rust decoder has always been right (bit9 splits format 7
+// from format 8, B = bit10); this test pins both halves.
+#[test]
+fn thumb_format7_register_offset_byte_load() {
+    // 0x5C41 = `ldrb r1, [r0, r1]` (binutils: 0x5C41).
+    let o = decode_thumb(0x5C41, 0, 0x020F_6560, 2);
+    assert_eq!(o.text, "ldrb r1, [r0, r1]");
+    match o.kind {
+        Kind::Mem { load: true, byte: true, rd: 1, rn: 0, .. } => {}
+        other => panic!("5C41 must be a byte load r1 <- [r0 + r1], got {:?}", other),
+    }
+    // 0x5801 = `ldr r1, [r0, r0]` — the WORD form of the same class (bit10 = 0).
+    let w = decode_thumb(0x5801, 0, 0x020F_6560, 2);
+    assert_eq!(w.text, "ldr r1, [r0, r0]");
+    match w.kind {
+        Kind::Mem { load: true, byte: false, rd: 1, rn: 0, .. } => {}
+        other => panic!("5801 must be a word load r1 <- [r0 + r0], got {:?}", other),
+    }
+    // Format 8 (bit9 set) is a different class and must not be confused with it.
+    assert_eq!(0x5C41 & 0x0200, 0, "fixture sanity: 5C41 is format 7");
+    assert_eq!(0x5E41 & 0x0200, 0x0200, "fixture sanity: 5E41 is format 8");
+
+    // Source-level lock for the C half (the include has no C harness, same
+    // honest option as classes 13/16 above): format 7 must be discriminated on
+    // bit9 and take B from bit10.
+    let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../tools/nnk_smc.inc");
+    let src = std::fs::read_to_string(&p)
+        .unwrap_or_else(|e| panic!("cannot read {}: {}", p.display(), e));
+    let arm = src
+        .find("/* formats 7/8 */")
+        .expect("regression: smc_exec_thumb lost its format 7/8 arm");
+    let end = src[arm..]
+        .find("format 9:")
+        .map(|i| arm + i)
+        .unwrap_or_else(|| (arm + 2400).min(src.len()));
+    let block = &src[arm..end];
+    assert!(
+        !block.contains("(hw >> 12) & 1u"),
+        "regression: the 0x5xxx arm is deriving B from bit12 again (always set)"
+    );
+    assert!(
+        block.contains("if (hw & 0x0200u) return 0;"),
+        "regression: format 7 and format 8 are no longer split on bit 9"
+    );
+    assert!(
+        block.contains("(hw >> 10) & 1u") && block.contains("r[(hw >> 3) & 7u] + r[ro]"),
+        "regression: LDR/STR/LDRB/STRB register-offset no longer uses B=bit10 and R[Ro]"
+    );
+}
