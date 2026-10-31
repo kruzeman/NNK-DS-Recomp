@@ -274,4 +274,9 @@ static void nnk_input_tick(void) { }
 
 #endif /* NNK_GX */
 
+/* Phase-4X: first-dispatch probe counter for the 0x029xxxxx band.  Declared
+ * here (included before run()) so the run-loop probe injected by
+ * tools/split_dispatch.py has a home outside the prelude injects. */
+static unsigned p4x_band_log;
+
 #endif /* NNK_INPUT_INC */

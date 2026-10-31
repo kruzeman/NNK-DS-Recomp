@@ -818,6 +818,14 @@ def main():
         fh.write("             * re-decode it from live RAM and skip the band switch. */\n")
         fh.write("            nnk_dma_tick();\n")
         fh.write("            nnk_input_tick();\n")
+        fh.write("            if (pc >= 0x02900000u && pc < 0x02A00000u && p4x_band_log < 24u) {\n")
+        fh.write("                p4x_band_log++;\n")
+        fh.write("                fprintf(stderr, \"p4x band: pc=0x%08X last=0x%08X r0=%08X \"\n")
+        fh.write("                        \"r1=%08X r2=%08X r3=%08X r5=%08X r12=%08X r13=%08X \"\n")
+        fh.write("                        \"r14=%08X step=%llu\\\\n\",\n")
+        fh.write("                        pc, last_pc, r[0], r[1], r[2], r[3], r[5], r[12],\n")
+        fh.write("                        r[13], r[14], (unsigned long long)steps);\n")
+        fh.write("            }\n")
         fh.write("            if (nnk_smc_try(&pc)) continue;\n")
         if ITCM_BAND in bands:
             # ITCM-resident code: band -1, below the flat window, dispatched

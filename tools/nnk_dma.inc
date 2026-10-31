@@ -259,7 +259,52 @@ static void p4u_timer_tick(void) {
         }
     }
 }
+/* Phase-4X: VBlank IRQ source (melonDS GPU::StartVBlank -> NDS.SetIRQ).
+ *
+ * BARRIER (Phase-4V stop-report, measured): from ~step 39M the guest runs a
+ * VCOUNT-poll main loop and does ZERO frame work — distinct PCs freeze at
+ * 15,542 — because nothing ever raises IF bit0 (VBlank).  The guest had ALREADY
+ * enabled the source: native IE=0x00000019 (VBlank bit0 + Timer0/1) with
+ * ime=1 at step 195,974,659 (p4r probe line), so delivery was armed and
+ * waiting on an IF bit that never came.
+ *
+ * melonDS ground truth (p4q_mel_io.txt, 6M-event IO capture):
+ *   W16 0x04000004 0x00000000 pc=0x02002AB0 ts=19,908,916   (DISPSTAT clear)
+ *   W16 0x04000004 0x00000008 pc=0x02002BB8 ts=19,909,621   (bit3 = VBlank IRQ EN)
+ *   first ack  W32 0x04000214 0x00000001 pc=0x01FF8038 ts=20,015,653
+ *   consecutive ack deltas 560,177..560,193 ts, median 560,190 = one frame
+ *   (2130 cycles/scanline x 263 scanlines) — the measured VBlank cadence.
+ * The runtime's `cycles` clock is in the same units (vcount() = cycles/2130
+ * % 263; gxd presents one frame per <192 -> >=192 edge), so the raise rides
+ * the same edge.  Semantics: at the edge into vc==192, IF bit0 raises iff
+ * DISPSTAT bit3 is set — exactly melonDS StartVBlank.  Gated to steps >
+ * 9,097,800 so the measured boot raise script (irq_raise_log) stays
+ * byte-exact for the strict-prefix verification (same gate as Phase-4U;
+ * the measured DISPSTAT enable itself happens far later, ~step 13.2M). */
+static uint32_t p4x_last_vc = 0xFFFFFFFFu;
+static unsigned p4x_vbl_n;
+static void p4x_vblank_tick(void) {
+    uint32_t vc;
+    if (steps <= 9097800u) return;
+    vc = vcount();
+    if (p4x_last_vc < 192u && vc >= 192u) {
+        if (dispstat & 0x8u) {              /* DISPSTAT bit3: VBlank IRQ EN */
+            iflags |= 1u;                   /* IRQ_VBlank, melonDS GPU */
+            p4x_vbl_n++;
+            if (p4x_vbl_n <= 4u || (p4x_vbl_n & 255u) == 0u) {
+                fprintf(stderr, "p4x: VBlank IRQ raise n=%u step=%llu cyc=%llu "
+                        "if=0x%08X ie=0x%08X ime=%u\n",
+                        p4x_vbl_n, (unsigned long long)steps,
+                        (unsigned long long)cycles, iflags, ie, ime);
+            }
+        }
+    }
+    p4x_last_vc = vc;
+}
+
 void nnk_dma_tick(void) {
+    /* Phase-4X: VBlank IF raise (edge into vc==192) before the delivery check. */
+    p4x_vblank_tick();
     /* Phase-4U: timer overflows may raise IF before the delivery check. */
     p4u_timer_tick();
     /* Phase-4Q: deliver a pending measured ARM7 IPC reply. */
@@ -405,8 +450,56 @@ static void nnk_ipc_tick(void);
 static void nnk_p4s_request(uint32_t v);
 static void nnk_p4s_tick(void);
 
+/* Phase-4X: the class-0x0B IPC request/reply handshake (measured).
+ *
+ * BARRIER (measured in both runs): at native step 38,987,833 the guest sends
+ * IPC words 0x0000002B then 0x81BA702B (pc 0x0200BAD4) and waits for the
+ * ARM7's answer; the native ARM7 shim had no model for it ("no measured
+ * reply in the melonDS capture" — the Phase-4Q table predates the long IO
+ * capture), so the mailbox receive never completes, every thread parks, and
+ * the card stream dies at step 38,981,422 (9,093 starts, last op B8).
+ *
+ * melonDS ground truth (p4q_mel_io.txt, the WHOLE 6M-event capture): exactly
+ * ONE handshake round — 6 sends at pc 0x0200BAD4, 5 replies 0x0000006B read
+ * at the mailbox loop pc 0x0200BB44:
+ *   send 0x0000002B        ts 50,484,317
+ *   send 0x81BA702B        ts 50,484,371   (parameter word: bit31 set)
+ *   recv 0x0000006B        ts 50,485,392   (+1,075 from the first send)
+ *   send 0x000000AB        ts 50,485,825   (+1,416 reply->send)
+ *   recv 0x0000006B        ts 50,487,241   (+1,416)
+ *   send 0x000001AB        ts 50,487,701   (+2,472)
+ *   recv 0x0000006B        ts 50,490,173   (+2,472)
+ *   send 0x000001AB        ts 50,491,108   (+3,331)
+ *   recv 0x0000006B        ts 50,494,439   (+3,331)
+ *   send 0x000001AB        ts 50,495,455   (+2,568)
+ *   recv 0x0000006B        ts 50,498,023   (+2,568)
+ * The exchange is strictly alternating (the guest sends the next request
+ * only after the previous reply), and (v & 0x1F) == 0x0B with bit31 clear
+ * marks the command words (the 0x81BA702B parameter carries bit31 and gets
+ * no reply of its own).  Modelled: one 0x6B reply per command at the
+ * measured per-exchange gap (first 5 exact, then 2,500 = the measured mean);
+ * nothing is faked — the guest's mailbox handler really receives the word.
+ * After the round melonDS's card stream resumes (B7s at ts 53M) and the
+ * overlay-resident display switch follows at ts 54,276,936 (pc 0x0207CB10). */
+static uint64_t nnk_p4b_at;
+static int nnk_p4b_pend;
+static const uint64_t nnk_p4b_gap[5] = { 1075u, 1416u, 2472u, 3331u, 2568u };
+static unsigned nnk_p4b_n;
+static void nnk_p4b_request(uint32_t v) {
+    uint64_t gap = nnk_p4b_n < 5u ? nnk_p4b_gap[nnk_p4b_n] : 2500u;
+    nnk_p4b_at = cycles + gap;
+    nnk_p4b_pend = 1;
+    nnk_p4b_n++;
+    if (nnk_p4b_n <= 8u)
+        fprintf(stderr, "p4b: class-0x0B request 0x%08X -> reply 0x0000006B in "
+                "%llu cycles step=%llu\n", v, (unsigned long long)gap,
+                (unsigned long long)steps);
+}
+
 void nnk_ipc_send(uint32_t v) {
     if ((v & 0x1Fu) == 7u) nnk_p4s_request(v);   /* Phase-4S: class-7 card req */
+    if ((v & 0x1Fu) == 0x0Bu && !(v & 0x80000000u))
+        nnk_p4b_request(v);                      /* Phase-4X: class-0x0B cmd */
     if (v == 0x80004046u) {
         nnk_ipc_reply_word = 0xC0204006u;
         nnk_ipc_reply_at = cycles + 2076u;   /* measured request->reply gap */
@@ -474,6 +567,20 @@ static void nnk_ipc_tick(void) {
             }
             memmove(nnk_p4r_q, nnk_p4r_q + 1,
                     (--nnk_p4r_qn) * sizeof nnk_p4r_q[0]);
+        }
+    }
+    /* Phase-4X: deliver the pending class-0x0B handshake reply. */
+    if (nnk_p4b_pend && cycles >= nnk_p4b_at) {
+        nnk_p4b_pend = 0;
+        if (arm9_recv_n < 16u) {
+            arm9_recv_fifo[arm9_recv_n++] = 0x0000006Bu;
+            iflags |= 0x00040000u;           /* IRQ_IPCRecv, as melonDS */
+            fprintf(stderr, "p4b: ARM7 -> 0x0000006B queued if=0x%08X "
+                    "ie=0x%08X ime=%u step=%llu cyc=%llu\n",
+                    iflags, ie, ime, (unsigned long long)steps,
+                    (unsigned long long)cycles);
+        } else {
+            nnk_p4b_pend = 1;                /* FIFO full: retry next dispatch */
         }
     }
 }
