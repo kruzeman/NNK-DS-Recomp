@@ -101,6 +101,22 @@ env NNK_ROM_PATH='Ni No Kuni.nds' NNK_GX=headless NNK_STEP_LIMIT=2300000000 \
 divergence at index none of 9691 compared*; melonDS's next start after native's
 last is `B7 0x0BB33A00` at ts 4,543,150,296.
 
+## 2b. Verification of the format-7 fix (branch code, rebuilt)
+
+Same image/recipe with the patched `tools/nnk_smc.inc` (rebuilt runtime,
+`out/split/p5l1`):
+
+```
+done steps=2256160152 distinct_pcs=21685 halt_pc=0x0207B218 halt=dispatch to untranslated pc
+```
+
+The run **passes `0x020F6560`** (no `smcfail` for it) and continues 392,145
+steps further, then stops on the *same class* at the next site:
+`0x0207B218`, distinct PCs 21,685 (was 21,524).  So format 7 was a real hole and
+the fix is measured, but the Mobiclip player has a chain of unrooted PCs; each
+one costs a ~10-minute run to reach, which is why this phase stops here with the
+chain named rather than fixed.
+
 ## 3. The picture (the goal)
 
 Frame 4000 (top screen) is the **Mobiclip Video Codec** splash:
