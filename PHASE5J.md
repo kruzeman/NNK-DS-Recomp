@@ -1,0 +1,160 @@
+# Phase-5J — the 0x020F5DF4 null return: the compiled `pop {..,pc}` dropped its target's state
+
+Follows Phase-5I (merged `4c0cd2e`).  The named barrier was follow-up barrier E:
+the `0x020F5C98`/`0x020F5CD4` frame returned 0 out of `0x020F5DF4` and the guest
+jumped to `0x00000000`.
+
+**Headline:** the null return is a *state-loss* consequence, and the first
+differing instruction is not in the frame at all — it is the compiled Thumb
+`pop {r3,r4,r5,r6,r7,pc}` at `0x020F5C88`, whose emitted code threw away the
+return address's state bit.  Four decode classes were fixed (12/13/14/15
+below); the run moves from step 40,768,913 to 42,038,854 and from 16,694 to
+18,252 distinct guest PCs.  The picture is still not there: the next barrier is
+named in §4.
+
+## 1. Root cause (measured, in order)
+
+### (a) first differing instruction: `0x020F5C88` (compiled) — the state bit
+
+Native trace (`NNK_TRACE_FROM=40755000`) around the frame:
+
+```
+0x020f5c84 0x020f5c86 0x020f5c88   <- Thumb, pop {r3,r4,r5,r6,r7,pc}
+0x020f5cc4 0x020f5cc8 0x020f5ccc 0x020f5cd0 0x020f5cd4 ... (+4 strides)
+```
+
+`0x020F5C88` is a *compiled* case (`work/phase3a/arm9_thumb_ovl_itcm_p4j.c`,
+`case 0x020F5C88u`), emitted as
+
+```c
+uint32_t _t = ld32(_a + 20u);
+pc = _t & ~1u;
+```
+
+i.e. the target's state bit is destroyed.  The image has **zero**
+`smc_branch_mode` calls: the compiled emitter never recorded interworking
+state, and the live re-decoder (Phase-5C/5D) is the only place that does.
+The popped word was `0x0207CAC4` (even — the ARM BLX at `0x0207CAC0` links
+`pc+4` with bit0 clear, melonDS `ARMInterpreter_Branch.cpp` A_BLX_REG).
+
+The live decoder then had to decode the unrooted target `0x020F5CC4` and had
+no state for it (`nnk_pc_is_thumb` = 0 because the map is derived from
+addr+2 fall-throughs and this case is not compiled; no register carried the
+tag; `smc_t_sticky` was stale):
+
+```
+smc: on-demand step=40768163 pc=0x020F5CC4 word=0xBDF81C20 state=arm sticky=0 -> 0x020F5CC8
+```
+
+`0xBDF81C20` is Thumb `adds r0,r4,#0` + `pop {..,pc}` and was executed as one
+ARM `ldrsh`, `npc = pc+4`.  That is the first *wrong* execution.
+
+### (b) the null return is downstream of the wrong state
+
+Running the frame in ARM state was self-consistent enough to survive until
+`sp` was overwritten by a Thumb halfword pair read as an ARM op:
+
+| step | site | ARM decode of Thumb bytes | effect |
+|---|---|---|---|
+| 40,768,164 | `0x020F5CE8` word `0x2001D001` (`beq`+`movs r0,#1`) | `andcs sp, r1, r1` (C=1) | `sp = r1 = 0x02E7FFF0` |
+| 40,768,712 | `0x020F5D0E` (`blx 0x020F83E8`) | runs with the clobbered sp | helper returns `0xFFFFFFFF` |
+| 40,768,901 | `0x020F5D18` `blt` (r0 < 0) | — | guest takes the "no object" path |
+| 40,768,912 | `0x020F5DF0` `movs r0,#0; add sp,#64` | — | **null return** |
+| 40,768,913 | `0x020F5DF4` `pop {r3,r4,r5,r6,r7,pc}` | — | pops the frame base, `pc = 0` |
+
+So the phase's "null return out of the frame" is the *symptom*: with the
+correct Thumb decode the same frame keeps `sp = 0x027E3B00 + 0x1C` and the
+`ldrb r0,[r4,#0x30]` flag is no longer 0.  (Register dump at `0x020F5DF4`,
+step 40,768,912: `r0=00000000 r13=02E80030`, entry `0x020F5CD4`
+`r13=027E3B00` — the pop frame the emitter built is nowhere near that sp.)
+
+## 2. The four classes fixed (all melonDS-derived, all locked)
+
+| # | class | site | old behaviour | fix |
+|---|---|---|---|---|
+| 12 | Thumb format 12 split: `1011 0000 0 imm7` ADD SP / `1011 0000 1 imm7` SUB SP | live decoder `nnk_smc.inc` | the whole `0xB000..0xB0FF` block was ADD, so every `sub sp,#imm` RAISED sp | bit7 selects the direction, both `imm7 << 2` |
+| 13 | compiled LDM/`pop {..,pc}` dropped the target's state bit | emitter `nnktool/src/recompile.rs` (`Kind::LdmStm`) | `pc = _t & ~1u;` only | emits `nnk_smc_note_branch(_t)` (`_t | 1u` / `_t & ~1u` for the one-register list) |
+| 14 | Thumb `pop {..,pc}` forced Thumb for **every** register list (Phase-5D over-generalisation) | live decoder POP arm | `smc_branch_mode(tv \| 1u)` | `raw = (cnt == 1u) ? (tv \| 1u) : tv` — melonDS `T_POP`: `if (cpu->Num==1) pc \|= 0x1; cpu->JumpTo(pc);` (ARM `A_LDM`: `if (Num==1) pc &= ~0x1`) |
+| 15 | the stale-band hook (`nnk_smc_try`) had **no** state resolution at all (Phase-4Z fixed only `nnk_smc_exec_any`) | live decoder | map + carried state only → unclassified PCs fell to ARM, which decodes Thumb bytes silently | same resolution as `exec_any` (register tag → last resolved state), and both hooks now stamp `smc_t_sticky` |
+
+The runtime half of class 13 is `void nnk_smc_note_branch(uint32_t raw)` in
+`tools/nnk_smc.inc` (non-static, declared in `nnk_rt.h` by
+`tools/split_dispatch.py`) and reuses the existing one-step-scoped
+`smc_branch_mode` carry, so an IRQ between the transfer and the next dispatch
+invalidates it.
+
+Problem: the image this branch runs is a Phase-4F build artifact and its ITCM
+sub-image + seed trace are no longer in the scratch cache, so it cannot be
+regenerated byte-for-byte (a fresh regeneration would also fold in every
+runtime change since Phase-4F).  `tools/p5j_note_branch.py` therefore splices
+**exactly the text the new emitter emits** into a copy of the image
+(`work/phase3a/arm9_thumb_ovl_itcm_p5j.c`, 3,068 LDM-pc sites, 28 of them
+one-register) — idempotent, `--check` reports the delta.  The emitter stays the
+source of truth for the next full regeneration.
+
+## 3. Result — measured on this branch
+
+| check | Phase-5I | now |
+|---|---|---|
+| run end (steps) | 40,768,913 | **42,038,854** |
+| distinct guest PCs | 16,694 | **18,252** |
+| halt | `0x020F5DF4` (pop → 0) | **`0x0207EA20`** (new, see §4) |
+| `0x020F5CC4` decode | ARM `ldrsh` (+4) | **Thumb `adds` → `0x020F5CC6`** |
+| `0x020F5CD4` frame | ARM-state replay, sp clobbered | **Thumb, `npc = 0x020F5CD6`** |
+| frames presented | 78 | 81 (still uniform) |
+
+Trace after the class-13/14 fix (`NNK_SMC_TRACE_FROM`, step 40,768,162):
+
+```
+smc: on-demand step=40768162 pc=0x020F5CC6 word=0x4B01BDF8 state=thumb sticky=1 -> 0x0207CAC4
+```
+
+i.e. the frame's own epilogue now returns to the ARM BLX caller with the popped
+word's state (ARM), instead of falling through the veneer at `0x020F5CC8`.
+
+Verification:
+
+```
+$ cd nnktool && cargo test
+test result: ok. 25 passed; 0 failed        # 23 -> 25 (classes 12/13/14/15)
+
+$ sh tools/verify_phase2a.sh
+1) strict common prefix        : 1000 / 1000 melonDS PCs (100.0%)
+2) window-filtered prefix      : 1000 / 1000 (window 0x02000000..0x02400000)
+3) in-order matched after resync: 1000 / 1000 melonDS PCs (100.0%)
+melonDS trace fully reproduced
+```
+
+Reproduce:
+
+```sh
+cd /home/hermes/NiNoKuni/worktrees/null-return && ln -sfn /home/hermes/NiNoKuni/work work
+python3 tools/p5j_note_branch.py work/phase3a/arm9_thumb_ovl_itcm_p5j.c   # idempotent
+NNK_GX=1 NNK_IMAGE_C=work/phase3a/arm9_thumb_ovl_itcm_p5j.c SPLIT_DIR=work/split/k \
+  bash tools/build_split.sh /home/hermes/NiNoKuni/out/split/p5j4
+env NNK_ROM_PATH='/home/hermes/NiNoKuni/Ni No Kuni.nds' NNK_GX=headless \
+  NNK_STEP_LIMIT=80000000 \
+  NNK_SMC_IMAGE="0x02000000:work/ghidra_src/arm9.bin,0x020C0000:work/phase3a/ovl_p4f4.bin" \
+  /home/hermes/NiNoKuni/out/split/p5j4 work/phase3a/arm9_stored_padded.bin
+```
+
+## 4. Next barrier (named) — barrier F, and the two named follow-ups
+
+**Barrier F — sp becomes 0 in the `0x0207EA20` frame** (step 42,038,854,
+`halt=dispatch to untranslated pc` with `pc=0x00000000`; halt state
+`r13=00000000 r14=00000000`, last traced PC `0x0207EA20`).  `distinct_pcs`
+grows by 1,456 PCs before it, so the run is exploring new code; the first thing
+to measure is the `sp` write between the last good frame and `0x0207EA20`
+(`NNK_DEBUG_AT_PC=0x0207EA20` plus the same trace-region diff).
+
+**Follow-up G (same class as 13, not yet emitted):** `bx`/`blx` register in a
+*compiled* case still drops the target state (only the LDM/`pop` form carries
+it now).  melonDS `JumpTo` takes bit0 there as well.
+
+**Follow-up H (same class as 15, named for completeness):** a compiled
+*static* branch (`b`/`beq`) that lands on an unrooted PC still carries no
+state — the target is only resolved because `smc_t_sticky` happens to hold the
+branch's own state.  A per-case state marker in the image (emitted by
+`nnktool`, consumed by `tools/split_dispatch.py` instead of the addr+2
+fall-through heuristic) would make `nnk_pc_is_thumb` exact for every compiled
+PC and retire the heuristic.
