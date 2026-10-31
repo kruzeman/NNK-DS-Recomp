@@ -342,7 +342,14 @@ static int smc_exec_arm(uint32_t pc, uint32_t w, uint32_t *npc, uint32_t *costp)
             int32_t so = (int32_t)(o << 6) >> 6;       /* sign-extend 26 bits */
             r[14] = pc + 4u;
             *npc = (pc + 8u + (uint32_t)so) & ~1u;
-            smc_branch_mode(*npc);            /* Phase-5C: BLX is ARM state */
+            /* Phase-5I: ARM-state BLX(1) SWITCHES TO THUMB (ARM ARM A7.1.4:
+             * "BLX <label> ... the T bit is set").  The old call tagged the
+             * target as ARM, so 0x0207CAC0 `blx 0x020F5C98` (word 0xFA01E474)
+             * ran the Thumb prologue `push {r3,r4,r5,r6,r7,lr}` as ARM
+             * 0x1C05B5F8, walked 4-byte steps to the Thumb pair
+             * `F754 EAC6` and branched to 0x012B39FC (the ARM reading of
+             * those bytes) — the run's first "untranslated pc". */
+            smc_branch_mode(*npc | 1u);
             *costp = 3;
             return 1;
         }
@@ -715,8 +722,17 @@ static int smc_exec_thumb(uint32_t pc, uint32_t *npc, uint32_t *costp) {
         rs = (hw >> 3) & 0xFu;
         switch ((hw >> 8) & 3u) {
         case 0:
-            if (rd == 15u) { *npc = (smc_reg(rd, pc, 1) + r[rs]) & ~1u; return 1; }
-            r[rd] = smc_reg(rd, pc, 1) + r[rs];
+            /* Phase-5I: BOTH operands go through smc_reg, so `add rd, pc`
+             * reads the PC (Thumb: (pc+4) & ~3) instead of the stale
+             * register slot r[15].  Measured at 0x020D24E0
+             * (`add r0, pc`, 0x4478): the old code used r[rs] = r[15] = 0,
+             * so the jump-table base became r[0]'s old value; the table
+             * load then returned 0 and the following `add pc, r0`
+             * (0x020D24E8) fell through into the table, walking straight
+             * into the 0x020D3250 halt stub. */
+            tv = smc_reg(rd, pc, 1) + smc_reg(rs, pc, 1);
+            if (rd == 15u) { *npc = tv & ~1u; return 1; }
+            r[rd] = tv;
             return 1;
         case 1: (void)smc_dp(10, smc_reg(rd, pc, 1), smc_reg(rs, pc, 1), 1); return 1;
         case 2: tv = smc_reg(rs, pc, 1);
@@ -762,7 +778,22 @@ static int smc_exec_thumb(uint32_t pc, uint32_t *npc, uint32_t *costp) {
         else   { if (B) st8(ea, r[rd]); else st32(ea, r[rd]); *costp = 3; }
         return 1;
     }
-    if ((hw & 0xF000u) == 0x8000u) {                 /* format 10: SP-relative */
+    if ((hw & 0xF000u) == 0x8000u) {                 /* format 8: LDRH/STRH imm5 */
+        /* Phase-5I: the immediate halfword form `1000 L imm5 Rn Rd` lives in
+         * 0x8000..0x8FFF and was swallowed by the format-10 SP-relative test
+         * below (mask 0xF000 == 0x8000), so `ldrh r0,[r0,#6]` executed as
+         * `ldr r0,[sp,#imm]`.  Measured at 0x020D24E2 inside the SDK card
+         * state machine: the guest's jump-table halfword came back as
+         * whatever sat at sp+0x300, the table index died, and `add pc, r0`
+         * walked the table into the 0x020D3250 halt stub. */
+        unsigned L = (unsigned)((hw >> 11) & 1u);
+        rd = hw & 7u;
+        ea = r[(hw >> 3) & 7u] + (((hw >> 6) & 0x1Fu) << 1);
+        if (L) { r[rd] = ld16(ea); *costp = 1; }
+        else   { st16(ea, (uint16_t)r[rd]); *costp = 3; }
+        return 1;
+    }
+    if ((hw & 0xF000u) == 0x9000u) {                 /* format 10: SP-relative */
         unsigned L = (unsigned)((hw >> 11) & 1u);
         rd = (hw >> 8) & 7u;
         ea = r[13] + ((hw & 0xFFu) << 2);
@@ -952,7 +983,16 @@ int nnk_smc_exec_any(uint32_t *pcp) {
         rc = smc_exec_thumb(pc, &npc, &cost);
         if (rc) { smc_nfb++; thumb = 1; }
     }
-    if (!rc) return 0;
+    if (!rc) {
+        /* Phase-5I diagnostic: name the exact word/state a live-decode failure
+         * happens on (NNK_SMC_FAILLOG=1).  The generic "dispatch to untranslated
+         * pc" line names the PC but not which decoder ran or what bytes it saw. */
+        const char *fl = getenv("NNK_SMC_FAILLOG");
+        if (fl && fl[0])
+            fprintf(stderr, "smcfail pc=0x%08X word=0x%08X thumb_try=%d hw0=0x%04X hw1=0x%04X\n",
+                    pc, w, thumb, (unsigned)(w & 0xFFFFu), (unsigned)((w >> 16) & 0xFFFFu));
+        return 0;
+    }
     smc_t_sticky = thumb;                 /* Phase-4Z: the T bit this pc resolved to */
     smc_ninsn++;
     card_tick(cost);

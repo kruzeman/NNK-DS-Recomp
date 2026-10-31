@@ -597,3 +597,95 @@ fn runtime_smc_redecoder_aligns_the_thumb_blx_base() {
         "regression: the unaligned Thumb BL/BLX base came back"
     );
 }
+
+// ---------------------------------------------------------------- class 9 ---
+// Thumb format-5 `ADD rd, pc` must read the PC, not the r[15] register slot
+// (Phase-5I).
+//
+// The Rust emitter already reads R15 as (addr+4) (`reg_c_t`), so the compiled
+// cases were right; only the live C re-decoder was wrong.  `add r0, pc`
+// (0x4478 at 0x020D24E0) took its second operand straight out of `r[15]`,
+// which the runtime never maintains (it stays 0), so the result was the stale
+// r0 instead of the literal base 0x020D24EA.  The halfword load through
+// `ldrh r0,[r0,#6]` then returned 0, and `add pc, r0` (0x4487 at 0x020D24E8)
+// fell through into the jump-table data at 0x020D24EA and walked it as code
+// until it reached the unconditional `bl 0x020090D8` halt stub at 0x020D3250.
+// melonDS, with r0 = 0xE8, branches to case 3 (0x020D25D4) and the card state
+// machine re-arms the block read (#9093, B7 0x0DA44600).
+#[test]
+fn runtime_smc_redecoder_reads_pc_in_thumb_format5_add() {
+    // Rust side: the fixture must stay `add r0, pc` with rm = 15 (the operand
+    // that has to be PC-sourced), so the C guard below is about a real site.
+    let insn = decode_thumb(0x4478, 0x0000, 0x020D_24E0, 4);
+    match insn.kind {
+        Kind::Dp { rd: 0, rn: 0, ref src, .. } => match *src {
+            Operand::Reg { rm, .. } => assert_eq!(
+                rm, 15,
+                "4478 at 0x020D24E0 is `add r0, pc` (binutils); rm must be 15"
+            ),
+            ref other => panic!("4478 source must be Reg(15), got {:?}", other),
+        },
+        other => panic!("4478 must stay a data-processing ADD, got {:?}", other),
+    }
+
+    // C side: format-5 case 0 must source BOTH operands through smc_reg.
+    let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../tools/nnk_smc.inc");
+    let src = std::fs::read_to_string(&p)
+        .unwrap_or_else(|e| panic!("cannot read {}: {}", p.display(), e));
+    let fmt5 = src
+        .find("format 5: hi-reg / BX")
+        .expect("regression: smc_exec_thumb lost its format-5 (hi-reg/BX) arm");
+    let block = &src[fmt5..(fmt5 + 1400).min(src.len())];
+    assert!(
+        block.contains("smc_reg(rd, pc, 1) + smc_reg(rs, pc, 1)"),
+        "regression: Thumb format-5 ADD no longer reads its source through smc_reg (R15 must be PC)"
+    );
+    assert!(
+        !block.contains("+ r[rs]"),
+        "regression: Thumb format-5 ADD reads r[15]'s slot again (ADD rd, pc gives the stale value)"
+    );
+}
+
+// --------------------------------------------------------------- class 10 ---
+// Thumb format 8 (LDRH/STRH, immediate) must not be matched as format 10
+// (LDR/STR, SP-relative) (Phase-5I).
+//
+// Both live in 0x8xxx and the old format-10 test was `(hw & 0xF000) == 0x8000`,
+// so `ldrh r0,[r0,#6]` (0x88C0, measured at 0x020D24E2) executed as
+// `ldr r0,[sp,#imm]` and returned whatever sat at sp+0x300.  The guest's
+// jump-table index then died and the following `add pc,r0` walked the
+// halfword data at 0x020D24EA as code into the 0x020D3250 halt stub.
+#[test]
+fn runtime_smc_redecoder_splits_the_thumb_imm_halfword_form() {
+    // Rust fixture: 0x88C0 = `ldrh r0, [r0, #6]` (binutils), not SP-relative.
+    let insn = decode_thumb(0x88C0, 0x0000, 0x020D_24E2, 4);
+    match insn.kind {
+        Kind::Hw { kind: HwKind::Ldrh, rd: 0, rn: 0, ref ea } => match *ea {
+            Ea::Imm { off: 6, .. } => {}
+            ref other => panic!("88C0 must keep its #6 halfword offset, got {:?}", other),
+        },
+        other => panic!("88C0 must stay a halfword load from r0, got {:?}", other),
+    }
+
+    let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../tools/nnk_smc.inc");
+    let src = std::fs::read_to_string(&p)
+        .unwrap_or_else(|e| panic!("cannot read {}: {}", p.display(), e));
+    assert!(
+        src.contains("(hw & 0xF000u) == 0x9000u) {                 /* format 10: SP-relative */")
+            || src.contains("(hw & 0xF000u) == 0x9000u) { /* format 10: SP-relative */"),
+        "regression: the C re-decoder's SP-relative arm no longer masks 0x9000 (0x8xxx halfword forms are swallowed again)"
+    );
+    assert!(
+        src.contains("/* format 8: LDRH/STRH imm5 */"),
+        "regression: the C re-decoder lost its Thumb immediate halfword load/store arm"
+    );
+    // The halfword offset is imm5*2, and stores must use st16.
+    let fmt8 = src
+        .find("/* format 8: LDRH/STRH imm5 */")
+        .expect("format 8 arm missing");
+    let block = &src[fmt8..(fmt8 + 800).min(src.len())];
+    assert!(
+        block.contains("(((hw >> 6) & 0x1Fu) << 1)") && block.contains("ld16(ea)"),
+        "regression: the Thumb immediate halfword arm no longer reads a 16-bit element (imm5 scaled by 2)"
+    );
+}
