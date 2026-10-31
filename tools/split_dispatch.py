@@ -433,9 +433,19 @@ def main():
     # nnktool/src/recompile.rs carries for the next regeneration).  Each
     # anchor must match EXACTLY once or the split dies: a silently missing
     # hook would leave the store-only class in place.
+    _vrc_modern = any("static int vrc_in(uint32_t a)" in l for l in prelude)
     def inject(lines_, needle, repl, what):
         hits = [i for i, l in enumerate(lines_) if needle in l]
         if len(hits) != 1:
+            # Modern nnktool images embed the VRAMCNT model (vrc_*) and the IO
+            # delegations directly (recompile.rs is authoritative since
+            # Phase-4M); the splices below only exist for older pre-generated
+            # images.  Skip the vramcnt-family splice when its anchor is absent
+            # on such an image instead of dying — the semantics are already there.
+            if (not hits and _vrc_modern
+                    and ("nnk_vrc_" in repl or "vramcnt" in repl or "powerctl" in repl
+                         or "irq_trig" in repl or "card_end_pending" in repl)):
+                return list(lines_)
             die("Phase-4M: %s anchor %r matched %d lines"
                 % (what, needle, len(hits)))
         out = list(lines_)
@@ -568,12 +578,16 @@ def main():
     # and the whole card stream froze after 1398 B7 starts (Phase-4T, measured
     # against p4q_mel_io.txt: melonDS continues streaming to 2279 B7 starts).
     # The generated image already carries the correct line; it stays verbatim.
-    prelude = inject(prelude,
-                     "    card_next = CARD_NEVER; card_end_pending = 0;",
-                     "    card_next = CARD_NEVER; card_end_pending = 0;\n"
-                     "    if (spicnt & (1u << 14)) iflags |= 0x00080000u;"
-                     "   /* ROMEndTransfer: IRQ_CartXferDone */",
-                     "card transfer-done IRQ raise")
+    if not any("iflags |= 0x00080000u" in l for l in prelude):
+        # Modern images already emit the ROMEndTransfer IRQ_CartXferDone raise;
+        # re-splicing it would duplicate the line and break the card-trace
+        # anchor below (which must match exactly once).
+        prelude = inject(prelude,
+                         "    card_next = CARD_NEVER; card_end_pending = 0;",
+                         "    card_next = CARD_NEVER; card_end_pending = 0;\n"
+                         "    if (spicnt & (1u << 14)) iflags |= 0x00080000u;"
+                         "   /* ROMEndTransfer: IRQ_CartXferDone */",
+                         "card transfer-done IRQ raise")
     prelude = inject(prelude,
                      "        else if (!irq_active && irq_trig_n < IRQ_TRIG_N"
                      " && steps > irq_trig_log[irq_trig_n]",
