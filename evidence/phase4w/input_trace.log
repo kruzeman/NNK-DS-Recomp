@@ -1,0 +1,21 @@
+step=1 install: SDL event filter active (windowed); key events are consumed here and written through gxd_set_keymask
+step=1 schedule: 6 injection event(s) armed
+step=1 map: arrows=D-pad X=A Z=B S=DS-X A=DS-Y Q=L W=R Return=Start RShift/Backspace=Select
+step=17580000 inject SDL_KEYDOWN scancode=X frame=36
+step=17580000 key X             down -> DS A      mask=0xFFE EXTKEYIN=0x7F
+step=17586697 guest KEYINPUT read #1 val=0x03FE frame=36
+step=17586751 guest KEYINPUT read #2 val=0x03FE frame=36
+step=17586815 guest KEYINPUT read #3 val=0x03FE frame=36
+step=17590000 inject SDL_KEYUP scancode=X frame=36
+step=17590000 key X             up   -> DS A      mask=0xFFF EXTKEYIN=0x7F
+step=18556000 inject SDL_KEYDOWN scancode=W frame=38
+step=18556000 key W             down -> DS R      mask=0xEFF EXTKEYIN=0x7F
+step=18557557 guest KEYINPUT read #4 val=0x02FF frame=38
+step=18560701 guest KEYINPUT read #5 val=0x02FF frame=38
+step=18561000 inject SDL_KEYUP scancode=W frame=38
+step=18561000 key W             up   -> DS R      mask=0xFFF EXTKEYIN=0x7F
+step=20000000 inject SDL_KEYDOWN scancode=S frame=40
+step=20000000 key S             down -> DS X      mask=0xBFF EXTKEYIN=0x7E
+step=20100000 inject SDL_KEYUP scancode=S frame=40
+step=20100000 key S             up   -> DS X      mask=0xFFF EXTKEYIN=0x7F
+step=27371209 release-all (focus lost): mask=0xFFF EXTKEYIN=0x7F
