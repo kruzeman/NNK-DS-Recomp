@@ -781,21 +781,32 @@ static int smc_exec_thumb(uint32_t pc, uint32_t *npc, uint32_t *costp) {
         r[rd] = ld32(((pc + 4u) & ~3u) + ((hw & 0xFFu) << 2));
         return 1;
     }
-    if ((hw & 0xF000u) == 0x5000u) {                 /* formats 7/8/9 */
-        unsigned L = (unsigned)((hw >> 11) & 1u);
-        unsigned B = (unsigned)((hw >> 12) & 1u);
-        rd = hw & 7u;
-        base = r[(hw >> 3) & 7u];
-        if (hw & 0x0800u) {                          /* 0101 R: register offset */
-            unsigned ro = (unsigned)((hw >> 6) & 0x1Fu);
-            ea = base + ((hw & 0x0400u) ? r[ro] : ro);
-        } else {                                     /* 011: immediate offset */
-            ea = base + (((hw >> 6) & 0x1Fu) << 2);
-            B = (unsigned)((hw >> 12) & 1u);
+    if ((hw & 0xF000u) == 0x5000u) {                 /* formats 7/8 */
+        /* Phase-5L: the discriminator between format 7 (`0101 L B 0 Ro Rb Rd`,
+         * LDR/STR/LDRB/STRB with REGISTER offset) and format 8 (`0101 H S 1
+         * Ro Rb Rd`, halfword/signed with register offset) is bit 9 (0x0200),
+         * and B (byte) is bit10 — NOT bit12, which is part of the 0x5 prefix
+         * and therefore always 1 in this whole block.  The old arm derived
+         * B/L from bit12/bit11, scaled the offset as an imm5 when bit11 was
+         * clear, and then did `if (hw & 0x1000u) return 0;` — i.e. it refused
+         * EVERY 0x5xxx word (bit12 is always set), so the live decoder could
+         * not execute a plain `ldrb r1,[r0,r1]` at all.  Measured at
+         * 0x020F6560 inside the Mobiclip player (word 0x1C025C41,
+         * smcfail hw0=0x5C41 hw1=0x1C02): the run halted 2,255,768,127 steps
+         * in with `dispatch to untranslated pc`.  Format 7 is implemented
+         * here exactly as nnktool/src/decode.rs (bit9 test, B=bit10, offset
+         * R[Ro], no shift); format 8 still returns 0 so an unimplemented
+         * halfword form halts honestly instead of executing as a word. */
+        if (hw & 0x0200u) return 0;                  /* format 8: signed/half */
+        {
+            unsigned L = (unsigned)((hw >> 11) & 1u);
+            unsigned B = (unsigned)((hw >> 10) & 1u);
+            unsigned ro = (unsigned)((hw >> 6) & 7u);
+            rd = hw & 7u;
+            ea = r[(hw >> 3) & 7u] + r[ro];
+            if (L) { r[rd] = B ? ld8(ea) : ld32(ea); *costp = 1; }
+            else   { if (B) st8(ea, r[rd]); else st32(ea, r[rd]); *costp = 3; }
         }
-        if (hw & 0x1000u) return 0;                  /* format 8: signed/half */
-        if (L) { r[rd] = B ? ld8(ea) : ld32(ea); *costp = 1; }
-        else   { if (B) st8(ea, r[rd]); else st32(ea, r[rd]); *costp = 3; }
         return 1;
     }
     if ((hw & 0xE000u) == 0x6000u) {                 /* format 9: LDR/STR/LDRB/STRB imm5 */
