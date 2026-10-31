@@ -919,11 +919,123 @@ fn thumb_format7_register_offset_byte_load() {
         "regression: the 0x5xxx arm is deriving B from bit12 again (always set)"
     );
     assert!(
-        block.contains("if (hw & 0x0200u) return 0;"),
+        block.contains("if (hw & 0x0200u) {"),
         "regression: format 7 and format 8 are no longer split on bit 9"
     );
     assert!(
         block.contains("(hw >> 10) & 1u") && block.contains("r[(hw >> 3) & 7u] + r[ro]"),
         "regression: LDR/STR/LDRB/STRB register-offset no longer uses B=bit10 and R[Ro]"
+    );
+}
+
+// --------------------------------------------------------------- class 17 ---
+// Thumb format 8 (`0101 H S 1 Ro Rb Rd`) — STRH/LDRSB/LDRH/LDRSH with
+// REGISTER offset.  Phase-5L deliberately left this arm as `return 0` so an
+// unimplemented halfword form halted honestly; Phase-5M implements it so the
+// Mobiclip player's register-offset halfword accesses execute from live RAM.
+// The 4 (H,S) combinations are the whole class; bit 9 is the discriminator
+// against format 7, bit 11 = H and bit 10 = S.
+#[test]
+fn thumb_format8_register_offset_halfword_and_signed() {
+    for (hw, text, kind) in [
+        (0x5241u16, "strh r1, [r0, r1]", HwKind::Strh),
+        (0x5641, "ldrsb r1, [r0, r1]", HwKind::Ldrsb),
+        (0x5A41, "ldrh r1, [r0, r1]", HwKind::Ldrh),
+        (0x5E41, "ldrsh r1, [r0, r1]", HwKind::Ldrsh),
+    ] {
+        // fixture sanity: every one of these is format 8 (bits 15..12 = 0101,
+        // bit 9 set) with H = bit11, S = bit10.
+        assert_eq!(hw & 0xF000, 0x5000, "fixture sanity: {hw:04X} is 0101 H S 1");
+        assert_eq!(hw & 0x0200, 0x0200, "fixture sanity: {hw:04X} is format 8");
+        let o = decode_thumb(hw, 0, 0x0207_B218, 2);
+        assert_eq!(o.text, text, "decode text for {hw:04X}");
+        match o.kind {
+            Kind::Hw { kind: got, rd: 1, rn: 0, .. } => assert_eq!(got, kind, "{hw:04X} kind"),
+            other => panic!("{hw:04X} must be Kind::Hw {kind:?}, got {other:?}"),
+        }
+    }
+
+    // Source-level lock for the C half: the 0x5xxx arm must no longer bail on
+    // bit 9 and must take H from bit11 / S from bit10.
+    let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../tools/nnk_smc.inc");
+    let src = std::fs::read_to_string(&p)
+        .unwrap_or_else(|e| panic!("cannot read {}: {}", p.display(), e));
+    let arm = src
+        .find("/* formats 7/8 */")
+        .expect("regression: smc_exec_thumb lost its format 7/8 arm");
+    let end = src[arm..]
+        .find("format 9:")
+        .map(|i| arm + i)
+        .unwrap_or_else(|| (arm + 3200).min(src.len()));
+    let block = &src[arm..end];
+    assert!(
+        block.contains("unsigned H = (unsigned)((hw >> 11) & 1u);")
+            && block.contains("unsigned S = (unsigned)((hw >> 10) & 1u);"),
+        "regression: format 8 no longer derives H/S from bits 11/10"
+    );
+    assert!(
+        !block.contains("if (hw & 0x0200u) return 0;"),
+        "regression: format 8 is refused again instead of decoded"
+    );
+    assert!(
+        block.contains("(uint32_t)(int32_t)(int16_t)ld16(ea)")
+            && block.contains("(uint32_t)(int32_t)(int8_t)ld8(ea)"),
+        "regression: the signed halfword/byte loads lost their sign extension"
+    );
+}
+
+// --------------------------------------------------------------- class 18 ---
+// The on-demand decode hook must cover the ITCM window as well as main RAM.
+// Phase-5M, measured at step 2,256,160,152: the Mobiclip player's `blx r1` at
+// 0x0207B218 (word 0xE12FFF31, melonDS disassembly `blx r1`) called
+// 0x01FF8540 — an ITCM address.  The band dispatch routed it to the compiled
+// nnk_part_itcm, that part has no case for it (its rooted ITCM range ends at
+// 0x01FF8520's `pop {..,pc}`), so rc==0 and the run fell into
+// nnk_smc_exec_any, which refused every PC outside 0x02000000.. only and
+// halted with `untranslated pc=0x01ff8540`.  The ITCM array is live guest
+// state (the guest loads it at boot; ld16/ld32/st16/st32 already bind it), so
+// the same live decoder must be able to execute from it.
+#[test]
+fn runtime_live_decoder_covers_the_itcm_window() {
+    // The two windows are disjoint and the measured halt PC is inside ITCM.
+    const IMAGE_LOAD: u32 = 0x0200_0000;
+    const ITCM_LO: u32 = 0x01FF_8000;
+    const ITCM_HI: u32 = 0x0200_0000;
+    const ITCM_PHYS: u32 = 0x8000;
+    assert!(ITCM_LO < ITCM_HI && ITCM_HI <= IMAGE_LOAD);
+    assert!((ITCM_LO..ITCM_HI).contains(&0x01FF_8540));
+    assert_eq!(0x01FF_8540 - ITCM_LO, 0x540, "offset inside the 32 KiB array");
+    assert!(0x540 + 4 <= ITCM_PHYS);
+
+    // The Band-1 helper the dispatch uses must agree with these constants.
+    let rp = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../nnktool/src/recompile.rs");
+    let rs = std::fs::read_to_string(&rp).unwrap_or_else(|e| panic!("cannot read {}: {}", rp.display(), e));
+    for needle in [
+        "#define ITCM_LO 0x01FF8000u",
+        "#define ITCM_HI 0x02000000u",
+        "#define ITCM_PHYS 0x8000u",
+    ] {
+        assert!(rs.contains(needle), "regression: {needle} changed in the runtime prelude");
+    }
+
+    // Source-level lock for the C hook (no C harness, same honest option as
+    // classes 13/16/17).
+    let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../tools/nnk_smc.inc");
+    let src = std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("cannot read {}: {}", p.display(), e));
+    let f = src
+        .find("int nnk_smc_exec_any(uint32_t *pcp)")
+        .expect("regression: the on-demand hook disappeared");
+    let end = src[f..]
+        .find("smc_mode_done")
+        .map(|i| f + i)
+        .unwrap_or_else(|| (f + 2400).min(src.len()));
+    let block = &src[f..end];
+    assert!(
+        block.contains("pc >= ITCM_LO && pc < ITCM_HI"),
+        "regression: the on-demand hook is back to main RAM only (ITCM PCs halt)"
+    );
+    assert!(
+        block.contains("itcm + (pc & (ITCM_PHYS - 1u))"),
+        "regression: ITCM live decoding no longer reads the guest-owned itcm array"
     );
 }

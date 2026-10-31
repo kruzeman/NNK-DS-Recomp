@@ -46,7 +46,7 @@ pub enum Ea {
     },
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HwKind {
     Strh,
     Ldrh,
