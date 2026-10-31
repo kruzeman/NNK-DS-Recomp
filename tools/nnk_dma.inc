@@ -201,7 +201,67 @@ static void nnk_dma_card(int i) {
     }
 }
 
+/* Phase-4U: timer-overflow IRQ raise (melonDS NDSTimer::Run -> NDS.SetIRQ).
+ *
+ * MEASURED (p4q_mel_io.txt vs p4t_run60b.err): melonDS delivers 5,779
+ * IRQ_Timer1 acks (W32 0x04000214 0x00000010 at the ITCM stub 0x01FF8038,
+ * first at ts 29,302,442, steady period 268,939 ts) plus 376 Timer0/2 acks,
+ * while native delivers ZERO timer IF bits after step 9,097,800 — the
+ * runtime's only iflags sources were the measured irq_raise_log (ends at
+ * step 9,097,800), ROMEndTransfer (bit19) and the scripted IPC replies
+ * (bit18).  Native IF values in the whole run: 0x00000000/0x00040000/
+ * 0x00080000/0x00080008/0x000C0000 — never bit4.
+ *
+ * BARRIER (Phase-4U): after the last common card read (B7 #1556,
+ * 0x0DA6C400 at native step 23,486,383 / melon ts 35,250,160) the SDK
+ * ready-thread queue (linked list from *(0x0206C684+0x24), state at
+ * node+0x64, walked at pc 0x02006E80) drains C770 -> EA48 -> F540 and then
+ * finds ONLY the idle node 0x0206C6B0 ready (native step 23,494,370): the
+ * guest arms TM1 (pc 0x0200850C/8514) and parks in WFI at 0x02009118
+ * forever, while melonDS's armed Timer1 fires 128 ts later (IF=0x00280010,
+ * acked at ts 35,263,214) and the driver goes on to issue B7 #1557
+ * (0x0DA6C600) at ts 35,272,550.
+ *
+ * Model: overflow of an enabled timer with its IRQ bit set raises
+ * IF bit (3+channel), exactly melonDS NDSTimer::Run.  Latched on the enable
+ * edge in cycles; period = 0x10000 - reload (melonDS reloads RELOAD on
+ * overflow).  Gated to steps > 9,097,800 so the measured boot raise script
+ * (irq_raise_log) stays byte-exact for the strict-prefix verification. */
+static uint64_t p4u_tm_base[4];
+static uint64_t p4u_tm_ovf[4];
+static uint8_t p4u_tm_on[4];
+static void p4u_timer_tick(void) {
+    int t;
+    if (steps <= 9097800u) return;
+    for (t = 0; t < 4; t++) {
+        uint32_t ctrl = tm_ctrl[t];
+        if (!(ctrl & 0x80u)) { p4u_tm_on[t] = 0; continue; }
+        if (!p4u_tm_on[t]) {
+            p4u_tm_on[t] = 1;
+            p4u_tm_base[t] = cycles;
+            p4u_tm_ovf[t] = 0;
+            continue;
+        }
+        if (!(ctrl & 0x40u)) continue;
+        {
+            unsigned shift = (ctrl & 3u) == 0 ? 0u
+                          : ((ctrl & 3u) == 1 ? 6u
+                          : ((ctrl & 3u) == 2 ? 8u : 10u));
+            uint32_t period = 0x10000u - tm_reload[t];
+            uint64_t ticks, ovf;
+            if (!period) period = 0x10000u;
+            ticks = (cycles - p4u_tm_base[t]) >> shift;
+            ovf = ticks / period;
+            if (ovf > p4u_tm_ovf[t]) {
+                p4u_tm_ovf[t] = ovf;
+                iflags |= 1u << (3 + t);
+            }
+        }
+    }
+}
 void nnk_dma_tick(void) {
+    /* Phase-4U: timer overflows may raise IF before the delivery check. */
+    p4u_timer_tick();
     /* Phase-4Q: deliver a pending measured ARM7 IPC reply. */
     nnk_ipc_tick();
     /* Phase-4Q probe: the IE write history.  At the barrier native held
