@@ -110,6 +110,27 @@ ts 2.16B) logs **no hit** — the reference never reaches that helper.
 
 No decoder/CPU-semantics change, so the cargo suite stays at **21 passed**.
 
+### 4b. Negative result: the timer-IRQ producer (tried, measured, reverted)
+
+The IE mask is programmed through `os_irqEnable` (`0x020060B4`); `NNK_DEBUG_AT_PC=0x020060B4`
+with `NNK_DEBUG_N=300` (`p5f/dbg.err`, 111 calls in 30M steps) shows the *last*
+calls are `r0=0x00000010` (bit 4 = **Timer 1**) every ~200k steps, returning to
+`0x0200851C` — i.e. the guest's wait loop is a *timer* wait.  melonDS agrees:
+8,303 of its 25,232 WFI wakes carry `enabled=0x00000010`.
+
+So a timer-overflow producer (IF bits 3..6, sharing the TMxVAL read model's own
+wrap points, spliced the same way) was implemented and measured
+(`out/split/p5f_t`, `p5f/t.err`): it fires bit 4 (265 deliveries vs 263) but the
+run is **slightly worse** — the card stream stops at step 35,487,542 (vs
+35,8xx/39.0M baseline), `distinct_pcs` 16,444 (vs 16,447), still ends at
+`0x02009118` with 113 uniform frames.  Reverted: it perturbs the guest without
+removing the barrier, and shipping an uncharacterised behaviour change would
+violate the strict-prefix/honesty rules.  The finding that matters is recorded
+here: **the guest enables Timer 1 and never sees it run** (TM1CNT reads 0 at the
+halt probe while IE bit 4 is enabled — `p5f/p2.err` `tm=…/0x000000C1/0x0000EFA3/0x00000000`),
+so the next worker should compare TM0CNT/TM1CNT with melonDS at
+`ts≈56.5M` before re-attempting the producer.
+
 ## 5. Finite replay tables still in the runtime (the starvation inventory)
 
 | table | where | last entry | what starves |
