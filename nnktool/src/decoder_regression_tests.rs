@@ -296,12 +296,25 @@ fn runtime_smc_redecoder_keeps_its_bx_case_before_the_dp_catchall() {
         bx < dp,
         "regression: BX/BLX(reg) case now sits AFTER the data-processing catch-all"
     );
-    // BLX must link pc+4|1 (ARM-state, 4-byte instruction) exactly like the
-    // emitter's Kind::Bx arm.
+    // BLX (register) must link an EVEN pc+4.  melonDS A_BLX_REG
+    // (src/ARMInterpreter_Branch.cpp:57) does `u32 lr = R[15]-4; JumpTo(Rm);
+    // R[14] = lr;` - R[15] is pc+8 in ARM state, so lr == pc+4 with no
+    // interworking bit.  Phase-5D measured the old `| 1u` form: the decryptor
+    // stub at 0x0215AC1C (`E12FFF3C blx r12`) pushed an LR of 0x0215AC21, and
+    // the helper's `pop {pc}` therefore re-entered the ARM code at
+    // 0x0215AC20 (`E1A02005 mov r2,r5`) in Thumb state.
     let block = &src[bx..dp];
     assert!(
-        block.contains("r[14] = (pc + 4u) | 1u;"),
-        "regression: smc BLX(register) no longer links pc+4|1"
+        block.contains("if (link) r[14] = pc + 4u;"),
+        "regression: smc BLX(register) no longer links an even pc+4"
+    );
+    assert!(
+        !block.contains("| 1u;"),
+        "regression: smc BLX(register) tags the ARM caller's LR with bit0 again"
+    );
+    assert!(
+        block.contains("smc_branch_mode(tgt);"),
+        "regression: ARM bx/blx rM no longer carries the target's state"
     );
 }
 
@@ -478,5 +491,53 @@ fn runtime_smc_redecoder_carries_the_blx_state() {
         src.contains("steps != smc_t_step + 1ull"),
         "regression: the carried state is no longer one-step-scoped — a loop \
          revisiting the same target would inherit a stale state"
+    );
+}
+
+#[test]
+fn runtime_smc_redecoder_interworks_on_ldm_pc_and_links_arm_blx_even() {
+    // Phase-5D, class 7: the ARM9's *data-dependent* interworking.  Ground
+    // truth is melonDS itself (the project's reference implementation):
+    //   src/ARM.cpp:729 JumpTo(): `if (addr & 0x1) { ... CPSR |= 0x20; }`
+    //   src/ARMInterpreter_LoadStore.cpp:464 A_LDM: `JumpTo(pc, ...)` for a
+    //     PC in the register list -> the loaded word's bit0 selects the state
+    //   src/ARMInterpreter_LoadStore.cpp:95..121 A_LDR0/A_LDR_POST:
+    //     `if (Num==1) val &= ~0x1;` -> ARM9 LDR-into-PC does NOT interwork
+    //   src/ARMInterpreter_ALU.cpp:321/336 data-processing into PC:
+    //     `JumpTo(res & ~1)` -> no interworking
+    //   src/ARMInterpreter_LoadStore.cpp:745 A_POP: `if (Num==1) pc |= 0x1`
+    //     -> Thumb pop{pc} always continues in Thumb
+    //   src/ARMInterpreter_Branch.cpp:57 A_BLX_REG:
+    //     `u32 lr = R[15]-4; ... R[14] = lr;` -> LR = pc+4, bit0 CLEAR
+    // Both halves are measured on this ROM: melonDS executes 0x020D241C /
+    // 0x020D241E as Thumb (2-byte strides after the ARM helper's `pop {pc}`
+    // at 0x020E79A8 returns 0x020D241D), while the pre-Phase-5D runtime kept
+    // ARM state there and decoded the Thumb `blx 0x0204D3D0` at 0x020D2420 as
+    // an ARM `svc 0xD6F77A` (halt, step 39,237,994).
+    let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../tools/nnk_smc.inc");
+    let src = std::fs::read_to_string(&p)
+        .unwrap_or_else(|e| panic!("cannot read {}: {}", p.display(), e));
+    // (1) the ARM LDM with PC in the list carries the loaded word's state
+    assert!(
+        src.contains("if (i == 15u) { *npc = lv & ~1u; smc_branch_mode(lv); }"),
+        "regression: an ARM `pop/LDM {{..,pc}}` no longer interworks on the loaded word"
+    );
+    // (2) ARM BLX (register) must link an EVEN pc+4 — the `| 1u` form tagged
+    //     an ARM caller's return address Thumb (measured: 0x0215AC21).
+    assert!(
+        src.contains("if (link) r[14] = pc + 4u;"),
+        "regression: ARM BLX (register) links a Thumb-tagged LR again"
+    );
+    // (the block-scoped negative lock lives in
+    // runtime_smc_redecoder_keeps_its_bx_case_before_the_dp_catchall)
+    // (3) the forms melonDS does NOT interwork on must stay masked
+    assert!(
+        src.contains("if (rd == 15u) *npc = tv & ~1u;"),
+        "regression: an ARM LDR into PC started interworking (melonDS masks bit0)"
+    );
+    // (4) a Thumb pop{pc} always stays Thumb on the ARM9
+    assert!(
+        src.contains("if (k == 15u) { *npc = tv & ~1u; smc_branch_mode(tv | 1u); }"),
+        "regression: Thumb pop{{pc}} no longer forces the Thumb state"
     );
 }
