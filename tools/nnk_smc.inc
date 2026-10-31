@@ -720,7 +720,15 @@ static int smc_exec_thumb(uint32_t pc, uint32_t *npc, uint32_t *costp) {
         r[13] += (hw & 0x7Fu) << 2;
         return 1;
     }
-    if ((hw & 0xF600u) == 0xB400u) {                 /* PUSH */
+    /* Phase-5A: format 13 is `1011 L 10 R <list>` and bit 11 is the L bit that
+     * separates PUSH (0xB4xx / 0xB5xx) from POP (0xBCxx / 0xBDxx).  The mask
+     * used to be 0xF600, which leaves bit 11 out, so every POP matched this
+     * PUSH arm first and the POP arm below was unreachable dead code: a Thumb
+     * `pop {r4,r5,r6,pc}` (0xBD70) pushed a frame and fell through instead of
+     * returning.  Measured at the overlay dispatcher's epilogue 0x020D1A1E
+     * (Phase-5A): the `push {r4,r5,r6,lr}` at 0x020D19B8 had stored the
+     * correct link 0x020D1647, but the epilogue never popped it. */
+    if ((hw & 0xFE00u) == 0xB400u) {                 /* PUSH */
         unsigned list = (hw & 0xFFu) | ((hw & 0x0100u) ? 0x4000u : 0u);
         uint32_t sp = r[13];
         unsigned k, cnt = 0u, idx = 0u;
@@ -734,7 +742,7 @@ static int smc_exec_thumb(uint32_t pc, uint32_t *npc, uint32_t *costp) {
         r[13] = sp; *costp = 3;
         return 1;
     }
-    if ((hw & 0xF600u) == 0xBC00u) {                 /* POP */
+    if ((hw & 0xFE00u) == 0xBC00u) {                 /* POP */
         unsigned list = (hw & 0xFFu) | ((hw & 0x0100u) ? 0x8000u : 0u);
         uint32_t sp = r[13];
         unsigned k, idx = 0u;

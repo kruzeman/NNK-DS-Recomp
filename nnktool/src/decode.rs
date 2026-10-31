@@ -1137,8 +1137,15 @@ fn thumb_base(h: u16, addr: u32) -> (String, Kind) {
             Kind::Dp { op: if sub { 2 } else { 4 }, s: false, rd: 13, rn: 13, src: Operand::Imm(imm) },
         );
     }
-    // format 14: push/pop (POP with the extra bit transfers pc)
-    if h & 0xF600 == 0xB400 {
+    // format 14: push/pop (POP with the extra bit transfers pc).  Encoding
+    // `1011 L 10 R <list>`: bit 11 is L (PUSH/POP) and bit 8 the extra
+    // register.  The mask is 0xFE00 (bits 15..9) and both arms are matched
+    // explicitly — 0xB4xx PUSH, 0xBCxx POP.  Phase-5A: the runtime's C
+    // re-decoder used 0xF600 for these, a mask that leaves the L bit out, so
+    // every 0xBDxx pop matched its PUSH arm first and its POP arm was
+    // unreachable; this half re-tests L below and so stayed correct, but both
+    // halves now key on the same field.
+    if h & 0xFE00 == 0xB400 || h & 0xFE00 == 0xBC00 {
         let list = (h & 0xFF) as u16;
         let lr = h & 0x0100 != 0;
         let load = h & 0x0800 != 0;
