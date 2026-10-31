@@ -2198,11 +2198,16 @@ static void io_do_dma(int i) {
 /* Card transfer state machine (melonDS NDSCart.cpp, see the state block). */
 static void card_advance_receive(void) {
     uint64_t d = (uint64_t)card_xfer * (4u + ((card_pos & 0x1FFu) ? 0u : card_gap2));
-    /* Phase-4N: ROMAdvanceSend schedules ROMTransfer_End after the last word
-     * of the transfer (melonDS NDSCart.cpp).  Without this the data-read
-     * transfer never completes: ROMCnt bit31 stays set and the cart IRQ the
-     * guest waits for in its WFI idle loop is never raised. */
-    if (card_pos >= card_len) { card_end_pending = 1; card_next = card_cycles + d; return; }
+    /* Phase-4T (melonDS NDSCart.cpp exact): ROMAdvanceReceive returns WITHOUT
+     * scheduling an end once the last word has been produced — in read mode
+     * the transfer ends only when the CPU pops that last FIFO word
+     * (ReadROMData -> ROMEndTransfer).  Phase-4N scheduled ROMTransfer_End
+     * here for a "data-read" transfer, but that is ROMAdvanceSend (write
+     * mode) semantics; scheduling it in read mode cleared busy+DRQ ~20
+     * cycles after the last word, so the guest's B8 dummy read waited for a
+     * DRQ that had already been dropped (deadlock at pc 0x02016974, measured
+     * Phase-4T: the B7 stream froze after 1398 starts, melonDS continues). */
+    if (card_pos >= card_len) return;
     card_next = card_cycles + d;
 }
 /* ROMTransfer_ReceiveData: put the next word in the FIFO, then raise DRQ. */

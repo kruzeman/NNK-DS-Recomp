@@ -554,12 +554,17 @@ def main():
     #   (b) card_end_transfer() drops the cart IRQ entirely (Phase-4D note);
     #   (c) IRQ delivery was gated to the 3 scripted triggers (IRQ_TRIG_N),
     #       so nothing after step 9,097,801 is ever delivered.
-    prelude = inject(prelude,
-                     "    if (card_pos >= card_len) return;",
-                     "    if (card_pos >= card_len) { card_end_pending = 1;"
-                     " card_next = card_cycles + (uint64_t)card_xfer *"
-                     " (4u + ((card_pos & 0x1FFu) ? 0u : card_gap2)); return; }",
-                     "card end-of-transfer scheduling")
+    # Phase-4T: the FIRST Phase-4N inject ((a), "card end-of-transfer
+    # scheduling") is REMOVED: it made card_advance_receive schedule
+    # ROMTransfer_End after the last RECEIVED word, but that is melonDS's
+    # ROMAdvanceSend (write mode) semantics.  ROMAdvanceReceive (read mode)
+    # returns without scheduling — the read transfer ends only when the CPU
+    # pops the last FIFO word (ReadROMData -> ROMEndTransfer).  With the end
+    # scheduled, busy+DRQ were cleared ~20 cycles after the last word was
+    # produced, so the guest's B8 dummy-read DRQ wait at 0x02016974 deadlocked
+    # and the whole card stream froze after 1398 B7 starts (Phase-4T, measured
+    # against p4q_mel_io.txt: melonDS continues streaming to 2279 B7 starts).
+    # The generated image already carries the correct line; it stays verbatim.
     prelude = inject(prelude,
                      "    card_next = CARD_NEVER; card_end_pending = 0;",
                      "    card_next = CARD_NEVER; card_end_pending = 0;\n"
@@ -684,6 +689,61 @@ def main():
                      "        /* handled/notable log lives in nnk_ipc_send */",
                      "Phase-4Q IPC responder log moved")
     sys.stderr.write("Phase-4Q: ARM7 IPC-FIFO responder spliced\n")
+
+    # ---- Phase-4T: card-stall probe (ROMCNT-busy hang diagnosis) ----------
+    # The native guest spins in the ROMCNT poll loop at 0x02016974 with
+    # busy=1 / DRQ=0 forever (150M steps, distinct_pcs frozen at 13,828): the
+    # card transfer behind the overlay load never completes, so the guest
+    # never reaches the overlay-resident display switch (melonDS pc 0x0207CB10,
+    # DISPCNT=0x0021021B at ts 54,276,936).  The probe in tools/nnk_vramcnt.inc
+    # dumps the whole card state machine once the guest has polled a busy,
+    # DRQ-less ROMCNT 5,000 times; the counters below track how many transfers
+    # were started at all (the io_card_start log line is capped at 4).
+    prelude = inject(prelude, "static void io_card_start(uint32_t val) {",
+                     "static void nnk_card_probe(void);\n"
+                     "static unsigned nnk_card_starts;\n"
+                     "static uint32_t nnk_card_last_op;\n"
+                     "static uint32_t nnk_card_last_addr;\n"
+                     "static uint64_t nnk_card_last_cyc;\n"
+                     "static uint64_t nnk_blkcrc = 0xcbf29ce484222325ull;\n"
+                     "static unsigned nnk_blk_n;\n"
+                     "static void io_card_start(uint32_t val) {",
+                     "Phase-4T card probe prototypes")
+    prelude = inject(prelude,
+                     "        return (romcnt & ~0x00800000u) | (card_drq ? 0x00800000u : 0u);",
+                     "        nnk_card_probe();\n"
+                     "        return (romcnt & ~0x00800000u) | (card_drq ? 0x00800000u : 0u);",
+                     "Phase-4T card probe call")
+    prelude = inject(prelude, "        card_xfer_log_n++;",
+                     "        card_xfer_log_n++;",
+                     "Phase-4T card start counter (moved, see below)")
+    prelude = inject(prelude, "    card_op = card_cmd[0];",
+                     "    if (card_op == 0xB7 && nnk_blk_n) {\n"
+                     "        fprintf(stderr, \"p4t: blk addr=0x%08X crc=0x%08llX n=%u steps=%llu\\n\",\n"
+                     "                card_addr, (unsigned long long)nnk_blkcrc, nnk_blk_n,\n"
+                     "                (unsigned long long)steps);\n"
+                     "        nnk_blk_n = 0; nnk_blkcrc = 0xcbf29ce484222325ull;\n"
+                     "    }\n"
+                     "    card_op = card_cmd[0];",
+                     "Phase-4T per-block FIFO checksum")
+    prelude = inject(prelude,
+                     "        uint32_t ret = card_fifo[card_poscpu];",
+                     "        uint32_t ret = card_fifo[card_poscpu];\n"
+                     "        if (card_op == 0xB7) { nnk_blkcrc = (nnk_blkcrc ^ ret) * 16777619ull; nnk_blk_n++; }",
+                     "Phase-4T FIFO checksum accumulate")
+    prelude = inject(prelude, "    card_poll_n = 0;",
+                     "    card_poll_n = 0;\n"
+                     "    nnk_card_starts++;\n"
+                     "    nnk_card_last_op = card_cmd[0];\n"
+                     "    nnk_card_last_addr = addr;\n"
+                     "    nnk_card_last_cyc = card_cycles;\n"
+                     "    if (nnk_card_starts <= 50000u)\n"
+                     "        fprintf(stderr, \"p4t: start op=0x%02X addr=0x%08X size=%u cyc=%llu steps=%llu\\n\",\n"
+                     "                card_cmd[0], addr, (unsigned)datasize,\n"
+                     "                (unsigned long long)card_cycles,\n"
+                     "                (unsigned long long)steps);",
+                     "Phase-4T B7 stream log")
+    sys.stderr.write("Phase-4T: card-stall probe spliced\n")
 
     # ---- Phase-4K: firmware boot state (console MAC) --------------------
     # The guest reads the console WIFI MAC from 0x02FFFCF4; it is a console /

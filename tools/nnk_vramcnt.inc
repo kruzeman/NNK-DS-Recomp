@@ -280,6 +280,60 @@ static void nnk_vrc_report(void)
             (unsigned)vramcnt[4], d[4], (unsigned)vramcnt[5], d[5],
             (unsigned)vramcnt[6], d[6], (unsigned)vramcnt[7], d[7],
             (unsigned)vramcnt[8], d[8]);
+    fprintf(stderr, "p4t: last B7 block addr=0x%08X crc=0x%08llX n=%u starts=%u last_op=0x%02X\n",
+            nnk_card_last_addr, (unsigned long long)nnk_blkcrc, nnk_blk_n,
+            nnk_card_starts, nnk_card_last_op);
+}
+
+/* ==========================================================================
+ * Phase-4T — card-stall probe (ROMCNT-busy hang at pc 0x02016974).
+ *
+ * The native guest spins in the ROMCNT poll loop with busy=1 and DRQ=0
+ * forever (150M steps, distinct_pcs frozen at 13,828), so the card transfer
+ * behind the overlay load never completes.  This probe fires ONCE the guest
+ * has polled a busy, DRQ-less ROMCNT 5,000 times and dumps the whole card
+ * state machine — the exact anatomy of the dead transfer — so the fix is
+ * measured, not guessed.  Called from io_read32's ROMCNT case (hooked by
+ * tools/split_dispatch.py); counters updated at every io_card_start.
+ * ========================================================================== */
+static int nnk_card_probe_done;
+static unsigned nnk_card_probe_polls;
+static unsigned nnk_card_hb;
+static void nnk_card_probe(void)
+{
+    if (!(romcnt & 0x80000000u)) { nnk_card_probe_polls = 0; return; }
+    if (card_drq) { nnk_card_probe_polls = 0; return; }
+    nnk_card_probe_polls++;
+    /* Dead transfer: busy, no data coming, nothing scheduled, room left. */
+    if (card_next == CARD_NEVER && !card_end_pending && card_pos < card_len) {
+        nnk_card_probe_done = 1;
+        fprintf(stderr,
+            "p4t: DEAD transfer starts=%u last_op=0x%02X last_addr=0x%08X "
+            "pos=%u/%u count=%d late=%d endpend=%d cyc=%llu "
+            "fifo0=0x%08X fifo1=0x%08X romcnt=0x%08X spicnt=0x%08X "
+            "dma0cnt=0x%08X dma2cnt=0x%08X dma3cnt=0x%08X pc=0x%08X steps=%llu\n",
+            nnk_card_starts, nnk_card_last_op, nnk_card_last_addr,
+            card_pos, card_len, card_count, card_late, card_end_pending,
+            (unsigned long long)card_cycles,
+            card_fifo[0], card_fifo[1], romcnt, spicnt,
+            dma_cnt[0], dma_cnt[2], dma_cnt[3], last_pc,
+            (unsigned long long)steps);
+        return;
+    }
+    /* Heartbeat: >1M consecutive busy/no-DRQ polls (healthy streaming polls
+     * ~900 between words), so the stall's progress over time is measured. */
+    if (nnk_card_probe_polls >= 1000000u && nnk_card_hb < 16u) {
+        nnk_card_hb++;
+        nnk_card_probe_polls = 0;
+        fprintf(stderr,
+            "p4t: busy-wait heartbeat %u pos=%u/%u count=%d late=%d "
+            "next=%llu cyc=%llu last_op=0x%02X last_addr=0x%08X "
+            "pc=0x%08X steps=%llu\n",
+            nnk_card_hb, card_pos, card_len, card_count, card_late,
+            (unsigned long long)card_next, (unsigned long long)card_cycles,
+            nnk_card_last_op, nnk_card_last_addr, last_pc,
+            (unsigned long long)steps);
+    }
 }
 
 #endif /* NNK_VRAMCNT_INC */
