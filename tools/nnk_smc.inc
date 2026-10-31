@@ -635,8 +635,21 @@ static int smc_exec_thumb(uint32_t pc, uint32_t *npc, uint32_t *costp) {
             int32_t o = (int32_t)(((sg << 24) | (i1 << 23) | (i2 << 22) |
                                    ((hw & 0x3FFu) << 12) | ((hw2 & 0x7FFu) << 1)));
             o = (o << 7) >> 7;
+            /* Phase-5E: the BASE differs between the two forms (ARM ARM
+             * ARMv5T, BL(1)/BLX(1) immediate):
+             *   BL(1)  (suffix 11111): target = PC + offset, PC = addr + 4
+             *   BLX(1) (suffix 11101): target = Align(PC,4) + offset
+             * because BLX(1) calls ARM code and the encoding forces the low
+             * offset bit to 0 (H).  Measured against binutils round-trip:
+             * the ROM's F779 EFE6 at 0x020D2426 is `blx 0x0204C3F4`
+             * (Align(0x020D242A,4) - 0x86034); with the unaligned base the
+             * runtime decoded 0x0204C3F6 (2 bytes into the ARM function at
+             * 0x0204C3F4) and executed its prologue in Thumb state. */
+            {
+                uint32_t base = (hw2 & 0x1000u) ? (pc + 4u) : ((pc + 4u) & ~3u);
+                *npc = (base + (uint32_t)o) & ~1u;
+            }
             r[14] = (pc + 4u) | 1u;
-            *npc = (pc + 4u + (uint32_t)o) & ~1u;
             /* Phase-5C: the suffix's bit 12 separates the forms - BL
              * (11111, bit12=1) stays in Thumb, BLX (11101, bit12=0) makes
              * the target ARM state. */
