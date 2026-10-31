@@ -56,6 +56,7 @@ static unsigned long long smc_nhalt;      /* unsupported live instruction */
 static unsigned long long smc_nfb;        /* state fallback taken */
 static unsigned long long smc_nany;       /* Phase-4L: decode-on-demand hits */
 static int smc_trace_left;                /* NNK_SMC_TRACE budget */
+static int smc_t_sticky;                  /* Phase-4Z: last resolved T bit */
 
 /* Emitted next to the dispatch image by tools/split_dispatch.py.  A mono
  * (recompile-all -> cc) build has no generated map, so fall back to ARM-only
@@ -69,6 +70,32 @@ static int smc_trace_left;                /* NNK_SMC_TRACE budget */
 #define NNK_SMC_MAP_H 1
 static inline int nnk_pc_is_thumb(uint32_t pc) { (void)pc; return 0; }
 #endif
+
+/* Phase-4Z: recover the processor state for a PC the map cannot classify.
+ * nnk_pc_is_thumb() is built from the COMPILED cases whose emitter-written
+ * fall-through is addr+2, so a PC the recompiler never rooted — measured:
+ * the overlay vtable thunk 0x020D22BC and the dispatcher epilogue
+ * 0x020D1A1E — reads as ARM, and the ARM decode of their Thumb bytes
+ * silently SUCCEEDS (it never reaches the Thumb fallback, state_fallbacks=0),
+ * producing npc=pc+4 garbage that fabricated a branch into the not-yet
+ * downloaded module at 0x02988AA0 (halt step 39,001,655).
+ * A register-indirect transfer strips bit0 into pc (`pc = _t & ~1u`, and
+ * `*npc = tv & ~1u` in this decoder) but the SOURCE register still carries
+ * it on the very next dispatch, so: whichever register holds the tagged
+ * target for this pc decides the state.  Only consulted when the map says
+ * "not Thumb", so every classified PC keeps its old behaviour and an
+ * unclassified ARM PC with no matching register still falls back to ARM
+ * (the Phase-4L 0x0215C034 case), with the existing decode-failure
+ * fallback covering the rest. */
+static int smc_state_from_regs(uint32_t pc)
+{
+    int k;
+    for (k = 0; k < 15; k++) {
+        uint32_t v = r[k];
+        if ((v & ~1u) == pc) return (int)(v & 1u);
+    }
+    return -1;                            /* no register carries this pc */
+}
 
 /* ---- generation-0 image segments ---------------------------------------
  * The COMPILED generation is the image `nnktool recompile-all` decoded, which
@@ -664,10 +691,15 @@ static int smc_exec_thumb(uint32_t pc, uint32_t *npc, uint32_t *costp) {
         else   { if (B) st8(ea, r[rd]); else st32(ea, r[rd]); *costp = 3; }
         return 1;
     }
-    if ((hw & 0xF000u) == 0x6000u) {                 /* format 9: LDR/STR imm5 */
+    if ((hw & 0xE000u) == 0x6000u) {                 /* format 9: LDR/STR/LDRB/STRB imm5 */
         unsigned L = (unsigned)((hw >> 11) & 1u), B = (unsigned)((hw >> 12) & 1u);
         rd = hw & 7u;
-        ea = r[(hw >> 3) & 7u] + (((hw >> 6) & 0x1Fu) << 2);
+        /* byte forms (0x7000..0x7FFF, B=1) take imm5 as a BYTE offset; only
+         * the word forms are word-scaled.  The mask used to be 0xF000, so the
+         * whole LDRB/STRB half fell through as "unsupported" and the ARM
+         * fallback silently executed those Thumb bytes as ARM (npc=pc+4),
+         * measured at 0x020D22CA `strb r3,[r0,#15]` (Phase-4Z). */
+        ea = r[(hw >> 3) & 7u] + (((hw >> 6) & 0x1Fu) << (B ? 0 : 2));
         if (L) { r[rd] = B ? ld8(ea) : ld32(ea); *costp = 1; }
         else   { if (B) st8(ea, r[rd]); else st32(ea, r[rd]); *costp = 3; }
         return 1;
@@ -835,6 +867,11 @@ int nnk_smc_exec_any(uint32_t *pcp) {
     smc_nany++;
     trace_pc(pc);
     thumb = nnk_pc_is_thumb(pc);
+    if (!thumb) {
+        int m = smc_state_from_regs(pc);
+        if (m < 0) m = smc_t_sticky;
+        thumb = (m > 0);
+    }
     rc = thumb ? smc_exec_thumb(pc, &npc, &cost) : smc_exec_arm(pc, w, &npc, &cost);
     if (!rc && thumb) {
         rc = smc_exec_arm(pc, w, &npc, &cost);
@@ -844,6 +881,7 @@ int nnk_smc_exec_any(uint32_t *pcp) {
         if (rc) { smc_nfb++; thumb = 1; }
     }
     if (!rc) return 0;
+    smc_t_sticky = thumb;                 /* Phase-4Z: the T bit this pc resolved to */
     smc_ninsn++;
     card_tick(cost);
     if (smc_trace_left > 0) {
