@@ -369,7 +369,13 @@ static void nnk_input_file_load(const char *path)
 
 static void nnk_input_file_tick(void)
 {
-    const char *p = getenv("NNK_INPUT_FILE");
+    /* Phase-5AE: the env lookup is cached.  This runs once per dispatched
+     * guest instruction, and getenv() is a linear scan of the whole
+     * environment (~470 cycles for two misses, measured with the TSC
+     * profiler) — it was the single largest per-step cost in the runtime.
+     * The environment cannot change inside a run, so one lookup is enough. */
+    static const char *p; static int init;
+    if (!init) { init = 1; p = getenv("NNK_INPUT_FILE"); }
     if (!p || !p[0]) return;
     if (gxd_frames == nnk_file_frame) return;       /* one read per frame */
     nnk_file_frame = gxd_frames;
@@ -410,7 +416,9 @@ static unsigned nnk_rec_first_frame;
 
 static void nnk_input_record_tick(void)
 {
-    const char *p = getenv("NNK_INPUT_RECORD");
+    /* Phase-5AE: cached env lookup (one per dispatched instruction otherwise). */
+    static const char *p; static int init;
+    if (!init) { init = 1; p = getenv("NNK_INPUT_RECORD"); }
     if (!p || !p[0]) return;
     if (gxd_frames == nnk_rec_frame) return;        /* one line per frame max */
     nnk_rec_frame = gxd_frames;

@@ -1951,3 +1951,141 @@ fn movie_session_ends_on_the_skip_key_edge_not_a_starved_ring() {
     let block = &inc[sample..(sample + 4000).min(inc.len())];
     assert!(!block.contains("st32(p"), "regression: the p5u sample must not write guest state");
 }
+
+/// Phase-5AE — the per-step caches are EXACT (a performance change must not
+/// move a single guest-visible value).
+///
+/// Measured (PHASE5AE.md): the runtime spent ~1306 host cycles per dispatched
+/// guest instruction on the notice-screen loop, 58% of it in two `getenv()`
+/// calls and three 64-bit divisions inside the per-step clock/display/probe
+/// chain.  The cures are caches, and a cache in an emulator core is only
+/// admissible if it is bit-exact:
+///
+///   * `vcount()` — `(cycles / 2130) % 263` became a cached scanline window
+///     (`vc_win_lo <= cycles < vc_win_hi`).  `cycles` is monotonic in the run
+///     loop but NOT here: a card-bus stall adds `card_cycles - t0` in one jump,
+///     so the cache must recompute outside the window.  This test re-implements
+///     both forms and proves they agree over a unit walk, the scanline and
+///     frame-wrap boundaries, arbitrary forward jumps and a backward jump.
+///   * `nnk_display_tick()` — returns early when the scanline has not changed;
+///     the frame edge it acts on is the same `<192 -> >=192` test.
+///   * the debug/probe chain and the `NNK_P5U` hook — gated on parsed state
+///     only (`ckpt_pc || dbg_pc || dc_npc || pred_npc`, `nnk_p5u_on`), never on
+///     anything a run can change.
+#[test]
+fn phase_5ae_per_step_caches_are_bit_exact() {
+    const CYCLES_PER_SCANLINE: u64 = 2130;
+    const SCANLINES: u64 = 263;
+    let reference = |cycles: u64| ((cycles / CYCLES_PER_SCANLINE) % SCANLINES) as u32;
+
+    struct Vc {
+        lo: u64,
+        hi: u64,
+        val: u32,
+    }
+    impl Vc {
+        fn new() -> Self {
+            Vc { lo: 0, hi: 0, val: 0 }
+        }
+        fn get(&mut self, cycles: u64) -> u32 {
+            if cycles >= self.lo && cycles < self.hi {
+                return self.val;
+            }
+            let q = cycles / CYCLES_PER_SCANLINE;
+            self.lo = q * CYCLES_PER_SCANLINE;
+            // C unsigned arithmetic wraps (defined behaviour): for a `cycles`
+            // inside the last scanline of the 64-bit range `hi` wraps below
+            // `lo`, and the window simply never matches, so the next call
+            // recomputes.  Mirror that exactly.
+            self.hi = self.lo.wrapping_add(CYCLES_PER_SCANLINE);
+            self.val = (q % SCANLINES) as u32;
+            self.val
+        }
+    }
+
+    let mut vc = Vc::new();
+    // (a) a unit walk across ~5 frames, in order (the run loop's steady state)
+    for cycles in 0..(5 * SCANLINES * CYCLES_PER_SCANLINE) {
+        assert_eq!(vc.get(cycles), reference(cycles), "unit walk at {cycles}");
+    }
+    // (b) every scanline/frame/64-bit boundary neighbourhood, in order
+    let mut probes: Vec<u64> = Vec::new();
+    for k in 0..(3 * SCANLINES + 2) {
+        let b = k * CYCLES_PER_SCANLINE;
+        probes.extend([b.saturating_sub(1), b, b + 1, b + CYCLES_PER_SCANLINE - 1]);
+    }
+    probes.extend([
+        0,
+        1,
+        u64::MAX / 2,
+        (u64::MAX / 2) - 1,
+        u64::MAX - 1,
+        u64::MAX,
+    ]);
+    probes.sort_unstable();
+    for cycles in probes {
+        assert_eq!(vc.get(cycles), reference(cycles), "boundary at {cycles}");
+    }
+    // (c) the card-stall jump: forward by many frames in one step, then BACK
+    // (the cache window must not serve a stale value).
+    for jumps in [1u64, 7, 2130, 559_590, 559_591, 1 << 20, 1 << 32] {
+        let mut c = 1234u64;
+        for _ in 0..64 {
+            assert_eq!(vc.get(c), reference(c), "forward jump at {c}");
+            c = c.wrapping_add(jumps);
+        }
+        let back = c / 3;
+        assert_eq!(vc.get(back), reference(back), "backward jump at {back}");
+    }
+
+    // (d) the sources keep the caches and the gates.
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let rs = std::fs::read_to_string(root.join("nnktool/src/recompile.rs"))
+        .expect("cannot read nnktool/src/recompile.rs");
+    for needle in [
+        "static unsigned long long vc_win_lo, vc_win_hi;",
+        "if (cycles >= vc_win_lo && cycles < vc_win_hi) return vc_win_val;",
+        "if (vc == (uint32_t)gxd_last_vc) return 0;",
+    ] {
+        assert!(rs.contains(needle), "regression: prelude cache lost: {needle}");
+    }
+    let splice = std::fs::read_to_string(root.join("tools/p5ae_runtime_splice.py"))
+        .expect("cannot read tools/p5ae_runtime_splice.py");
+    for needle in [
+        "T1_OLD",
+        "vc_win_val",
+        "nnk_probe_mask",
+        "nnk_p5u_on",
+        "#define NNK_P5U_GATE 1",
+    ] {
+        assert!(splice.contains(needle), "regression: Phase-5AE splice lost: {needle}");
+    }
+    let build = std::fs::read_to_string(root.join("tools/build_split.sh"))
+        .expect("cannot read tools/build_split.sh");
+    assert!(
+        build.contains("p5ae_runtime_splice.py") && build.contains("nnk_probe_mask"),
+        "regression: the frozen image would silently be built without the Phase-5AE prelude"
+    );
+    let input = std::fs::read_to_string(root.join("tools/nnk_input.inc"))
+        .expect("cannot read tools/nnk_input.inc");
+    for needle in ["getenv(\"NNK_INPUT_FILE\")", "getenv(\"NNK_INPUT_RECORD\")"] {
+        let cached = format!("if (!init) {{ init = 1; p = {}; }}", needle);
+        assert!(input.contains(&cached), "regression: per-step env lookup returned: {needle}");
+    }
+    let smc = std::fs::read_to_string(root.join("tools/nnk_smc.inc"))
+        .expect("cannot read tools/nnk_smc.inc");
+    assert!(
+        smc.contains("if (!smc_dblk[o >> 8]) return 0;"),
+        "regression: the dispatch probe lost its 256-byte dirty block"
+    );
+    assert!(
+        smc.contains("if (sg == -1) return 0;"),
+        "regression: the dispatch probe lost the pre-resolved band map"
+    );
+    let dma = std::fs::read_to_string(root.join("tools/nnk_dma.inc"))
+        .expect("cannot read tools/nnk_dma.inc");
+    assert!(
+        dma.contains("if (ticks < (uint64_t)(p4u_tm_ovf[t] + 1u) * (uint64_t)period) continue;"),
+        "regression: the timer tick divides on every step again"
+    );
+}

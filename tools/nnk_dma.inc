@@ -251,6 +251,14 @@ static void p4u_timer_tick(void) {
             uint64_t ticks, ovf;
             if (!period) period = 0x10000u;
             ticks = (cycles - p4u_tm_base[t]) >> shift;
+            /* Phase-5AE: divide only when an overflow is actually possible.
+             * `ovf > p4u_tm_ovf[t]` is exactly `ticks >= (ovf+1)*period`, so
+             * the hot path is a 64x32 multiply + compare instead of a 64-bit
+             * divide.  This function runs once per dispatched guest instruction
+             * and used to divide up to four times per step (TSC profiler: the
+             * timer model was the second largest fixed per-step cost after the
+             * per-step getenv() pair). */
+            if (ticks < (uint64_t)(p4u_tm_ovf[t] + 1u) * (uint64_t)period) continue;
             ovf = ticks / period;
             if (ovf > p4u_tm_ovf[t]) {
                 p4u_tm_ovf[t] = ovf;
