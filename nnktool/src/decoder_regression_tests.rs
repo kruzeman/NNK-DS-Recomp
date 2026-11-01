@@ -1732,72 +1732,68 @@ fn vram_read_shadow_round_trips_a_guest_store() {
 /// path, and the off case says so and names the canonical pair.
 #[test]
 fn movie_hle_requires_a_readable_source() {
+    // Phase-5AC (class 40) + Phase-5AH (class 45): `NNK_MOVIE_YUV` NAMES an
+    // A/B frame source; it is not a boolean.  What changed in 5AH: an
+    // unset/empty/unreadable value no longer means "HLE off" -- the runtime
+    // now decodes the containers out of the CARD IMAGE (the shipped path needs
+    // no external file at all), and a bad override falls back to that path.
+    // The 5AC defect this test still guards: a bare truthy value ("1") must
+    // NEVER be trusted as a source (that silently produced the guest decoder's
+    // macroblocks while the banner claimed the HLE was on).
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
     let inc = std::fs::read_to_string(root.join("tools/nnk_smc.inc"))
         .expect("cannot read tools/nnk_smc.inc");
 
-    // (a) the gate: the source is probed with fopen BEFORE the HLE is enabled,
-    //     and the enable line is not reachable on a failed probe.
-    let init = inc
-        .find("static void p5t_init(void) {")
-        .expect("regression: p5t_init is gone");
+    let init = inc.find("static void p5t_init(void) {").expect("regression: p5t_init is gone");
     let init_body = &inc[init..];
     let init_body = &init_body[..init_body.find("\n}\n").expect("p5t_init end missing")];
-    assert!(
-        init_body.contains("if (!p || !p[0]) return;"),
-        "regression: an unset/empty NNK_MOVIE_YUV no longer leaves the HLE off"
-    );
+
+    // (a) the override is probed with fopen BEFORE it is trusted, and the
+    //     fall-through to the ROM path is present and announced.
     assert!(
         init_body.contains("probe = fopen(p, \"rb\");"),
-        "regression: NNK_MOVIE_YUV is trusted without opening it (a bare \"1\" would enable the HLE)"
+        "regression: NNK_MOVIE_YUV is trusted without opening it (a bare \"1\" would select the override)"
     );
-    let gate = init_body.find("if (!probe) {").expect("regression: the fopen gate is gone");
+    assert!(
+        init_body.contains("is not a readable yuv420p file"),
+        "regression: a rejected override no longer says so"
+    );
+    assert!(
+        init_body.contains("using the ROM"),
+        "regression: a rejected override no longer falls back to the ROM source"
+    );
+    assert!(
+        init_body.contains("Phase-5AH default: decode the containers out of the card image"),
+        "regression: the shipped (ROM-decoded) movie path left p5t_init"
+    );
+    let gate = init_body.find("if (!probe) {").or_else(|| init_body.find("if (probe) {")).expect("gate");
     let enable = init_body.find("p5t_state = 2;").expect("regression: the enable line is gone");
-    assert!(
-        gate < enable,
-        "regression: p5t_state = 2 is reached without a successful fopen (the Phase-5AC mis-wiring)"
-    );
-    assert!(
-        init_body[gate..enable].contains("HLE OFF"),
-        "regression: a rejected source no longer announces that the HLE is off"
-    );
-    assert!(
-        init_body.contains("NNK_MOVIE_YUV2=<op_d.yuv>"),
-        "regression: the canonical configuration (op_u top / op_d bottom) left the message"
-    );
-    // The per-frame size that makes a path a *source* rather than a flag.
-    assert!(inc.contains("#define P5T_FRAME (P5T_YSZ + 2 * P5T_CSZ)"));
-    assert_eq!(256u32 * 192 * 3 / 2, 73728, "fixture: one 256x192 yuv420p frame");
+    assert!(gate < enable, "regression: p5t_state = 2 is reached without a successful fopen");
 
-    // (b) the gate re-implemented from the C text: only a source that opens
-    //     turns the hook on; every truthy non-file stays off (state 1).
-    let decide = |v: Option<&str>, opens: &dyn Fn(&str) -> bool| -> u32 {
+    // (b) the decision re-implemented from the C text: only a source that
+    //     OPENS selects the override; everything else takes the ROM path.
+    let decide = |v: Option<&str>, opens: &dyn Fn(&str) -> bool| -> &'static str {
         match v {
-            None => 1,
-            Some(s) if s.is_empty() => 1,
-            Some(s) if opens(s) => 2,
-            Some(_) => 1,
+            Some(s) if !s.is_empty() && opens(s) => "override",
+            _ => "rom",
         }
     };
     let only_op_u = |s: &str| s == "op_u.yuv";
-    for v in [None, Some(""), Some("0"), Some("1"), Some("on"), Some("yes"), Some("/nonexistent/op_u.yuv")] {
-        assert_eq!(decide(v, &only_op_u), 1, "{v:?} must leave the HLE off");
+    for v in [None, Some(""), Some("0"), Some("1"), Some("on"), Some("/nonexistent/op_u.yuv")] {
+        assert_eq!(decide(v, &only_op_u), "rom", "{v:?} must take the ROM-decoded path");
     }
-    assert_eq!(decide(Some("op_u.yuv"), &only_op_u), 2, "a real source must enable the hook");
-    // The measured equivalence that motivates the gate: cfg1 == cfg0 byte-exact.
-    assert_eq!(decide(Some("1"), &only_op_u), decide(None, &only_op_u),
-        "fixture: NNK_MOVIE_YUV=1 and unset both leave the HLE off (Phase-5AC, 14/14 identical frames)");
+    assert_eq!(decide(Some("op_u.yuv"), &only_op_u), "override", "a real source must select it");
+    // The measured equivalence that motivates the gate (Phase-5AC): a bare "1"
+    // behaved exactly like unset, i.e. the override was never really used.
+    assert_eq!(decide(Some("1"), &only_op_u), decide(None, &only_op_u));
 
-    // (c) a failed source must not be retried per codec forever: the probe is
-    //     in p5t_init (once), and p5t_stream's own failure path still logs.
+    // (c) the probe runs once, and per-stream failures are still reported.
     assert_eq!(
         inc.matches("probe = fopen(p, \"rb\");").count(), 1,
         "regression: the source probe duplicated (it must run once, in p5t_init)"
     );
-    assert!(
-        inc.contains("movie: stream %d cannot open %s"),
-        "regression: the per-stream open failure stopped being reported"
-    );
+    assert!(inc.contains("movie: stream %d cannot open %s"),
+        "regression: the per-stream open failure stopped being reported");
 }
 
 /// Phase-5AD, class 41: the movie session ends on a **skip key edge**, not on a
