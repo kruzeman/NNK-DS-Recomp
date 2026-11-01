@@ -95,7 +95,7 @@ names a raw yuv420p file:
 Frame index = decode steps since the session started (one source frame per
 step, the guest's own `blx` contract), clamped at the last frame past EOF.
 
-## 5. Result (measured, this run) — the hook fires, the session does not yet play
+## 4. Result (measured, this run) — the hook fires, the session does not yet play
 
 Run: `p5t2` (image `arm9_thumb_ovl_itcm_p5s2.c` + this hook),
 `NNK_STEP_LIMIT=2.33e9`, `NNK_MOVIE_YUV=work/p5t/op_u.yuv`,
@@ -157,7 +157,33 @@ game's own `op_u.mods` to the guest's exact plane (byte-identical Y for frame
 130 of the melonDS dump), so once the plane is written at the right moment the
 converter/compositor path Phase-5P proved faithful is fed correct pixels.
 
-## 6. Reproduce
+## 5. Acceptance checks on this branch
+
+```
+$ cd nnktool && cargo test
+test result: ok. 32 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+$ SKIP_MELONDS=1 bash tools/verify_phase2a.sh
+1) strict common prefix        : 1000 / 1000 melonDS PCs (100.0%)
+2) window-filtered prefix      : 1000 / 1000 (window 0x02000000..0x02400000)
+3) in-order matched after resync: 1000 / 1000 melonDS PCs (100.0%)
+rc=0                                                  -> RESULT: PASS
+```
+
+`NNK_MOVIE_YUV` unset leaves the runtime byte-for-byte the previous behaviour
+(the hook's only entry points are one `pc ==` compare at the ITCM callback
+entry and one `npc ==` compare at the callback return).
+
+## 6. Evidence in `/home/hermes/NiNoKuni/shots/`
+
+```
+p5t_ref_op_u_f0130.png    the reference decode of op_u.mods frame 130 (the exact
+                          plane melonDS's ring slot 0x022C0880 holds, byte-exact)
+p5t.04120_top.png         native captures at display frames 4120/4140 — black:
+p5t.04140_top.png         the display stops rendering at the movie start (B1)
+```
+
+
+## 7. Reproduce
 
 ```sh
 ln -sfn /home/hermes/NiNoKuni/work work
