@@ -2780,3 +2780,78 @@ fn phase_5al_the_guard_is_benign_on_the_melonds_object_and_the_payload_is_0x1a8(
         "our object's uninitialised +0x124 is what parks the guest"
     );
 }
+
+// --------------------------------------------------------------- class 48 ---
+// Thumb format-5 R15 reads are (addr + 4) UNALIGNED (Phase-5AM).
+//
+// GCC's Thumb switch idiom puts the halfword table immediately after its
+// `add pc, rX`, so the base (`add r3, pc` -> addr+4) is frequently 2 mod 4:
+//
+//   0x020DDE9A  add  r3, pc        @ base = 0x020DDE9E
+//   0x020DDE9C  ldrh r3, [r3, #6]  @ entry = [0x020DDEA4] = 0x0006
+//   0x020DDEA2  add  pc, r3        @ 0x020DDEA6 + 6 = 0x020DDEAC (case 0)
+//
+// The live re-decoder (`tools/nnk_smc.inc` smc_reg) masked the base to 4 bytes,
+// so the entry load read the `add pc, r3` instruction word itself (0x449F at
+// 0x020DDEA2) and the jump landed on 0x020E2344 — an unrelated ov17 derived
+// constructor that built a bogus object at the VRAM pointer 0x06006000 with
+// count 0x449F and then ran the 0x1A8-payload allocation loop (Phase-5AL's
+// allocation #412 divergence).  melonDS reads R[15] = addr + 4 with no mask.
+#[test]
+fn phase_5am_thumb_format5_reads_the_unaligned_pc_in_a_switch_table() {
+    // The site's own encoding must stay `add pc, r3` (0x449F).
+    let insn = decode_thumb(0x449F, 0x0000, 0x020D_DEA2, 2);
+    match insn.kind {
+        Kind::Dp { rd: 15, rn: 15, ref src, .. } => match *src {
+            Operand::Reg { rm: 3, .. } => {}
+            ref other => panic!("0x449F at 0x020DDEA2 must be `add pc, r3`, got {:?}", other),
+        },
+        ref other => panic!("0x449F must stay a format-5 ADD (Kind::Dp), got {:?}", other),
+    }
+
+    // Rust emitter: the destination-side operand must be the UNALIGNED (pc+4).
+    let mut out = Vec::new();
+    let e = super::emit_insn(&insn, 0x020D_DEA2, true, false, String::new(), &mut out, true);
+    let body = e.body.join("\n");
+    assert!(
+        body.contains("(pc + 4u)"),
+        "emitter: `add pc, r3` must add to (pc + 4); body was: {}",
+        body
+    );
+    assert!(
+        !body.contains("0x020DDEA4u"),
+        "emitter: pc_lit's word-aligned base is back in a format-5 ADD: {}",
+        body
+    );
+
+    // C re-decoder: smc_reg must not mask the Thumb PC.
+    let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../tools/nnk_smc.inc");
+    let src = std::fs::read_to_string(&p)
+        .unwrap_or_else(|e| panic!("cannot read {}: {}", p.display(), e));
+    let at = src.find("static inline uint32_t smc_reg").expect("smc_reg is gone");
+    let fbody = &src[at..(at + 400).min(src.len())];
+    assert!(
+        fbody.contains("thumb ? (pc + 4u) : (pc + 8u)"),
+        "smc_reg: the Thumb PC read must be (pc + 4) — got: {}",
+        fbody
+    );
+    assert!(
+        !fbody.contains("& ~3u"),
+        "smc_reg: the word-alignment mask that broke the 0x020DDEA4 table is back"
+    );
+
+    // The measured arithmetic, both ways.
+    let table_base = 0x020D_DE9Au32 + 4;              // smc_reg(3, 0x020DDE9A, 1)
+    assert_eq!(table_base, 0x020D_DE9E);
+    assert_eq!(table_base + 6, 0x020D_DEA4, "entry #0 is the measured 0x0006");
+    let entry = 0x0006u32;
+    let target = (0x020D_DEA2u32 + 4) + entry;        // smc_reg(15, 0x020DDEA2, 1)
+    assert_eq!(target & !1, 0x020D_DEAC, "case 0 is the `b 0x020DDEB4` at DEAC");
+    let old_base = (0x020D_DE9Au32 + 4) & !3u32;      // the old mask
+    assert_eq!(old_base + 6, 0x020D_DEA2, "the mask pointed the load at `add pc,r3`");
+    assert_eq!(
+        ((0x020D_DEA2u32 + 4) & !3u32) + 0x449F & !1u32,
+        0x020E_2342,
+        "and that is exactly the PC the runtime traced (0x020E2342)"
+    );
+}

@@ -276,7 +276,14 @@ fn emit_insn(
     match &insn.kind {
         Kind::Dp { op, s, rd, rn, src } => {
             let (opnd, shifted) = operand_c(src, addr, thumb);
-            let rn_v = reg_mode(*rn, addr, thumb);
+            /* Phase-5AM: the SAME unaligned Thumb PC rule applies to the
+             * destination-side operand of a data-processing instruction.  For
+             * `add pc, r3` (0x449F at 0x020DDEA2) the base is (addr + 4) =
+             * 0x020DDEA6, not pc_lit's word-aligned 0x020DDEA4: masking bit1
+             * shifts every GCC switch-table target by two bytes and, at this
+             * site, turned the jump into a call into 0x020E2344 (an unrelated
+             * ov17 constructor).  melonDS reads R[15] = addr + 4 here. */
+            let rn_v = if thumb { reg_c_t(*rn, addr) } else { reg_c(*rn, addr) };
             let test = matches!(op, 8..=11);
             body.push(format!("{{ uint32_t _rn = {}; uint32_t _op = {};", rn_v, opnd));
             match op {
