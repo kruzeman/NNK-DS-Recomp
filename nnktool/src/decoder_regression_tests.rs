@@ -2978,3 +2978,116 @@ fn phase_5an_thumb_blx_rm_interworks_on_bit0_like_melonds() {
         "smc_exec_thumb: the masked-target BLX rM arm is back"
     );
 }
+
+// --------------------------------------------------------------- class 50 ---
+// An unrooted PC reached by FALL-THROUGH takes its state from the predecessor's
+// instruction stride, not from a stale `smc_t_sticky` (Phase-5AO).
+//
+// The live re-decoder resolves the ARM/Thumb state of a PC the compiled map
+// cannot classify through a ladder: the interworking note carried by the branch
+// (Phase-5C), then a register still holding the tagged target (Phase-4Z), then
+// `smc_t_sticky` — "the state of the last pc the LIVE decoder resolved".  That
+// last rule was stale by construction: compiled cases never update it, so it
+// can be thousands of ARM instructions out of date.
+//
+// Measured (operator session, native NNK_TRACE_FROM=560127000):
+//
+//   0x0202A8E8  ldrh r2,[r0]        @ a table-lookup helper, ARM
+//   0x0202A8EC  cmp  r1, r2
+//   0x0202A8F0  movcs r0,#0
+//   0x0202A8F4  bxcs lr            @ compiled case, ARM, NOT taken here
+//   0x0202A8F8  ldrh r2,[r0,#2]    @ 0xE1D020B2 — NO compiled case
+//   0x0202A8FC  ldr  r0,[r0,#4]
+//   0x0202A900  tst  r2,#1
+//   0x0202A904  addne r0,r0,r1,lsl#4
+//   0x0202A908  addeq r0,r0,r1,lsl#3
+//   0x0202A90C  bx   lr            @ returns to the caller 0x0202C1A0
+//
+// The sticky state was Thumb (the last live decode, 190k steps earlier), so
+// 0x0202A8F8 was decoded as Thumb: npc = 0x0202A8FA (the +2 stride), then the
+// Thumb reading of the ARM words fabricated the branch chain
+// 0x0202A8FA -> 0x0202AC9E -> 0x0202AEAE -> 0x0202B1B2 -> 0x0202B4F6, which
+// fell into the compiled ARM cases 0x0202B4F8..0x0202B50C with a Thumb frame.
+// The epilogue `pop {r4,r5,r6,pc}` at 0x0202B50C (0xE8BD8070) popped
+// 0x0213D114 — a pointer into overlay 17's read-only data tail — and the guest
+// executed the string "/data/Event/Demo/" as ARM (`andeq r0,r0,r0`, +4 each)
+// until 0x0213D2AC, where the word 0xEF746E65 = "ent" + 0xEF decoded as
+// `swi 0x74`.  Run halt: step 560,128,158, pc 0x0213D2AC, `hle swi
+// imm24=0x746E65 num=0x74`.
+//
+// The stride rule is the same rule tools/split_dispatch.py uses to build
+// nnk_pc_is_thumb from the emitted fall-throughs, applied locally: a 2-byte
+// successor belongs to a Thumb stream, a 4-byte successor to an ARM one.
+#[test]
+fn phase_5ao_unrooted_fallthrough_state_comes_from_the_stride_not_stale_sticky() {
+    // The predecessor is a compiled ARM case (`bxcs lr`, one 4-byte word).
+    let bxcs = decode_arm(0x212F_FF1E, 0x0202_A8F4);
+    assert!(
+        bxcs.text.contains("bx") && bxcs.text.contains("lr"),
+        "0x212FFF1E at 0x0202A8F4 is `bxcs lr`, got {}",
+        bxcs.text
+    );
+    assert_eq!(bxcs.words.len(), 1, "an ARM bx is one 4-byte word");
+
+    // The unrooted handler is ARM too: 0xE1D020B2 is `ldrh r2,[r0,#2]` and it
+    // is 4 bytes wide — the ARM reading the stride rule must pick.
+    let ldrh = decode_arm(0xE1D0_20B2, 0x0202_A8F8);
+    assert!(
+        ldrh.text.contains("ldrh"),
+        "0xE1D020B2 at 0x0202A8F8 must decode as `ldrh r2,[r0,#2]`, got {}",
+        ldrh.text
+    );
+    assert_eq!(ldrh.words.len(), 1, "the ARM ldrh is one 4-byte word");
+
+    // The two strides, measured: ARM reaches 0x0202A8FC (the trace's next pc
+    // after the fix) and Thumb reaches the 0x0202A8FA the bug took.
+    assert_eq!(0x0202_A8F4u32 + 4, 0x0202_A8F8, "`bxcs lr` falls THROUGH to A8F8");
+    assert_eq!(0x0202_A8F8u32 + 4, 0x0202_A8FC, "ARM stride: the fixed next pc");
+    assert_eq!(0x0202_A8F8u32 + 2, 0x0202_A8FA, "Thumb stride: the buggy next pc");
+    // The handler is 0x28 bytes and ends in `bx lr` back to its caller.
+    assert_eq!(0x0202_A90Cu32 - 0x0202_A8E8u32, 0x24);
+    assert_eq!(decode_arm(0xE12F_FF1E, 0x0202_A90C).text.trim(), "bx lr");
+
+    // The live re-decoder must consult the stride rule BEFORE the sticky guess
+    // in BOTH ladders, and the sticky state must carry the step it was set at.
+    let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../tools/nnk_smc.inc");
+    let src = std::fs::read_to_string(&p)
+        .unwrap_or_else(|e| panic!("cannot read {}: {}", p.display(), e));
+    assert!(
+        src.contains("static int smc_state_from_stride(uint32_t pc, uint32_t prev_pc)"),
+        "smc_state_from_stride() is gone"
+    );
+    assert!(
+        src.contains("steps == smc_t_sticky_step + 1ull"),
+        "the sticky state must be consulted only while it is FRESH"
+    );
+    assert_eq!(
+        src.matches("smc_t_sticky_step = steps;").count(),
+        2,
+        "both sticky assignments must stamp the step they resolved"
+    );
+    assert_eq!(
+        src.matches("uint32_t prev_pc = last_pc;").count(),
+        2,
+        "both dispatch hooks must snapshot the predecessor BEFORE trace_pc(pc)"
+    );
+    assert_eq!(
+        src.matches("m = smc_state_from_stride(pc, prev_pc);").count(),
+        2,
+        "both ladders must try the stride rule"
+    );
+    // NEGATIVE guard: in every ladder the stride rule has to come first.
+    for (i, _) in src.match_indices("int m = smc_state_from_regs(pc);") {
+        let tail = &src[i..(i + 400).min(src.len())];
+        let stride = tail
+            .find("m = smc_state_from_stride(pc, prev_pc);")
+            .unwrap_or_else(|| panic!("ladder at byte {i} lost the stride rule"));
+        let sticky = tail
+            .find("m = smc_t_sticky;")
+            .unwrap_or_else(|| panic!("ladder at byte {i} lost the sticky fallback"));
+        assert!(
+            stride < sticky,
+            "ladder at byte {i} consults the STALE sticky state before the stride rule"
+        );
+    }
+}
