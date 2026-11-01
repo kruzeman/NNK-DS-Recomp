@@ -2382,3 +2382,95 @@ fn phase_5ag_prelude_manifest_is_complete_and_current() {
     );
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+// ---------------------------------------------------------------------------
+// class 45 (Phase-5AI): the ARM7 producer never loses what the guest waits on
+// ---------------------------------------------------------------------------
+/// Post-skip (operator report) the guest halts in the SDK terminate helper
+/// (`0x020090D8` -> `0x02009108`: disable IRQ, WFI, spin) with `CPSR.I=1`, so
+/// nothing drains the ARM9 recv FIFO any more.  Measured: the last drain is at
+/// step 334,040,918, the halt is entered at step 334,058,027, and the first
+/// `ipc: p4r FIFO-full drop` follows at cycle 345,486,197 -- exactly the
+/// 16 recv + 32 host queue words backlogged at the measured 5.79 words/1e6
+/// cycles.  So the drop was a downstream SYMPTOM, but it was still a silent
+/// loss of a word the guest may wait on.  Phase-5AI removes the drop:
+///   * the producer's host queue is a *back-pressure* buffer -- when it is
+///     full the ARM7 has not produced the word yet (`next` stays put), which
+///     is what hardware does when the send FIFO is full;
+///   * the one-shot reply waits for a free recv-FIFO slot instead of pushing
+///     past `arm9_recv_fifo[16]` (that path had no bound at all);
+///   * the FIFO-full transition is logged once ("ARM7 send BLOCKED"), and the
+///     old silent-drop wording cannot come back.
+///
+/// Locked here (source invariants -- no ROM, no run):
+///   1. `NNK_P4R_QMAX` is a backlog capacity, not a 32-word drop ring;
+///   2. `nnk_p4r_schedule()` refuses to enqueue into a full queue (returns
+///      without advancing `next`) and reports BLOCKED/RESUMED;
+///   3. `nnk_p4r_enqueue()`'s only overflow branch is the loud INTERNAL one
+///      (it can no longer say "drop ... step=");
+///   4. the reply path is gated on `arm9_recv_n < 16u`;
+///   5. the `NNK_IPC_PROBE=1` drain probe exists, so the next worker can see
+///      *which* side stopped (guest vs model) instead of inferring it.
+#[test]
+fn phase_5ai_arm7_producer_backpressures_instead_of_dropping() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let dma = std::fs::read_to_string(root.join("tools/nnk_dma.inc"))
+        .expect("cannot read tools/nnk_dma.inc");
+
+    // (1) capacity: a backlog, not a 32-entry drop ring.
+    assert!(
+        dma.contains("#define NNK_P4R_QMAX 4096"),
+        "regression: the p4r host queue is back to a small drop ring"
+    );
+    assert!(
+        !dma.contains("#define NNK_P4R_QMAX 32"),
+        "regression: the 32-word drop ring is back"
+    );
+
+    // (2) the producer stalls on a full queue without advancing `next`.
+    let sched = dma
+        .find("static void nnk_p4r_schedule(void) {")
+        .expect("nnk_p4r_schedule() is gone");
+    let body = &dma[sched..];
+    let full = body
+        .find("if (nnk_p4r_qn >= NNK_P4R_QMAX) {")
+        .expect("the back-pressure branch is gone");
+    let enqueue = body
+        .find("nnk_p4r_enqueue(nnk_p4r_stream[i].word")
+        .expect("the enqueue call is gone");
+    assert!(
+        full < enqueue,
+        "regression: the producer enqueues before it checks for a full queue"
+    );
+    assert!(
+        body[full..enqueue].contains("return;"),
+        "regression: the full-queue branch no longer stops the producer"
+    );
+    assert!(
+        body[full..].contains("ARM7 send BLOCKED") && body[full..].contains("ARM7 send RESUMED"),
+        "regression: the FIFO-full transition is silent again"
+    );
+
+    // (3) no silent drop wording survives anywhere in the producer.
+    assert!(
+        !dma.contains("FIFO-full drop"),
+        "regression: the p4r producer silently drops words again"
+    );
+    assert!(
+        dma.contains("INTERNAL queue overflow") && dma.contains("must back-pressure first"),
+        "regression: the unreachable-overflow guard lost its diagnostic"
+    );
+
+    // (4) the one-shot reply waits for a recv-FIFO slot (it used to push past
+    // the 16-entry array).
+    assert!(
+        dma.contains("nnk_ipc_reply_pend && cycles >= nnk_ipc_reply_at && arm9_recv_n < 16u"),
+        "regression: the reply can overrun arm9_recv_fifo[16] again"
+    );
+
+    // (5) the drain probe exists and is opt-in.
+    assert!(
+        dma.contains("NNK_IPC_PROBE") && dma.contains("p4r: NO DRAIN") && dma.contains("drain RESUMED"),
+        "regression: the NNK_IPC_PROBE drain instrument is gone"
+    );
+}
