@@ -1,0 +1,91 @@
+# Ni no Kuni DS — prelude feature manifest (Phase-5AG)
+#
+# WHY THIS FILE EXISTS
+# tools/build_split.sh compiles a FROZEN dispatch image (work/phase3a/
+# arm9_thumb_ovl_itcm_p5u.c) that `nnktool recompile-all` generated at an
+# earlier phase.  The canonical runtime ("prelude") of the current tree lives
+# in nnktool/src/recompile.rs, in the tools/*.inc fragments that the image
+# #includes, and in the transforms tools/split_dispatch.py and the splice
+# scripts apply at build time.  A prelude fix committed to the tree is
+# therefore NOT in the shipped binary unless one of those three paths carries
+# it -- and nothing used to notice.  Phase-5AB (missing VRAM read shadow ->
+# 0x020E1B32 crash) and Phase-5AF (missing overlay registry -> only 2 overlay
+# slots) were both that class, discovered hours late.
+#
+# Every row is:  id <TAB> class <TAB> marker <TAB> source <TAB> description
+#
+#   class = required    the EFFECTIVE prelude must contain `marker`, and the
+#                       tree file `source` must contain it too (so the manifest
+#                       cannot rot into a test of nothing).  A missing marker
+#                       FAILS the build (tools/prelude_audit.py, called from
+#                       tools/build_split.sh after the split, before cc).
+#   class = divergent   the tree carries the marker but the frozen image
+#                       predates it.  Expected ABSENT from the effective
+#                       prelude; the audit reports it as "image predates the
+#                       tree" and tells a future phase to promote the row after
+#                       it splices the fix.  Not enforced: shipping these
+#                       changes guest-visible behaviour, which needs its own
+#                       measured phase.
+#   class = obsolete    the frozen image carries the marker, the tree dropped
+#                       it.  The audit reports it as a stale probe so it can be
+#                       dropped or re-spliced; not fatal (probes only).
+#
+# The search space for `required` is the effective prelude text: the split's
+# nnk_main.c (image prelude + every split-time injection) plus every *.inc
+# copied next to it.  That is exactly what cc compiles as the runtime TU.
+#
+# RULE FOR A FUTURE PHASE: when you add or change a prelude feature, add a row
+# here in the same commit, with the marker being a symbol/expression that only
+# that feature introduces.  Run `bash tools/build_split.sh <out>`: if the audit
+# fails, your feature is missing from the shipped binary -- splice it (see
+# tools/p5*_splice.py) or regenerate the image.  Full mechanics: PRELUDE_AUDIT.md
+
+# ---------------------------------------------------------------- required
+4m_vramcnt_width_model	required	nnk_vrc_in	tools/nnk_vramcnt.inc	Phase-4M: width-correct VRAMCNT_A..I model in every IO accessor path
+4m_vramcnt_readback	required	nnk_vrc_read	tools/nnk_vramcnt.inc	Phase-4M: VRAMCNT read-back (W8/W16/W32) so the guest's RMW sees its own writes
+4m_vramstat_readback	required	nnk_vrc_stat	tools/nnk_vramcnt.inc	Phase-4M: VRAMSTAT 0x0400024E derived from the ARM7-mapped banks
+5y_vramcnt_slot_table	required	vrc_slot	tools/nnk_vramcnt.inc	Phase-5Y: per-bank slot table (WRAMCNT 0x247 is not VRAMCNT_H)
+4m_2d_shadow_read	required	nnk_sh_read	tools/nnk_vramcnt.inc	Phase-4M: 2D register-block read shadow (engine A+B, 0x04000000/0x04001000)
+4m_2d_shadow_write	required	nnk_sh_write	tools/nnk_vramcnt.inc	Phase-4M: 2D register-block write shadow
+4m_powcnt1_readback	required	powerctl & 0xFFFFu	tools/split_dispatch.py	Phase-4M: POWCNT1 0x04000304 read-back (display-init RMW, black-screen class)
+5x_vram_read_shadow	required	gxd_sh_rd	nnktool/src/recompile.rs	Phase-5X: VRAM/palette/OAM window read shadow behind NNK_GX (0x020E1B32 crash class)
+5x_vram_write_shadow	required	gxd_sh_wr	nnktool/src/recompile.rs	Phase-5X: write side of the same shadow
+5f_vblank_irq_producer	required	p5f_vc_last	tools/split_dispatch.py	Phase-5F: periodic VBlank IRQ on the VCOUNT==192 edge (unbounded WFI supply)
+5f_wfi_probe	required	nnk_wfi_probe	tools/split_dispatch.py	Phase-5F/5H: NNK_WFI_PROBE state dump at the idle loop
+4n_cart_xferdone_irq	required	iflags |= 0x00080000u	tools/split_dispatch.py	Phase-4N: ROMEndTransfer raises IRQ_CartXferDone (idle-loop wake)
+4n_rule_based_irq_delivery	required	irq_trig_n >= IRQ_TRIG_N	tools/split_dispatch.py	Phase-4N: IRQ delivery falls through to the rule after the script table ends
+4q_arm7_ipc_responder	required	nnk_ipc_send	tools/nnk_dma.inc	Phase-4Q: ARM7 IPC-FIFO request -> measured reply (driver finish tail)
+4o_card_event_trace	required	cardlog_ev	tools/split_dispatch.py	Phase-4O: unbounded NNK_CARDLOG start/end trace
+4t_card_stall_probe	required	nnk_card_probe	tools/nnk_vramcnt.inc	Phase-4T: ROMCNT busy/DRQ stall dump + B7 block checksum
+4k_console_mac_seed	required	nnk_boot_firmware	tools/nnk_boot.inc	Phase-4K: console WIFI MAC at 0x02FFFCF4 (firmware property, not ROM)
+4l_dma_completion_shim	required	nnk_dma_tick	tools/nnk_dma.inc	Phase-4L: DMA completion/timing shim for vblank/hblank modes
+5b_arm7_keypad_publish	required	arm7_publish_keypad	tools/nnk_smc.inc	Phase-5B: ARM7 periodic keypad/touch publish at main-RAM 0x3FFFA8
+4w_keyinput_model	required	nnk_input_init	tools/nnk_input.inc	Phase-4W: SDL keyboard -> KEYINPUT/EXTKEYIN
+4w_input_file_script	required	NNK_INPUT_FILE	tools/nnk_input.inc	Phase-5X: NNK_INPUT_FILE operator script (timed taps) + recorder
+4w_input_script_parser	required	nnk_script_parse	tools/nnk_input.inc	Phase-5X: the script grammar itself
+smc_redispatch	required	nnk_smc_exec_any	tools/nnk_smc.inc	Phase-4L: decode-on-demand re-dispatch of ITCM/overlay code
+smc_store_note	required	smc_note	tools/nnk_smc.inc	Phase-5N/5P: store hook (watch/probe surface every st8/16/32 calls)
+5t_movie_hle_streams	required	p5t_nstr	tools/nnk_smc.inc	Phase-5AA: one movie HLE stream per codec (the stream table)
+5t_movie_source_is_file	required	NNK_MOVIE_YUV	tools/nnk_smc.inc	Phase-5T/5AC: NNK_MOVIE_YUV names a raw yuv420p file (a path, never a boolean)
+5u_step_probe	required	p5u_hook	tools/nnk_smc.inc	Phase-5U: per-sample NNK_P5U step/register probe
+5ae_vcount_cache	required	vc_win_lo	nnktool/src/recompile.rs	Phase-5AE: cached vcount() (bit-identical, removes a 64-bit div per query)
+5ae_gxd_tick_skip	required	gxd_last_vc	nnktool/src/recompile.rs	Phase-5AE: one gxd tick per scanline (tail call off the per-step path)
+5ae_probe_gate	required	nnk_probe_mask	tools/p5ae_runtime_splice.py	Phase-5AE: probe addresses parsed once, gated behind one int test
+5af_overlay_registry	required	BEGIN_NNK_OVL_BLOCK	nnktool/src/recompile.rs	Phase-4G/5AF: the ROM's 21-entry overlay table + load registry
+5af_overlay_pc_report	required	io_ovl_pc_report	nnktool/src/recompile.rs	Phase-5AF: table-driven classification of an untranslated PC
+5af_overlay_load_note	required	if (card_cmd[0] == 0xB7) io_ovl_note(addr);	tools/p5af_ovl_table_splice.py	Phase-4G: overlay load event on the B7 card stream
+5af_overlay_arena_dump	required	io_ovl_dump_tick	nnktool/src/recompile.rs	Phase-5AF: per-dispatch first-gen arena dump hook
+5af_overlay_arena_dump_exit	required	io_ovl_dump_exit	nnktool/src/recompile.rs	Phase-5AF: resident-arena dump at halt
+5af_overlay_table_dump	required	io_ovl_table_dump	nnktool/src/recompile.rs	Phase-5AF: NNK_OVL_TABLE=path table dump (the doc's number)
+
+# --------------------------------------------------------------- divergent
+# Tree ahead of the frozen image, deliberately NOT enforced this phase: each
+# one changes guest-visible behaviour, so shipping it needs its own measured
+# phase (band + verifier), not a silent splice.
+4l_dma_startmode_field	obsolete	uint32_t timing = (cnt >> 24) & 3u;	nnktool/src/recompile.rs	Phase-4L: the image's io_dma_exec still decodes StartMode from bits 24..25; the tree reads 27..29.  Harmless today: timed/immediate DMA semantics are owned by tools/nnk_dma.inc (which carries the correct field), so this line is a stale leftover to drop or splice.  Reported, not fatal.
+5q_itcm_at_pc	divergent	itcm_dump_at_pc	nnktool/src/recompile.rs	Phase-5Q: PC-triggered live ITCM snapshot (the image still carries pred/dc probes)
+5ad_quit_path_diag	divergent	nnk: quit path at step=	nnktool/src/recompile.rs	Phase-5AD: GX quit-path diagnostics
+
+# ---------------------------------------------------------------- obsolete
+5r_pred_probe	obsolete	static void pred_probe(uint32_t pc)	nnktool/src/recompile.rs	Phase-5R intra-predictor probe, removed from the tree (superseded by 5Q itcm_dump_at_pc)
+5s_dc_probe	obsolete	static void dc_probe(uint32_t pc)	nnktool/src/recompile.rs	Phase-5S DC-dequant probe, removed from the tree

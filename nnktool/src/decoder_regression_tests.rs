@@ -2196,3 +2196,189 @@ fn phase_5af_overlay_map_is_table_driven() {
         assert!(splice.contains(hook), "regression: splice lost the anchor {hook:?}");
     }
 }
+
+/// Phase-5AG: the prelude feature manifest is complete and CURRENT.
+///
+/// Two consecutive phases (5AB, 5AF) shipped a binary whose runtime prelude
+/// silently predated a committed fix, because tools/build_split.sh compiles a
+/// frozen dispatch image.  tools/nnk_prelude_manifest.txt + the audit in
+/// tools/build_split.sh make that class impossible; this test keeps the
+/// manifest itself honest:
+///
+///   1. every row is well formed (5 tab-separated fields, unique id, known
+///      class) and there are enough of them to cover the prelude surface;
+///   2. a `required` row's marker still exists in the tree file that owns it
+///      (a manifest row may not survive the feature it describes);
+///   3. a `divergent` row is still in the tree, an `obsolete` row is not;
+///   4. every feature id a splice in tools/build_split.sh registers is a
+///      `required` manifest row, so a new splice cannot ship unlisted;
+///   5. the auditor itself enforces the rule: a prelude missing a required
+///      marker exits non-zero and names it, a complete one exits zero.
+#[test]
+fn phase_5ag_prelude_manifest_is_complete_and_current() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let manifest_path = root.join("tools/nnk_prelude_manifest.txt");
+    let manifest = std::fs::read_to_string(&manifest_path)
+        .expect("cannot read tools/nnk_prelude_manifest.txt");
+
+    struct Row {
+        id: String,
+        class: String,
+        marker: String,
+        source: String,
+    }
+    let mut rows: Vec<Row> = Vec::new();
+    for (n, line) in manifest.lines().enumerate() {
+        if line.trim().is_empty() || line.trim_start().starts_with('#') {
+            continue;
+        }
+        let f: Vec<&str> = line.split('\t').collect();
+        assert_eq!(
+            f.len(),
+            5,
+            "manifest line {}: expected id/class/marker/source/description, got {:?}",
+            n + 1,
+            line
+        );
+        assert!(
+            matches!(f[1], "required" | "divergent" | "obsolete"),
+            "manifest line {}: unknown class {:?}",
+            n + 1,
+            f[1]
+        );
+        assert!(
+            !rows.iter().any(|r| r.id == f[0]),
+            "duplicate manifest feature id {:?}",
+            f[0]
+        );
+        rows.push(Row {
+            id: f[0].to_string(),
+            class: f[1].to_string(),
+            marker: f[2].to_string(),
+            source: f[3].to_string(),
+        });
+    }
+
+    // (1) the inventory must actually be an inventory (the frozen image's
+    // stale surface alone is ~36 features).
+    let required: Vec<&Row> = rows.iter().filter(|r| r.class == "required").collect();
+    assert!(
+        required.len() >= 30,
+        "the prelude manifest shrank to {} required features; the inventory \
+         must cover every prelude feature (see PRELUDE_AUDIT.md)",
+        required.len()
+    );
+
+    // (2)+(3) every row's marker must match the TREE as the class claims.
+    for r in &rows {
+        let p = root.join(&r.source);
+        let text = std::fs::read_to_string(&p)
+            .unwrap_or_else(|e| panic!("{}: source {} unreadable: {e}", r.id, r.source));
+        let found = text.contains(&r.marker);
+        match r.class.as_str() {
+            "required" => assert!(
+                found,
+                "{}: marker {:?} is gone from its canonical source {} — the \
+                 manifest row is stale (re-classify or drop it)",
+                r.id, r.marker, r.source
+            ),
+            "divergent" => assert!(
+                found,
+                "{}: a divergent row must still describe a tree feature ({} \
+                 lost {:?}); promote or drop it",
+                r.id, r.source, r.marker
+            ),
+            _ => assert!(
+                !found,
+                "{}: marked obsolete but {:?} is back in {} — re-classify it",
+                r.id, r.marker, r.source
+            ),
+        }
+    }
+
+    // (4) build_split.sh registers the features each splice installs; every
+    // registered id must be a required manifest row.  Read the array
+    // assignments out of the script and cross-check them.
+    let build = std::fs::read_to_string(root.join("tools/build_split.sh"))
+        .expect("cannot read tools/build_split.sh");
+    let mut registered: Vec<String> = Vec::new();
+    let mut rest = build.as_str();
+    while let Some(i) = rest.find("SPLICED_FEATURES+=(") {
+        rest = &rest[i + "SPLICED_FEATURES+=(".len()..];
+        let end = rest.find(')').expect("unterminated SPLICED_FEATURES+=");
+        for id in rest[..end].split_whitespace() {
+            registered.push(id.to_string());
+        }
+        rest = &rest[end..];
+    }
+    assert!(
+        registered.len() >= 10,
+        "build_split.sh registers only {} spliced features; the three splices \
+         install at least 11",
+        registered.len()
+    );
+    for id in &registered {
+        let row = rows.iter().find(|r| &r.id == id).unwrap_or_else(|| {
+            panic!("build_split.sh splices feature {id:?} that has no manifest row")
+        });
+        assert_eq!(
+            row.class, "required",
+            "{id:?} is installed by a splice, so it must be a `required` row"
+        );
+    }
+
+    // (5) the auditor enforces the rule end to end.  Synthetic split dirs: one
+    // empty prelude (must fail and name the missing feature), one carrying
+    // every required marker (must pass).
+    assert!(
+        build.contains("tools/prelude_audit.py --split")
+            && build.contains("BUILD FAILED: the prelude audit rejected"),
+        "build_split.sh no longer fails the build on a missing prelude feature"
+    );
+    let tmp = std::env::temp_dir().join(format!("nnk_p5ag_audit_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).expect("cannot create audit temp dir");
+    let run = |dir: &std::path::Path| {
+        std::process::Command::new("python3")
+            .arg(root.join("tools/prelude_audit.py"))
+            .arg("--split")
+            .arg(dir)
+            .output()
+            .expect("cannot run tools/prelude_audit.py")
+    };
+
+    std::fs::write(tmp.join("nnk_main.c"), "/* an empty prelude */\n").unwrap();
+    let bad = run(&tmp);
+    let bad_err = String::from_utf8_lossy(&bad.stderr);
+    assert!(
+        !bad.status.success(),
+        "the audit passed a prelude with NO features -- it would ship anything"
+    );
+    assert!(
+        bad_err.contains("AUDIT FAILED") && bad_err.contains(&required[0].id),
+        "the audit's failure must name the missing features, got:\n{bad_err}"
+    );
+
+    let mut complete = String::from("/* synthetic complete prelude */\n");
+    for r in &required {
+        complete.push_str(&r.marker);
+        complete.push('\n');
+    }
+    std::fs::write(tmp.join("nnk_main.c"), &complete).unwrap();
+    let good = run(&tmp);
+    assert!(
+        good.status.success(),
+        "the audit rejected a prelude that carries every required marker:\n{}\n{}",
+        String::from_utf8_lossy(&good.stdout),
+        String::from_utf8_lossy(&good.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&good.stdout).contains(&format!(
+            "prelude: {}/{} features present",
+            required.len(),
+            required.len()
+        )),
+        "the audit no longer prints the N/N summary line"
+    );
+    let _ = std::fs::remove_dir_all(&tmp);
+}
