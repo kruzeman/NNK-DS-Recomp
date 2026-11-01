@@ -445,6 +445,13 @@ def main():
     # (5) Phase-4W: the SDL keyboard input model
     shutil.copyfile(os.path.join(here, "nnk_input.inc"),
                     os.path.join(outdir, "nnk_input.inc"))
+    # (6) Phase-5AH: the in-process MobiClip decoder.  nnk_smc.inc #includes
+    # nnk_mobiclip.inc, which #includes the vendored codec body, so both must
+    # sit next to the generated TU.
+    shutil.copyfile(os.path.join(here, "nnk_mobiclip.inc"),
+                    os.path.join(outdir, "nnk_mobiclip.inc"))
+    shutil.copyfile(os.path.join(here, "nnk_mobiclip_dec.inc"),
+                    os.path.join(outdir, "nnk_mobiclip_dec.inc"))
 
     # ---- Phase-4M: VRAMCNT_A..I model hooks -----------------------------
     # The generated image's IO model is store-only AND 8-bit-only for

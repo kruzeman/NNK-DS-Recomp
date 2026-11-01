@@ -1224,6 +1224,13 @@ int nnk_smc_try(uint32_t *pcp) {
  * genuine data-as-code jump still stops the run instead of running wild.
  * Main-RAM window only (0x02000000..0x03800000), like nnk_smc_try. */
 /* ==========================================================================
+ * Phase-5AH: the in-process MobiClip decoder (compat layer + MODS demuxer +
+ * the vendored libavcodec/mobiclip.c body) that the Phase-5T HLE below uses
+ * to paint the movie straight out of the card image.
+ * ========================================================================== */
+#include "nnk_mobiclip.inc"
+
+/* ==========================================================================
  * Phase-5T — HLE Mobiclip movie decode (host decode feeds the guest planes).
  *
  * MEASURED CONTRACT (PHASE5T.md):
@@ -1275,55 +1282,89 @@ int nnk_smc_try(uint32_t *pcp) {
 #define P5T_CB_RET 0x0207B21Cu
 #define P5T_MAXSTREAM 4
 
-/* Phase-5AA: one entry per codec (per movie), not one global cursor. */
+/* Phase-5AA: one entry per codec (per movie), not one global cursor.
+ *
+ * Phase-5AH: the picture source is now the ROM itself.  Each stream either
+ *   * decodes data/movie/*.mods from the card image in-process
+ *     (tools/nnk_mobiclip.inc) — the DEFAULT, and the only input is
+ *     NNK_ROM_PATH; or
+ *   * reads a raw yuv420p file named by NNK_MOVIE_YUV / NNK_MOVIE_YUV2 —
+ *     a reviewer's A/B DIAGNOSTIC, never a requirement.
+ */
 typedef struct {
     uint32_t codec;      /* stream struct base = the callback's r0 */
     uint32_t cursor;     /* [codec] at the previous present of THIS stream */
     long index;          /* next frame index (-1 = session start) */
     long frames, presents, shortr;
-    FILE *fp;
+    FILE *fp;            /* yuv override mode */
+    int  rom;            /* 1 = decode the .mods container from the card */
+    NnkMobiDec dec;
+    NnkMods    mods;
 } P5tStream;
 
-static int p5t_state;                 /* 0 unparsed, 1 off, 2 on */
+static int p5t_state;                 /* 0 unparsed, 1 off, 2 yuv file, 3 rom */
 static P5tStream p5t_str[P5T_MAXSTREAM];
 static int p5t_nstr;
 static uint32_t p5t_codec;            /* codec of the CURRENT decode step */
 static uint8_t p5t_buf[P5T_FRAME];
+/* Phase-5AH: per-stream default container, overridable for A/B work only. */
+#define P5T_ROM_SRC1 "data/movie/op_u.mods"
+#define P5T_ROM_SRC2 "data/movie/op_d.mods"
 
 static void p5t_init(void) {
     const char *p = getenv("NNK_MOVIE_YUV");
     FILE *probe;
+    const uint8_t *m1, *m2;
+    size_t n1 = 0, n2 = 0;
     p5t_state = 1;
-    if (!p || !p[0]) return;
-    /* Phase-5AC: NNK_MOVIE_YUV must NAME a readable raw yuv420p file (73728 B
-     * per 256x192 frame); it is not a boolean.  A bare truthy value ("1",
-     * "on") used to switch the HLE ON with no source at all: p5t_stream()
-     * then failed to fopen("1") for the FIRST codec, p5t_nstr stayed 0, and
-     * the hook wrote nothing for the whole run — measured in Phase-5AC as
-     * cfg1 (NNK_MOVIE_YUV=1) vs cfg0 (unset) producing 14/14 BYTE-IDENTICAL
-     * display frames, i.e. exactly the HLE-off picture, while the startup
-     * banner still claimed "hle src1=1".  Only a source that actually opens
-     * enables the present path, and the fallback is announced. */
-    probe = fopen(p, "rb");
-    if (!probe) {
-        fprintf(stderr, "movie: NNK_MOVIE_YUV=%s is not a readable yuv420p file"
-                        " -> HLE OFF (the guest's own decoder runs).  Canonical"
-                        " configuration: NNK_MOVIE_YUV=<op_u.yuv>"
-                        " NNK_MOVIE_YUV2=<op_d.yuv>\n", p);
+    if (p && p[0]) {
+        /* Phase-5AC: NNK_MOVIE_YUV must NAME a readable raw yuv420p file
+         * (73728 B per 256x192 frame); it is not a boolean.  A bare truthy
+         * value ("1", "on") used to switch the HLE ON with no source at all:
+         * p5t_stream() then failed to fopen("1") for the FIRST codec,
+         * p5t_nstr stayed 0, and the hook wrote nothing for the whole run —
+         * measured in Phase-5AC as cfg1 (NNK_MOVIE_YUV=1) vs cfg0 (unset)
+         * producing 14/14 BYTE-IDENTICAL display frames, i.e. exactly the
+         * HLE-off picture, while the startup banner still claimed
+         * "hle src1=1". */
+        probe = fopen(p, "rb");
+        if (probe) {
+            fclose(probe);
+            p5t_state = 2;
+            fprintf(stderr, "movie: hle A/B OVERRIDE src1=%s src2=%s plane=%dx%d"
+                            " (yuv420p files; the shipped path needs none)\n",
+                    p, (getenv("NNK_MOVIE_YUV2") && getenv("NNK_MOVIE_YUV2")[0])
+                           ? getenv("NNK_MOVIE_YUV2") : "(src1)", P5T_W, P5T_H);
+            return;
+        }
+        fprintf(stderr, "movie: NNK_MOVIE_YUV=%s is not a readable yuv420p file;"
+                        " ignoring the override and using the ROM\n", p);
+    }
+    /* Phase-5AH default: decode the containers out of the card image. */
+    if (!rom || rom_len < 0x200) {
+        fprintf(stderr, "movie: HLE OFF — no card image (NNK_ROM_PATH unset),"
+                        " so the movie is unavailable and the guest's own"
+                        " (unfixed) decoder would paint the picture\n");
         return;
     }
-    fclose(probe);
-    p5t_state = 2;
-    fprintf(stderr, "movie: hle src1=%s src2=%s plane=%dx%d\n",
-            p, (getenv("NNK_MOVIE_YUV2") && getenv("NNK_MOVIE_YUV2")[0])
-                   ? getenv("NNK_MOVIE_YUV2") : "(src1)",
-            P5T_W, P5T_H);
+    m1 = m2 = NULL;
+    if (nnk_rom_file(rom, rom_len, P5T_ROM_SRC1, &m1, &n1) < 0) m1 = NULL;
+    if (nnk_rom_file(rom, rom_len, P5T_ROM_SRC2, &m2, &n2) < 0) m2 = NULL;
+    if (!m1) {
+        fprintf(stderr, "movie: HLE OFF — %s not found in the card image\n", P5T_ROM_SRC1);
+        return;
+    }
+    p5t_state = 3;
+    fprintf(stderr, "movie: hle rom src1=%s (%zu B) src2=%s (%zu B) plane=%dx%d\n",
+            P5T_ROM_SRC1, n1,
+            m2 ? P5T_ROM_SRC2 : "(missing)", n2, P5T_W, P5T_H);
 }
 
-/* Register a codec and open its frame source.  Stream 1 uses NNK_MOVIE_YUV,
- * stream 2 NNK_MOVIE_YUV2 (falling back to stream 1's file), later sessions
- * stream 1's file again — a session restart at a new codec address starts a
- * new stream at frame 0, exactly like a new movie session on the real player. */
+/* Register a codec and open its frame source.  ROM mode: stream 1 decodes
+ * op_u.mods (top screen), stream 2 op_d.mods (bottom); NNK_MOVIE_MODS /
+ * NNK_MOVIE_MODS2 name other containers inside the card.  YUV mode keeps the
+ * Phase-5AA behaviour (stream 1 = NNK_MOVIE_YUV, stream 2 = NNK_MOVIE_YUV2,
+ * falling back to stream 1's file). */
 static P5tStream *p5t_stream(uint32_t codec) {
     P5tStream *s;
     const char *p, *n;
@@ -1334,15 +1375,39 @@ static P5tStream *p5t_stream(uint32_t codec) {
         fprintf(stderr, "movie: no stream slot for codec 0x%08X (dropped)\n", codec);
         return NULL;
     }
+    s = &p5t_str[p5t_nstr];
+    memset(s, 0, sizeof *s);
+    s->codec = codec;
+    s->index = -1;
+    if (p5t_state == 3) {
+        const uint8_t *img = NULL;
+        size_t ilen = 0;
+        const char *env = (p5t_nstr == 1) ? getenv("NNK_MOVIE_MODS2") : getenv("NNK_MOVIE_MODS");
+        const char *path = (env && env[0]) ? env
+                         : (p5t_nstr == 1) ? P5T_ROM_SRC2 : P5T_ROM_SRC1;
+        if (nnk_rom_file(rom, rom_len, path, &img, &ilen) < 0) {
+            fprintf(stderr, "movie: stream %d: %s not found in the card image\n", p5t_nstr, path);
+            return NULL;
+        }
+        if (nnk_mods_parse(&s->mods, img, ilen) < 0) {
+            fprintf(stderr, "movie: stream %d: %s is not a MODS container\n", p5t_nstr, path);
+            return NULL;
+        }
+        if (nnk_mobi_open(&s->dec, s->mods.width, s->mods.height) < 0) {
+            fprintf(stderr, "movie: stream %d: decoder init failed\n", p5t_nstr);
+            nnk_mods_free(&s->mods);
+            return NULL;
+        }
+        s->rom = 1;
+        s->frames = s->mods.nframes;
+        fprintf(stderr, "movie: stream %d codec=0x%08X source=rom:%s frames=%ld %dx%d step=%llu\n",
+                p5t_nstr, codec, path, s->frames, s->mods.width, s->mods.height,
+                (unsigned long long)steps);
+        p5t_nstr++;
+        return s;
+    }
     p = (p5t_nstr == 1) ? getenv("NNK_MOVIE_YUV2") : NULL;
     if (!p || !p[0]) p = getenv("NNK_MOVIE_YUV");
-    s = &p5t_str[p5t_nstr];
-    s->codec = codec;
-    s->cursor = 0;
-    s->index = -1;
-    s->frames = 0;
-    s->presents = 0;
-    s->shortr = 0;
     s->fp = fopen(p, "rb");
     if (!s->fp) {
         fprintf(stderr, "movie: stream %d cannot open %s\n", p5t_nstr, p);
@@ -1365,7 +1430,7 @@ static P5tStream *p5t_stream(uint32_t codec) {
 /* Callback entry: remember which codec this decode step belongs to. */
 static void p5t_note_codec(uint32_t codec) {
     if (!p5t_state) p5t_init();
-    if (p5t_state != 2) return;
+    if (p5t_state < 2) return;
     if (!p5t_stream(codec)) return;
     p5t_codec = codec;
 }
@@ -1421,10 +1486,10 @@ static void p5t_present(void) {
     P5tStream *s = NULL;
     uint32_t cur, player;
     int i;
-    if (p5t_state != 2) return;
+    if (p5t_state < 2) return;
     for (i = 0; i < p5t_nstr; i++)
         if (p5t_str[i].codec == p5t_codec) s = &p5t_str[i];
-    if (!s || !s->fp) return;
+    if (!s || (!s->fp && !s->rom)) return;
     cur = ld32(p5t_codec);
     /* One source frame per decode step (measured: melonDS's ring holds
      * consecutive op_u/op_d frames 125..130 at f130).  The stream cursor
@@ -1438,10 +1503,20 @@ static void p5t_present(void) {
     if (s->index >= s->frames) {           /* past EOF: hold the last frame */
         s->index = s->frames - 1;
     }
-    if (fseek(s->fp, (long)s->index * P5T_FRAME, SEEK_SET) != 0) return;
-    if (fread(p5t_buf, 1, P5T_FRAME, s->fp) != (size_t)P5T_FRAME) {
-        s->shortr++;
-        return;
+    if (s->rom) {
+        /* Phase-5AH: decode this frame in-process from the card image.  The
+         * decoder keeps the reference pictures, so presenting frame N costs
+         * one frame decode (P frames) after the previous present. */
+        if (nnk_mobi_frame(&s->dec, &s->mods, (int)s->index, p5t_buf, NULL, NULL) < 0) {
+            s->shortr++;
+            return;
+        }
+    } else {
+        if (fseek(s->fp, (long)s->index * P5T_FRAME, SEEK_SET) != 0) return;
+        if (fread(p5t_buf, 1, P5T_FRAME, s->fp) != (size_t)P5T_FRAME) {
+            s->shortr++;
+            return;
+        }
     }
     /* The decoder's OUTPUT buffers are the codec's six Y ring slots
      * (codec+0x0C..+0x20).  The player's own source-plane fields are NOT
