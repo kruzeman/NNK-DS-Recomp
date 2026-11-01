@@ -1,0 +1,13 @@
+# Ni no Kuni DS - short frame-timed session (Phase-5Z round-trip fixture)
+# frame = DISPLAY frame; KEYINPUT active-low, idle 0x3FF
+# B=bit1=0x3FD (notice/menu advance), A=bit0=0x3FE (skip), Start=bit3=0x3F7
+0 0x3FF
+13 0x3FD
+15 0x3FF
+49 0x3FD
+51 0x3FF
+85 0x3FE
+87 0x3FF
+120 0x3F7
+122 0x3FF
+end

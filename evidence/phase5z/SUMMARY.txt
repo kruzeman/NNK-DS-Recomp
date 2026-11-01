@@ -1,0 +1,30 @@
+# Phase-5Z evidence — scripted NNK_INPUT_FILE + NNK_INPUT_RECORD
+# all lines below are verbatim grep/diff output of the runs described in PHASE5Z.md
+
+=== 1. round trip: play (script -> record) ===
+gx: 131 frames presented, 125926 unhandled io writes\nnnk_input: summary script entries=9 applied=9 last_frame=131 recorded=9 entries first_recorded_frame=0
+done steps=70000001 traced=70000000 distinct_pcs=19478 hle_hits=7303 halt_pc=0x02007134 halt=step budget exhausted
+done steps=70000001 traced=70000000 distinct_pcs=19478 hle_hits=7303 halt_pc=0x02007134 halt=step budget exhausted
+=== 1b. round trip: replay (recorded file -> NNK_INPUT_FILE) ===
+gx: 131 frames presented, 125926 unhandled io writes\nnnk_input: summary script entries=9 applied=9 last_frame=131 recorded=0 entries
+done steps=70000001 traced=70000000 distinct_pcs=19478 hle_hits=7303 halt_pc=0x02007134 halt=step budget exhausted
+done steps=70000001 traced=70000000 distinct_pcs=19478 hle_hits=7303 halt_pc=0x02007134 halt=step budget exhausted
+=== 1c. script vs recorded (diff) ===
+0 differences
+=== 1d. applied masks, play vs replay (diff) ===
+0 differences
+
+=== 2. recorder captures the injector too (no script, NNK_INPUT_INJECT X down/up) ===
+0 0x3FF
+59 0x3FE
+61 0x3FF
+gx: 77 frames presented, 115377 unhandled io writes\nnnk_input: summary script entries=0 applied=0 last_frame=77 recorded=3 entries first_recorded_frame=0
+
+=== 3. frontier run (operator session, VRAM read shadow, 900M step budget) ===
+halt state: r0=00000000 r1=6000009F r2=00000000 r3=00000000 r4=00000002 r5=022C5C84 r6=00000004 r7=0000011C r13=027E3A00 r14=02009114 nzcv=0110
+done steps=900000001 traced=900000000 distinct_pcs=23174 hle_hits=7760 halt_pc=0x0200911C halt=step budget exhausted
+gx: 1613 frames presented, 205174 unhandled io writes\nnnk_input: summary script entries=113 applied=91 last_frame=1613 recorded=91 entries first_recorded_frame=0
+--- A-skip application and the last guest KEYINPUT read:
+step=510500540 script applied frame=917 mask=0x3FE entry=52/113 pressed=0xC01 released=0x000
+step=510500540 file mask=0xFFE EXTKEYIN=0x7F frame=917
+step=328139850 guest KEYINPUT read #516 val=0x03FF frame=591
