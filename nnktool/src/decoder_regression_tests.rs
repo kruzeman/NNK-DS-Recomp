@@ -1171,3 +1171,80 @@ fn runtime_interrupt_model_reaches_the_vblank_and_stops_at_cpsr_i() {
     assert_eq!(0x0207B218u32 & 3, 0, "fixture sanity: the `blx r1` is ARM-aligned");
 }
 
+
+/// Phase-5V — the CPSR.I stall is observable through ONE funnel.
+///
+/// Measured (PHASE5V.md): after the last delivered IRQ (step 2,256,303,812,
+/// ctl D2->1F) the guest takes three balanced OS_DisableInterrupts /
+/// OS_RestoreInterrupts pairs and then a LAST, unreleased disable at step
+/// 2,256,356,359 (pc=0x02008D28, lr=0x02007070, ctl 1F->9F) inside the SDK
+/// sleep/yield path — and from there to the end of the window not one further
+/// CPSR write happens, so no interrupt can be delivered.
+///
+/// That count is only trustworthy because every architectural CPSR-control
+/// write goes through `cpsr_set_ctl()`: the compiled `Kind::Msr` emitter, the
+/// live re-decoder's `msr` cases, the exception entry (`0xD2`) and the
+/// exception return (the SPSR restore).  This class locks that funnel plus the
+/// probe that measures it, so a future fix cannot quietly lose either.
+#[test]
+fn cpsr_i_transitions_are_observable_through_the_single_ctl_funnel() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let rs = std::fs::read_to_string(root.join("nnktool/src/recompile.rs"))
+        .expect("cannot read nnktool/src/recompile.rs");
+
+    // The funnel: one definition per runtime text (RUNTIME, RUNTIME_ALL) and
+    // one assignment site in each (a mode change is a CPSR write too, so both
+    // banks and ctl are updated together).
+    assert_eq!(
+        rs.matches("static void cpsr_set_ctl(uint32_t ctl)").count(),
+        2,
+        "regression: cpsr_set_ctl definitions changed — the I-bit history would split"
+    );
+    assert_eq!(
+        rs.matches("cpsr_ctl = ctl & 0xFFu;").count(),
+        2,
+        "regression: cpsr_ctl is no longer written only by cpsr_set_ctl (RUNTIME + RUNTIME_ALL)"
+    );
+    // Both exception paths must stay inside the funnel.
+    for needle in [
+        "cpsr_set_ctl(0xD2u);",              // exception entry: IRQ mode, I+F
+        "cpsr_set_ctl(sr & 0xFFu);",         // exception return: SPSR restore
+        "static void irq_enter(uint32_t *pc)",
+        "static void bios_irq_return(uint32_t *pc)",
+    ] {
+        assert!(rs.contains(needle), "regression: exception CPSR path lost: {needle}");
+    }
+    // The compiled `msr` and the live-decoder `msr` must both write ctl only.
+    let inc = std::fs::read_to_string(root.join("tools/nnk_smc.inc"))
+        .expect("cannot read tools/nnk_smc.inc");
+    assert_eq!(
+        inc.matches("cpsr_set_ctl(tv & 0xFFu);").count(),
+        2,
+        "regression: the live decoder's msr CPSR_c / msr spsr_c paths changed"
+    );
+
+    // The probe (tools/p5v_i_probe_splice.py) and its three measured sites.
+    let splice = std::fs::read_to_string(root.join("tools/p5v_i_probe_splice.py"))
+        .expect("cannot read tools/p5v_i_probe_splice.py");
+    for needle in [
+        "static void p5v_i_edge(uint32_t oldc, uint32_t newc)",
+        "(((p5v_o ^ cpsr_ctl) & 0x80u) != 0u)",   // log I transitions only
+        "NNK_P5V_FROM",
+        "static void p5v_sched(uint32_t pc)",
+        "0x020070B4u",                            // the yield loop that parks
+        "0x020067E0u",                            // OS_RescheduleThread
+        "0x0206C684u",                            // OSi_ThreadInfo block
+        "p5v_watch(a, v, 4u)",
+        "NNK_P5V_WATCH_FROM",
+    ] {
+        assert!(splice.contains(needle), "regression: Phase-5V probe lost: {needle}");
+    }
+    assert!(
+        splice.contains("'static void trace_pc(uint32_t pc) {'")
+            && splice.contains("p5v_sched(pc);"),
+        "regression: the scheduler dump no longer hooks trace_pc (the shared dispatch point)"
+    );
+    // Fixture sanity: the two helpers the measured history names.
+    assert_eq!(0x02008D28u32 & 3, 0, "fixture: OS_DisableInterrupts' msr is ARM-aligned");
+    assert_eq!(0x02008D40u32 & 3, 0, "fixture: OS_RestoreInterrupts' msr is ARM-aligned");
+}
