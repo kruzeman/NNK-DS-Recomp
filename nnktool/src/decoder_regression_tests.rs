@@ -1716,3 +1716,86 @@ fn vram_read_shadow_round_trips_a_guest_store() {
     assert_eq!(0x020E_1B32u32 - 0x020E_1B28u32, 10, "fixture: ldr..blx span is 10 bytes of Thumb");
     assert_eq!(0x0600_6004u32 & 3, 0, "fixture: the vptr word is 4-byte aligned");
 }
+
+/// Phase-5AC, class 40: `NNK_MOVIE_YUV` NAMES a frame source — it is not a
+/// boolean, and a bare truthy value must not leave the HLE "enabled" with
+/// nothing to present.
+///
+/// Measured in Phase-5AC on the same shadow-fixed binary and the same scripted
+/// session: `NNK_MOVIE_YUV=1` (cfg1) and `NNK_MOVIE_YUV` unset (cfg0) produce
+/// **14/14 byte-identical** display frames (f100..f1400), because p5t_init()
+/// used to set `p5t_state = 2` for any non-empty value while p5t_stream() then
+/// failed to `fopen("1")` for the first codec, so `p5t_nstr` stayed 0 and
+/// p5t_present() returned without writing a byte — the whole hook was off
+/// while the banner still printed `movie: hle src1=1`.  The startup gate is
+/// now the source file itself: only a path that opens enables the present
+/// path, and the off case says so and names the canonical pair.
+#[test]
+fn movie_hle_requires_a_readable_source() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let inc = std::fs::read_to_string(root.join("tools/nnk_smc.inc"))
+        .expect("cannot read tools/nnk_smc.inc");
+
+    // (a) the gate: the source is probed with fopen BEFORE the HLE is enabled,
+    //     and the enable line is not reachable on a failed probe.
+    let init = inc
+        .find("static void p5t_init(void) {")
+        .expect("regression: p5t_init is gone");
+    let init_body = &inc[init..];
+    let init_body = &init_body[..init_body.find("\n}\n").expect("p5t_init end missing")];
+    assert!(
+        init_body.contains("if (!p || !p[0]) return;"),
+        "regression: an unset/empty NNK_MOVIE_YUV no longer leaves the HLE off"
+    );
+    assert!(
+        init_body.contains("probe = fopen(p, \"rb\");"),
+        "regression: NNK_MOVIE_YUV is trusted without opening it (a bare \"1\" would enable the HLE)"
+    );
+    let gate = init_body.find("if (!probe) {").expect("regression: the fopen gate is gone");
+    let enable = init_body.find("p5t_state = 2;").expect("regression: the enable line is gone");
+    assert!(
+        gate < enable,
+        "regression: p5t_state = 2 is reached without a successful fopen (the Phase-5AC mis-wiring)"
+    );
+    assert!(
+        init_body[gate..enable].contains("HLE OFF"),
+        "regression: a rejected source no longer announces that the HLE is off"
+    );
+    assert!(
+        init_body.contains("NNK_MOVIE_YUV2=<op_d.yuv>"),
+        "regression: the canonical configuration (op_u top / op_d bottom) left the message"
+    );
+    // The per-frame size that makes a path a *source* rather than a flag.
+    assert!(inc.contains("#define P5T_FRAME (P5T_YSZ + 2 * P5T_CSZ)"));
+    assert_eq!(256u32 * 192 * 3 / 2, 73728, "fixture: one 256x192 yuv420p frame");
+
+    // (b) the gate re-implemented from the C text: only a source that opens
+    //     turns the hook on; every truthy non-file stays off (state 1).
+    let decide = |v: Option<&str>, opens: &dyn Fn(&str) -> bool| -> u32 {
+        match v {
+            None => 1,
+            Some(s) if s.is_empty() => 1,
+            Some(s) if opens(s) => 2,
+            Some(_) => 1,
+        }
+    };
+    let only_op_u = |s: &str| s == "op_u.yuv";
+    for v in [None, Some(""), Some("0"), Some("1"), Some("on"), Some("yes"), Some("/nonexistent/op_u.yuv")] {
+        assert_eq!(decide(v, &only_op_u), 1, "{v:?} must leave the HLE off");
+    }
+    assert_eq!(decide(Some("op_u.yuv"), &only_op_u), 2, "a real source must enable the hook");
+    // The measured equivalence that motivates the gate: cfg1 == cfg0 byte-exact.
+    assert_eq!(decide(Some("1"), &only_op_u), decide(None, &only_op_u),
+        "fixture: NNK_MOVIE_YUV=1 and unset both leave the HLE off (Phase-5AC, 14/14 identical frames)");
+
+    // (c) a failed source must not be retried per codec forever: the probe is
+    //     in p5t_init (once), and p5t_stream's own failure path still logs.
+    assert_eq!(
+        inc.matches("probe = fopen(p, \"rb\");").count(), 1,
+        "regression: the source probe duplicated (it must run once, in p5t_init)"
+    );
+    assert!(
+        inc.contains("movie: stream %d cannot open %s"),
+        "regression: the per-stream open failure stopped being reported"
+    );
+}
