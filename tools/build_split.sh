@@ -252,7 +252,7 @@ done
 
 # Everything that must invalidate a cached .o is captured once here.
 CC_ID=$("$CC" --version | head -1)
-HDR_HASH=$(cat "$SPLIT/nnk_rt.h" "$SPLIT"/nnk_smc_map.h "$SPLIT"/nnk_smc.inc "$SPLIT"/nnk_boot.inc "$SPLIT"/nnk_dma.inc "$SPLIT"/nnk_vramcnt.inc "$SPLIT"/nnk_input.inc 2>/dev/null | sha256sum | cut -d' ' -f1)
+HDR_HASH=$(cat "$SPLIT/nnk_rt.h" "$SPLIT"/nnk_smc_map.h "$SPLIT"/nnk_smc.inc "$SPLIT"/nnk_boot.inc "$SPLIT"/nnk_dma.inc "$SPLIT"/nnk_vramcnt.inc "$SPLIT"/nnk_input.inc "$SPLIT"/nnk_mobiclip.inc "$SPLIT"/nnk_mobiclip_dec.inc 2>/dev/null | sha256sum | cut -d' ' -f1)
 
 # compile_cached <source.c> <target.o> <flag-array-name>
 # Reuse <target.o> when its sidecar stamp still matches the current content
