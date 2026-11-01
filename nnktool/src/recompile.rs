@@ -3480,6 +3480,55 @@ static void itcm_dump_once(uint32_t pc) {
     else fprintf(stderr, "itcm: cannot open %s\n", p);
 }
 
+/* Phase-5Q: PC-TRIGGERED ITCM snapshot — the Phase-5P prescription.  The
+ * 32 KiB ITCM array is swapped during movie playback (audio vs video code
+ * phases), so a first-ITCM-execution dump (itcm_dump_once above) shows data
+ * at the decode callback.  This hook dumps the LIVE array exactly when the
+ * dispatch reaches a chosen PC, and logs the register file there, so the
+ * blob the re-decoder actually fetches can be disassembled and its forms
+ * audited against the bytes melonDS executes.
+ *   NNK_ITCM_DUMP_AT_PC=<hex>        trigger PC (0/unset = off)
+ *   NNK_ITCM_DUMP_AT_PC_N=<count>    max dumps (default 1; suffix _<hit>)
+ *   NNK_ITCM_DUMP_AT_PC_PATH=<file>  blob path
+ *   NNK_TRACE_AT_PC=<1|0>            start the PC trace at the trigger
+ *   NNK_HALT_AFTER_TRIGGER=<n>       halt n steps after the first trigger */
+static uint32_t itcm_at_pc;
+static int itcm_at_hits;
+static int itcm_at_limit = 1;
+static int itcm_at_trace;
+static uint64_t itcm_at_halt_after;
+static void itcm_dump_at_pc(uint32_t pc) {
+    if (!itcm_at_pc || pc != itcm_at_pc || itcm_at_hits >= itcm_at_limit) return;
+    itcm_at_hits++;
+    if (itcm_at_trace) { trace_from = steps; traced = 0; }
+    if (itcm_at_halt_after) step_limit = steps + itcm_at_halt_after;
+    fprintf(stderr, "itcm_at_pc: hit=%d step=%llu pc=%08X r0=%08X r1=%08X r2=%08X "
+            "r3=%08X r4=%08X r5=%08X r6=%08X r7=%08X r8=%08X r12=%08X r13=%08X "
+            "r14=%08X nzcv=%d%d%d%d\n",
+            itcm_at_hits, (unsigned long long)steps, pc, r[0], r[1], r[2], r[3],
+            r[4], r[5], r[6], r[7], r[8], r[12], r[13], r[14],
+            (int)n, (int)z, (int)c, (int)v);
+    const char *p = getenv("NNK_ITCM_DUMP_AT_PC_PATH");
+    if (!p || !p[0]) return;
+    char buf[1024];
+    if (itcm_at_limit > 1) snprintf(buf, sizeof buf, "%s_%d", p, itcm_at_hits);
+    else snprintf(buf, sizeof buf, "%s", p);
+    FILE *f = fopen(buf, "wb");
+    if (f) { fwrite(itcm, 1, ITCM_PHYS, f); fclose(f);
+             fprintf(stderr, "itcm_at_pc: dumped %s\n", buf); }
+    else fprintf(stderr, "itcm_at_pc: cannot open %s\n", buf);
+    const char *mp = getenv("NNK_ITCM_DUMP_AT_PC_MEM");
+    if (mp && mp[0]) {
+        char mbuf[1024];
+        if (itcm_at_limit > 1) snprintf(mbuf, sizeof mbuf, "%s_%d", mp, itcm_at_hits);
+        else snprintf(mbuf, sizeof mbuf, "%s", mp);
+        FILE *mf = fopen(mbuf, "wb");
+        if (mf) { fwrite(gmem, 1, GSIZE, mf); fclose(mf);
+                  fprintf(stderr, "itcm_at_pc: mem %s\n", mbuf); }
+        else fprintf(stderr, "itcm_at_pc: cannot open %s\n", mbuf);
+    }
+}
+
 static void trace_pc(uint32_t pc) {
     last_pc = pc;
     cycles++;                       /* coarse timing: ~1 cycle per instruction */
@@ -3499,6 +3548,7 @@ static void trace_pc(uint32_t pc) {
     checkpoint_dump(pc);
     debug_dump(pc);
     itcm_dump_once(pc);
+    itcm_dump_at_pc(pc);
     if (steps >= trace_from && traced < TRACE_LIMIT + trace_from) printf("0x%08x\n", pc);
     traced++;
     if (pc >= IMAGE_LOAD) {
@@ -3659,6 +3709,15 @@ const RUNTIME_ALL_MAIN: &str = r##"int main(int argc, char **argv) {
       if (n2 && n2[0]) dbg_limit = (int)strtol(n2, NULL, 0); }
     { const char *s = getenv("NNK_HALT_AT_PC");
       if (s && s[0]) halt_at_pc = (uint32_t)strtoul(s, NULL, 0); }
+    { const char *s = getenv("NNK_ITCM_DUMP_AT_PC");
+      if (s && s[0]) itcm_at_pc = (uint32_t)strtoul(s, NULL, 0);
+      const char *n3 = getenv("NNK_ITCM_DUMP_AT_PC_N");
+      if (n3 && n3[0]) itcm_at_limit = (int)strtol(n3, NULL, 0);
+      if (itcm_at_limit < 1) itcm_at_limit = 1;
+      const char *t3 = getenv("NNK_TRACE_AT_PC");
+      if (t3 && t3[0]) itcm_at_trace = atoi(t3);
+      const char *h3 = getenv("NNK_HALT_AFTER_TRIGGER");
+      if (h3 && h3[0]) itcm_at_halt_after = strtoull(h3, NULL, 0); }
     printf("nnk recompile-all ARM9 entry 0x%08X\n", ENTRY_CONST);
     printf("guest image %s: %zu bytes at 0x%08X\n", path, got, IMAGE_LOAD);
     run();
