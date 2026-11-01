@@ -108,23 +108,46 @@ ldflags=(-lm)
 # shadow run past it.  Apply the transform the canonical source already carries
 # to any image that lacks it; the spliced image is a build artifact next to the
 # split output, so the content-hash cache key stays stable across rebuilds.
+#
+# Phase-5AG: every splice registers the manifest features it installs, and
+# tools/prelude_audit.py below proves they (and every other required prelude
+# feature) are present in the runtime TU that cc is about to compile.  A
+# missing feature FAILS the build instead of shipping silently.  For the
+# regression proof, NNK_PRELUDE_DISABLE_SPLICE=<feature-id>[,<id>] skips the
+# matching splice on purpose so the audit can be seen failing.
+SPLICED_FEATURES=()
+NO_SPLICE=${NNK_PRELUDE_DISABLE_SPLICE:-}
+splice_disabled() {
+  case ",$NO_SPLICE," in *",$1,"*) return 0 ;; esac
+  return 1
+}
 if [[ -f "$IMAGE" ]] && ! grep -q 'gxd_sh_rd' "$IMAGE"; then
-  SPLICED_IMAGE="$(dirname "$SPLIT")/$(basename "$IMAGE" .c).prelude.c"
-  mkdir -p "$(dirname "$SPLICED_IMAGE")"
-  echo "== prelude splice: $IMAGE predates the Phase-5X read shadow -> $SPLICED_IMAGE =="
-  python3 tools/p5x_runtime_splice.py "$IMAGE" "$SPLICED_IMAGE"
-  IMAGE=$SPLICED_IMAGE
+  if splice_disabled 5x_vram_read_shadow; then
+    echo "== prelude splice DISABLED by NNK_PRELUDE_DISABLE_SPLICE: Phase-5X read shadow (negative control) =="
+  else
+    SPLICED_IMAGE="$(dirname "$SPLIT")/$(basename "$IMAGE" .c).prelude.c"
+    mkdir -p "$(dirname "$SPLICED_IMAGE")"
+    echo "== prelude splice: $IMAGE predates the Phase-5X read shadow -> $SPLICED_IMAGE =="
+    python3 tools/p5x_runtime_splice.py "$IMAGE" "$SPLICED_IMAGE"
+    IMAGE=$SPLICED_IMAGE
+    SPLICED_FEATURES+=(5x_vram_read_shadow 5x_vram_write_shadow)
+  fi
 fi
 # Phase-5AE: the frozen image predates the per-step speed-ups in the prelude
 # (cached vcount()).  Same policy as the Phase-5X splice above: the canonical
 # change is in nnktool/src/recompile.rs, and the frozen artifact gets the
 # identical transform so the guest parts stay byte-identical to previous phases.
 if [[ -f "$IMAGE" ]] && ! grep -q 'nnk_probe_mask' "$IMAGE"; then
-  SPLICED_IMAGE2="$(dirname "$SPLIT")/$(basename "$IMAGE" .c).p5ae.c"
-  mkdir -p "$(dirname "$SPLICED_IMAGE2")"
-  echo "== prelude splice (Phase-5AE): cached vcount() -> $SPLICED_IMAGE2 =="
-  python3 tools/p5ae_runtime_splice.py "$IMAGE" "$SPLICED_IMAGE2"
-  IMAGE=$SPLICED_IMAGE2
+  if splice_disabled 5ae_vcount_cache; then
+    echo "== prelude splice DISABLED by NNK_PRELUDE_DISABLE_SPLICE: Phase-5AE vcount cache (negative control) =="
+  else
+    SPLICED_IMAGE2="$(dirname "$SPLIT")/$(basename "$IMAGE" .c).p5ae.c"
+    mkdir -p "$(dirname "$SPLICED_IMAGE2")"
+    echo "== prelude splice (Phase-5AE): cached vcount() -> $SPLICED_IMAGE2 =="
+    python3 tools/p5ae_runtime_splice.py "$IMAGE" "$SPLICED_IMAGE2"
+    IMAGE=$SPLICED_IMAGE2
+    SPLICED_FEATURES+=(5ae_vcount_cache 5ae_gxd_tick_skip 5ae_probe_gate)
+  fi
 fi
 # Phase-5AF: the frozen image carries no overlay knowledge at all (it predates
 # the Phase-4G registry), so the table-driven overlay map -- the ROM's 21-entry
@@ -132,11 +155,18 @@ fi
 # untranslated-pc classification -- is spliced in from the canonical block in
 # nnktool/src/recompile.rs.  Same policy: no-op when it is already there.
 if [[ -f "$IMAGE" ]] && ! grep -q 'io_ovl_pc_report' "$IMAGE"; then
-  SPLICED_IMAGE3="$(dirname "$SPLIT")/$(basename "$IMAGE" .c).p5af.c"
-  mkdir -p "$(dirname "$SPLICED_IMAGE3")"
-  echo "== prelude splice (Phase-5AF): table-driven overlay registry -> $SPLICED_IMAGE3 =="
-  python3 tools/p5af_ovl_table_splice.py "$IMAGE" "$SPLICED_IMAGE3"
-  IMAGE=$SPLICED_IMAGE3
+  if splice_disabled 5af_overlay_registry; then
+    echo "== prelude splice DISABLED by NNK_PRELUDE_DISABLE_SPLICE: Phase-5AF overlay registry (negative control) =="
+  else
+    SPLICED_IMAGE3="$(dirname "$SPLIT")/$(basename "$IMAGE" .c).p5af.c"
+    mkdir -p "$(dirname "$SPLICED_IMAGE3")"
+    echo "== prelude splice (Phase-5AF): table-driven overlay registry -> $SPLICED_IMAGE3 =="
+    python3 tools/p5af_ovl_table_splice.py "$IMAGE" "$SPLICED_IMAGE3"
+    IMAGE=$SPLICED_IMAGE3
+    SPLICED_FEATURES+=(5af_overlay_registry 5af_overlay_pc_report 5af_overlay_load_note
+                       5af_overlay_arena_dump 5af_overlay_arena_dump_exit
+                       5af_overlay_table_dump)
+  fi
 fi
 
 if [[ "$GX" == "1" ]]; then
@@ -177,6 +207,26 @@ fi
 for f in nnk_main.c nnk_rt.h; do
   [[ -f "$SPLIT/$f" ]] || { echo "split output incomplete: missing $SPLIT/$f" >&2; exit 2; }
 done
+
+# ---- Phase-5AG: prelude feature audit -------------------------------------
+# The runtime TU ($SPLIT/nnk_main.c + the *.inc fragments next to it, after the
+# splices above and split_dispatch.py's injections) must carry EVERY feature
+# tools/nnk_prelude_manifest.txt marks `required`.  This is the guard that the
+# Phase-5AB (VRAM read shadow) and Phase-5AF (overlay registry) class of silent
+# regression cannot repeat: a prelude fix that the frozen image predates and no
+# splice installs FAILS the build here, before cc spends minutes compiling, and
+# the failure names the missing feature and marker.
+spliced_list=""
+if (( ${#SPLICED_FEATURES[@]} )); then
+  spliced_list=$(IFS=,; printf '%s' "${SPLICED_FEATURES[*]}")
+fi
+if ! python3 tools/prelude_audit.py --split "$SPLIT" --spliced "$spliced_list"; then
+  echo "" >&2
+  echo "BUILD FAILED: the prelude audit rejected $SPLIT (a required prelude" >&2
+  echo "feature is missing from the image; see PRELUDE_AUDIT.md).  Debug with:" >&2
+  echo "  python3 tools/prelude_audit.py --split $SPLIT" >&2
+  exit 1
+fi
 
 OBJDIR="$SPLIT/obj"
 mkdir -p "$OBJDIR"
