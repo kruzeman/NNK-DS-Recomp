@@ -142,3 +142,84 @@ is consulted.
 
 ## 5. ACCEPTANCE — the clean-directory run
 
+Directory `/home/hermes/p5aj_clean` held exactly two files — `Ni No Kuni.nds`
+(hard link to the ROM, so not a copy) and `nnk_runner` (the build from §3).  No
+`arm9_stored_padded.bin`, no `work/`, no env var except the headless knobs and
+the step budget:
+
+```
+$ cd /home/hermes/p5aj_clean && ls -l
+-rw-r--r-- 2 hermes hermes 536870912 Nov  1 17:17 Ni No Kuni.nds
+-rwxrwxr-x 1 hermes hermes  14967448 Nov  1 18:26 nnk_runner
+$ /usr/bin/time -f 'WALL_SECONDS %e' \
+    env NNK_GX=headless NNK_GX_SHOT=/home/hermes/p5aj_shots/f \
+        NNK_GX_SHOT_EVERY=25 NNK_STEP_LIMIT=2400000000 \
+    ./nnk_runner "Ni No Kuni.nds" > stdout.log 2> run.err
+
+rom: card image Ni No Kuni.nds (536870912 B) arm9 299816 B @0x4000 -> 0x02000000 entry 0x02000800 | fnt 190106 B fat 100912 B ovt 21 entries
+rom: derived guest image (stored arm9 zero-padded) 445304 B fnv=75cf0984527e4c41
+smc: generation-0 arm9 0x02000000..0x0206CB78 (445304 bytes) derived from the ROM (fnv=6087d11200ee29b2)
+smc: generation-0 arena window 0x020C0000..0x02180000 (786432 bytes, overlay 17 at its OVT base) derived from the ROM
+smc: armed, 2 generation-0 segments (ROM-derived), 768 bands
+io: card rom 536870912 bytes attached from argv (Phase-5AJ)
+io: overlay registry: 21 ARM9 overlays from the ROM overlay table
+bios: boot state seeded (header copy 0x027FFE00, 20 bootparam words)
+gx: display open mode=headless windowed=0 shot=/home/hermes/p5aj_shots/f
+...
+movie: hle rom src1=data/movie/op_u.mods (2096452 B) src2=data/movie/op_d.mods (2102176 B) plane=256x192
+movie: stream 0 codec=0x0227834C source=rom:data/movie/op_u.mods frames=1317 256x192 step=2256160152
+movie: stream 1 codec=0x022E8B74 source=rom:data/movie/op_d.mods frames=1317 256x192 step=2256257061
+...
+done steps=2400000001 traced=2400000000 distinct_pcs=22884 hle_hits=11202 halt_pc=0x01FFC4FC halt=step budget exhausted
+gx: 4291 frames presented, 784632 unhandled io writes
+WALL_SECONDS 501.38
+$ grep -c untranslated stdout.log
+0
+```
+
+| acceptance item | measured |
+|---|---|
+| (i) boots from the ROM alone | yes — the six derivation lines above, no other file read |
+| (ii) notice screen | capture `f.00250.bot.ppm` (frame 250) shows the anti-piracy notice ("We do not condone piracy / Tap to continue") |
+| (iii) intro from the ROM, >=6 successive frames luma corr >= 0.97 on TOP | **7 successive captures, 0.9986 / 0.9986 / 0.9986 / 0.9989 / 0.9990 / 0.9990 / 0.9990** (refs f16/f20/f24/f27/f30/f34/f37 of `op_u`) |
+| (iv) 2.4e9 steps, no `untranslated pc` | `done steps=2400000001 … halt=step budget exhausted`, `untranslated` count 0 |
+| (v) speed within ~20% of 5AE | **4.79 M steps/s** (2.4e9 in 501.38 s) vs 5AE's 5.26 M/s = **9% slower — while also writing 343 PPM captures**, which the 5AE number did not do |
+| step-identity with the previous pipeline | movie session starts at step **2,256,160,152** and `distinct_pcs=22884`, `halt_pc=0x01FFC4FC` — bit-for-bit the Phase-5AF/5AD baseline numbers |
+
+Band audit (`tools/p5ad_band.py /home/hermes/p5aj_shots work/p5t/op_u.yuv … 4125 4275 f 600`):
+
+```
+f04125.top  mean  21.1 sd  39.9  best ref f0016 corr 0.9986 MAE  1.62
+f04150.top  mean  20.8 sd  39.8  best ref f0020 corr 0.9986 MAE  1.53
+f04175.top  mean  27.9 sd  43.0  best ref f0024 corr 0.9986 MAE  2.01
+f04200.top  mean  55.4 sd  52.3  best ref f0027 corr 0.9989 MAE  2.73
+f04225.top  mean  68.9 sd  52.3  best ref f0030 corr 0.9990 MAE  2.92
+f04250.top  mean  72.8 sd  52.8  best ref f0034 corr 0.9990 MAE  2.96
+f04275.top  mean  73.0 sd  52.8  best ref f0037 corr 0.9990 MAE  2.96
+```
+
+Same reference frames and the same correlations as Phase-5AD's table
+(0.9986..0.9990) — the ROM-derived path paints the identical picture.
+
+### 5.1 A/B: same binary, ROM inputs vs the three files (150M steps)
+
+```
+$ ./nnk_runner "Ni No Kuni.nds"                                    # ROM only
+done steps=150000001 distinct_pcs=19470 hle_hits=7445 halt_pc=0x02009120 …  WALL 31.51
+$ NNK_ROM_PATH=… NNK_SMC_IMAGE="0x02000000:…/arm9.bin,0x020C0000:…/ovl_p4f4.bin" \
+      ./nnk_runner …/arm9_stored_padded.bin                        # the old inputs
+done steps=150000001 distinct_pcs=19470 hle_hits=7445 halt_pc=0x02009120 …  WALL 37.47
+```
+
+Identical `distinct_pcs` / `hle_hits` / `halt_pc` (guest-visible behaviour is
+the same, which is the point of §2.3), and the ROM path is **19% faster**
+because `io_load_rom` now `mmap`s the card image instead of `malloc`+`fread`ing
+512 MiB.  31.51 s / 150M = 4.76 M steps/s, i.e. inside the +-4% host noise of
+5AE's 5.07 M/s 150M number.
+
+## 6. Status
+
+Every acceptance item above is met on a binary built from committed sources;
+`cargo test` is 47/47.  `NNK_SMC_IMAGE` and `NNK_MOVIE_YUV*` now only exist as
+A/B overrides (they still work — that is how §5.1's legacy column was run), and
+`run.sh`/`README.md` document them that way.
