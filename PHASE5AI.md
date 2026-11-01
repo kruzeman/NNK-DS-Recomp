@@ -160,17 +160,26 @@ halt_pc=0x02009114`).
 
 * `cargo test` in `nnktool`: **46 passed** (45 + the new class-45 test
   `phase_5ai_arm7_producer_backpressures_instead_of_dropping`).
-* `SKIP_MELONDS=1 sh tools/verify_phase2a.sh`: green (section F: strict common
-  prefix 1,000/1,000 melonDS PCs; log `verify2a.log`).
+* `SKIP_MELONDS=1 sh tools/verify_phase2a.sh`: **green, rc=0** — section A
+  `RESULT: PASS`, section D `done steps=20000001 distinct_pcs=125`, section F
+  strict common prefix **1,000/1,000** melonDS PCs (log `verify2a.log`).
 * Unscripted canonical run to **2.42e9 steps**: no `untranslated pc`, no halt
   (`distinct_pcs=22884 hle_hits=11202`), 173 frames captured.
 * Movie band (`tools/p5ad_band.py`, shots `shots/p5ai`): top screen
   corr **0.9986..0.9990** against `op_u.yuv`, bottom **0.9991** against
   `op_d.yuv`, MAE ~2.9 luma, at f4175..f4300 — the movie is untouched by this
   phase.
-* Post-skip screen state, captured for the record (`shots/p5ai_skip`): the
-  frames after the skip are the frozen last movie frame; the guest renders
-  nothing new because it has terminated.
+* Post-skip screen state, captured for the record
+  (`shots/p5ai_skip`, `NNK_GX_SHOT_EVERY=5`, scripted run to 360M steps):
+  the top and bottom screens are **FLAT 0x00 from display frame 585** on
+  (single-valued pixel data, checked frame by frame through f645:
+  `s.00585..s.00645` top and bottom all `distinct=1 min=0 max=0`) after the
+  movie's last frames fade at f570 (mean 210) and f575 (mean 112).  The guest
+  never draws again: the last movie frame is presented at step 326,421,022
+  (= f583) and the terminate call follows ~11 frames later at f596.
+  PNGs: `shots/p5ai_png/p5ai_f560_top_movie.png` (the last movie band),
+  `p5ai_f590_top_black.png` and `p5ai_f590_bot_black.png` (the black screen —
+  223-byte PNGs, i.e. a single colour).
 
 ## 6. Reproduce
 
