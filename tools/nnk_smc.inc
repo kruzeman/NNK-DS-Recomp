@@ -973,11 +973,25 @@ static int smc_exec_thumb(uint32_t pc, uint32_t *npc, uint32_t *costp) {
         default: tv = smc_reg(rs, pc, 1);
                  if (hw & 0x0080u) r[14] = (pc + 2u) | 1u;
                  *npc = tv & ~1u;
-                 /* Phase-5X: BX rM interworks on tv's bit0; BLX rM (bit7) is
-                  * always ARM state (ARM ARM A7.1.4) — the live decoder used
-                  * to strip bit0 with no carry at all, so the target's state
-                  * fell back to the stale sticky value. */
-                 smc_branch_mode((hw & 0x0080u) ? (*npc) : tv);
+                 /* Phase-5X/Phase-5AN: the state comes from tv's bit0 for BOTH
+                  * halves of format 5.  Phase-5X tagged this site but still
+                  * passed the MASKED target for BLX rM, on the belief that
+                  * "BLX rM is always ARM state" — that rule is BLX <imm>, not
+                  * BLX rM.  melonDS A_BX and A_BLX_REG are literally the same
+                  * two lines (src/ARMInterpreter_Branch.cpp:49..59):
+                  * `JumpTo(cpu->R[Rm])`, and JumpTo takes bit0, so a tagged
+                  * Thumb pointer stays Thumb through BLX rM.
+                  * Measured (Phase-5AN): ov17 0x020E2B66 `blx r6` with
+                  * r6 = 0x020DEE25 (the object's vtable slot [+0x50]+8, a
+                  * Thumb function) was recorded as ARM, so the live decoder
+                  * ran the ARM reading of 0x020DEE24 — word 0xB083B530,
+                  * `andlts r3,r0,r0,lsr r5` — and swallowed BOTH halves of
+                  * the callee's prologue (`push {r4,r5,lr}` 0xB530 and
+                  * `sub sp,#12` 0xB083).  The function body then ran with a
+                  * stack 24 bytes off; its epilogue `pop {r4,r5,pc}` popped
+                  * 0 and the run halted at 559,830,681 with
+                  * `untranslated pc=0x00000000` (halt_pc=0x020DEE48). */
+                 smc_branch_mode(tv);
                  *costp = 3; return 1;
         }
     }
