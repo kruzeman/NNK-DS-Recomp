@@ -110,3 +110,66 @@ boot of `work/phase3a/arm9_stored_padded.bin`), evidence committed under
 
 No boot/IRQ/card code was touched; `verify_phase2a.sh` stays green on the
 branch.
+
+## 6. Frame-timed input: `NNK_INPUT_FILE` (DQ8 `DQ8_INPUT_FILE` analogue)
+
+A plain text file whose content is the desired active-low key mask, re-read
+once per **display frame** (gated on the presented-frame counter) and
+published through the same `gxd_set_keymask` path a real key edge takes.
+Two forms:
+
+```
+# legacy (DQ8-compatible): the whole file is ONE number = constant mask
+0x3FD
+```
+
+```
+# SCRIPT: <frame> <mask> per line; frame = decimal DISPLAY frame, mask = hex
+# '#' comments and blank lines are ignored; 'end' (or EOF) holds the last mask
+0 0x3FF
+13 0x3FD      # B down (advance the notice screen)
+15 0x3FF      # B up
+917 0x3FE     # A down (skip the movie)
+919 0x3FF     # A up
+end
+```
+
+Bits (KEYINPUT active-low; idle `0x3FF`, cleared bit = pressed):
+A=bit0 (`0x3FE`), B=bit1 (`0x3FD`), Select=bit2 (`0x3FB`),
+Start=bit3 (`0x3F7`), Right=bit4, Left=bit5, Up=bit6, Down=bit7,
+R=bit8, L=bit9; bits 10/11 = DS X/Y (optional, released by default).
+
+Semantics:
+
+* an entry's mask is applied when the display-frame counter reaches its
+  frame and **held** until the next entry; entries are applied in file order;
+* the file is parsed **once per change** (mtime/size); a reload during a run
+  does not replay entries already in the past;
+* a missing file **holds** the last mask (the host may write it only on
+  transitions);
+* every applied entry is traced under `NNK_INPUT_TRACE` as
+  `script applied frame=<f> mask=<m> entry=<i>/<n> pressed=<p> released=<r>`;
+* one-line exit summary: `nnk_input: summary script entries=<n> applied=<n>
+  last_frame=<f> ...`.
+
+Why frame-timed: the guest polls `KEYINPUT` about **once per display frame**
+(~556 k steps in the movie era), so a 20 k-step step-timed tap is usually
+invisible — which is exactly why fixed-step `NNK_INPUT_INJECT` never
+reproduced the operator's real session while a frame-timed (or repeated)
+press does.  See PHASE5X.md §1.
+
+## 7. Input recorder: `NNK_INPUT_RECORD`
+
+```
+NNK_INPUT_RECORD=/tmp/session.nnk ./run.sh     # play: the file IS the script
+NNK_INPUT_FILE=/tmp/session.nnk  ./run.sh      # replay it verbatim
+```
+
+At every display frame, if the **effective** guest mask (SDL keys +
+`NNK_INPUT_FILE` script + `NNK_INPUT_INJECT`, i.e. exactly what was pushed to
+`gxd_set_keymask`) changed, one `<frame> 0x%03X` line is appended and
+flushed (a crash still leaves a usable script).  A 3-line header records the
+title, that the build id is unavailable, and the bit legend.  Recording works
+in window mode (the operator plays) and headless.  The recorded frame samples
+are what the guest could have seen, so replaying the file reproduces the same
+mask sequence — proven in PHASE5X.md §6.

@@ -30,6 +30,17 @@
  *       pushes real SDL key events (SDL_PushEvent) at the given runtime step
  *       (windowed) or applies the same state change headless.
  *   NNK_INPUT_TRACE=<path>   append-only event/transition trace.
+ *   NNK_INPUT_FILE=<path>    frame-timed input (DQ8 `DQ8_INPUT_FILE`
+ *       analogue).  Either the legacy single value (whole file = one mask,
+ *       constant) or a SCRIPT: one `<frame> <mask>` entry per line (frame =
+ *       decimal DISPLAY-frame index, mask hex, `#` comments / blank lines,
+ *       `end` stops parsing; EOF holds the last mask).  An entry's mask is
+ *       applied when the display-frame counter reaches its frame and HELD
+ *       until the next entry.  Parsed once per file (mtime/size) change.
+ *   NNK_INPUT_RECORD=<path>  write the EFFECTIVE guest mask as a replayable
+ *       script: one `<frame> 0x%03X` line per mask transition, flushed
+ *       immediately, with a 3-line header (title, binary, bit legend).
+ *       Replay the produced file verbatim through NNK_INPUT_FILE.
  *
  * Non-NNK_GX builds get no-op stubs, so the spliced io_read16 hook and the
  * per-dispatch tick compile and cost nothing.
@@ -42,6 +53,8 @@
 #define SDL_MAIN_HANDLED
 #include <SDL2/SDL.h>
 #include <stdarg.h>
+#include <sys/stat.h>
+#include <stdlib.h>
 
 /* ---- state ---- */
 static FILE *nnk_in_log;                 /* NNK_INPUT_TRACE, NULL = quiet */
@@ -52,6 +65,8 @@ static uint32_t nnk_extkey = 0x7F;       /* EXTKEYIN low byte (X/Y pressed
 static int nnk_inited;
 static uint64_t nnk_ki_reads;            /* guest KEYINPUT reads seen */
 static uint32_t nnk_ki_last = 0xFFFFFFFFu;
+
+static void nnk_input_atexit(void);       /* defined with the recorder below */
 
 static void nnk_ilog(const char *fmt, ...)
 {
@@ -170,6 +185,7 @@ static void nnk_input_init(void)
             fprintf(stderr, "nnk_input: unknown scancode name %s\n", nnk_keymap[i].name);
     }
     if (gxd) gxd_set_keymask(gxd, nnk_mask);
+    atexit(nnk_input_atexit);
     if (getenv("NNK_GX") && strcmp(getenv("NNK_GX"), "window") == 0) {
         SDL_SetEventFilter(nnk_input_filter, NULL);
         nnk_ilog("install: SDL event filter active (windowed); key events are "
@@ -215,7 +231,7 @@ static void nnk_input_init(void)
 
 /* ---- frame-timed mask file (NNK_INPUT_FILE) ------------------------------
  * The DQ8 analogue (`DQ8_INPUT_FILE`, DQ8 src/native_hid.c:native_hid_pump):
- * a small text file the host writes; its first line is the desired active-low
+ * a small text file the host writes; its content is the desired active-low
  * key mask, re-read once per DISPLAY FRAME and published through the same
  * gxd_set_keymask path a real key event takes.
  *   Step-timed NNK_INPUT_INJECT cannot express "press when the prompt
@@ -224,35 +240,227 @@ static void nnk_input_init(void)
  * not reproduce his session while periodic presses did.  This file is the
  * reproducible form of a human session, and it is what a live operator can be
  * driven by as well.
- * Format: line 1 = strtoul(base 0) mask, low 12 bits =
- *   bit 0-9  KEYINPUT (active low; 0x3FF = nothing pressed)
- *   bit 10   DS X (EXTKEYIN bit0)   bit 11 = DS Y (EXTKEYIN bit1)
+ * Two accepted forms (operator's spec):
+ *   1) legacy: the whole file is ONE number -> constant mask (DQ8-compatible);
+ *   2) SCRIPT: one `<frame> <mask>` entry per line, frame = decimal display
+ *      frame, mask = hex (strtoul base 0), `#` comments and blank lines,
+ *      `end` stops parsing, EOF/end HOLDS the last mask.  Entries are applied
+ *      in file order as the display-frame counter passes them.
+ * Mask bits, KEYINPUT active-low (idle 0x3FF):
+ *   bit 0-9 = A B Select Start Right Left Up Down R L (cleared bit = pressed)
+ *   bit 10 = DS X, bit 11 = DS Y (EXTKEYIN bits 0/1)
  * So B = 0x3FD, A = 0x3FE, Start = 0x3F7, idle = 0x3FF.
- * A missing/unreadable/short file HOLDS the last mask (the host may rewrite it
- * only on transitions); re-reading one short line per frame is cheap. */
+ * The file is re-parsed only when its mtime/size changes; a missing file HOLDS
+ * the last mask (the host may write it only on transitions). */
+#define NNK_SCRIPT_MAX 512
+static struct { unsigned frame; uint32_t mask; } nnk_script[NNK_SCRIPT_MAX];
+static int nnk_script_n;          /* entries parsed */
+static int nnk_script_next;       /* next entry to apply */
+static int nnk_script_mode;       /* 1 = "<frame> <mask>" script, 0 = constant */
+static int nnk_file_parsed;
+static long nnk_file_mtime;
+static long long nnk_file_size;
 static unsigned nnk_file_frame = 0xFFFFFFFFu;
-static void nnk_input_file_tick(void)
+static unsigned nnk_script_applied;
+
+/* Publish an effective mask exactly like a real key edge does. */
+static void nnk_mask_publish(uint32_t v, const char *why)
 {
-    const char *p = getenv("NNK_INPUT_FILE");
-    char buf[64];
-    FILE *f;
-    unsigned long v;
-    if (!p || !p[0]) return;
-    if (gxd_frames == nnk_file_frame) return;       /* one read per frame */
-    nnk_file_frame = gxd_frames;
-    f = fopen(p, "r");
-    if (!f) return;
-    if (!fgets(buf, sizeof buf, f)) { fclose(f); return; }
-    fclose(f);
-    v = (unsigned long)strtoul(buf, NULL, 0) & 0xFFFu;
-    if ((uint32_t)v == nnk_mask) return;            /* no edge: no state change */
-    nnk_mask = (uint32_t)v;
+    v &= 0xFFFu;
+    /* Two accepted mask spaces: the runtime's 12-bit form (bits 10/11 = DS X/Y,
+     * active-low like the keys) and the operator's KEYINPUT-only script form
+     * (< 0x400: idle 0x3FF, B 0x3FD, A 0x3FE).  A bare KEYINPUT mask must not
+     * press DS X/Y, so the X/Y bits default to "released". */
+    if ((v & 0xC00u) == 0) v |= 0xC00u;
+    if (v == nnk_mask) return;
+    nnk_mask = v;
     nnk_extkey = 0x7Fu;
     if (!(nnk_mask & (1u << 10))) nnk_extkey &= ~1u;
     if (!(nnk_mask & (1u << 11))) nnk_extkey &= ~2u;
     if (gxd) gxd_set_keymask(gxd, nnk_mask);
-    nnk_ilog("file mask=0x%03X EXTKEYIN=0x%02X frame=%u",
-             nnk_mask, nnk_extkey, gxd_frames);
+    nnk_ilog("%s mask=0x%03X EXTKEYIN=0x%02X frame=%u",
+             why, nnk_mask, nnk_extkey, gxd_frames);
+}
+
+static void nnk_script_parse(FILE *f, const char *path)
+{
+    char line[256];
+    unsigned last_frame = 0;
+    int n = 0, lineno = 0, have_single = 0;
+    nnk_script_mode = 0;
+    while (fgets(line, sizeof line, f)) {
+        char *p = line, *t1, *t2, *e1, *e2;
+        unsigned long fr, mk;
+        lineno++;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == 0 || *p == '\r' || *p == '\n' || *p == '#') continue;
+        if (!strncmp(p, "end", 3) &&
+            (p[3] == 0 || p[3] == '\r' || p[3] == '\n' || p[3] == ' ' || p[3] == '\t'))
+            break;
+        t1 = strtok(p, " \t\r\n");
+        if (!t1) continue;
+        t2 = strtok(NULL, " \t\r\n");
+        fr = strtoul(t1, &e1, 0);
+        if (e1 == t1) {
+            fprintf(stderr, "nnk_input: %s:%d: bad frame '%s' "
+                    "(want '<frame> <mask>' or a single mask)\n", path, lineno, t1);
+            continue;
+        }
+        if (!t2) {
+            /* legacy form: the whole file / this lone line is one mask */
+            if (!have_single && n == 0) {
+                have_single = 1;
+                nnk_script[n].frame = 0;
+                nnk_script[n].mask = (uint32_t)fr & 0xFFFu;
+                n++;
+            }
+            continue;
+        }
+        mk = strtoul(t2, &e2, 0);
+        if (e2 == t2) {
+            fprintf(stderr, "nnk_input: %s:%d: bad mask '%s'\n", path, lineno, t2);
+            continue;
+        }
+        if (n >= NNK_SCRIPT_MAX) {
+            fprintf(stderr, "nnk_input: %s:%d: script full (max %d entries)\n",
+                    path, lineno, NNK_SCRIPT_MAX);
+            break;
+        }
+        if (nnk_script_mode && (unsigned)fr < last_frame)
+            fprintf(stderr, "nnk_input: %s:%d: frame %lu goes backwards "
+                    "(previous %u); applied in file order anyway\n",
+                    path, lineno, fr, last_frame);
+        nnk_script[n].frame = (unsigned)fr;
+        nnk_script[n].mask = (uint32_t)mk & 0xFFFu;
+        last_frame = (unsigned)fr;
+        n++;
+        nnk_script_mode = 1;
+    }
+    nnk_script_n = n;
+}
+
+/* (Re)load the file when its identity/mtime/size changed.  A reload during a
+ * run does not replay entries already in the past (the guest already saw
+ * them); it only arms the future ones. */
+static void nnk_input_file_load(const char *path)
+{
+    struct stat st;
+    FILE *f;
+    if (stat(path, &st) != 0) return;
+    if (nnk_file_parsed && st.st_mtime == nnk_file_mtime &&
+        (long long)st.st_size == nnk_file_size) return;
+    f = fopen(path, "r");
+    if (!f) return;
+    nnk_file_mtime = st.st_mtime;
+    nnk_file_size = (long long)st.st_size;
+    nnk_script_parse(f, path);
+    fclose(f);
+    nnk_script_next = 0;
+    if (nnk_file_parsed) {
+        while (nnk_script_next < nnk_script_n &&
+               nnk_script[nnk_script_next].frame <= gxd_frames)
+            nnk_script_next++;
+    }
+    nnk_file_parsed = 1;
+    nnk_ilog("file: loaded %d entr%s (%s) at frame %u",
+             nnk_script_n, nnk_script_n == 1 ? "y" : "ies",
+             nnk_script_mode ? "script" : "constant mask", gxd_frames);
+}
+
+static void nnk_input_file_tick(void)
+{
+    const char *p = getenv("NNK_INPUT_FILE");
+    if (!p || !p[0]) return;
+    if (gxd_frames == nnk_file_frame) return;       /* one read per frame */
+    nnk_file_frame = gxd_frames;
+    nnk_input_file_load(p);
+    while (nnk_script_next < nnk_script_n &&
+           gxd_frames >= nnk_script[nnk_script_next].frame) {
+        unsigned fr = nnk_script[nnk_script_next].frame;
+        uint32_t m = nnk_script[nnk_script_next].mask;
+        uint32_t before = nnk_mask;
+        uint32_t pressed = before & ~m & 0xFFFu;
+        uint32_t released = ~before & m & 0xFFFu;
+        nnk_script_next++;
+        nnk_script_applied++;
+        nnk_ilog("script applied frame=%u mask=0x%03X entry=%d/%d "
+                 "pressed=0x%03X released=0x%03X",
+                 fr, m, nnk_script_next, nnk_script_n, pressed, released);
+        nnk_mask_publish(m, "file");
+    }
+    /* a constant mask (legacy single value) is applied once, at load time */
+    if (!nnk_script_mode && nnk_script_n == 1 && nnk_script_applied == 0) {
+        nnk_script_applied++;
+        nnk_mask_publish(nnk_script[0].mask, "file");
+    }
+}
+
+/* ---- input recorder (NNK_INPUT_RECORD) ----------------------------------
+ * At every display frame, if the EFFECTIVE guest mask (after SDL keys +
+ * NNK_INPUT_FILE script + NNK_INPUT_INJECT, i.e. exactly what was pushed to
+ * gxd_set_keymask) differs from the last recorded one, append
+ * `<frame> 0x%03X` and flush, so a crash still leaves a replayable script.
+ * The produced file is accepted verbatim by NNK_INPUT_FILE. */
+static FILE *nnk_rec;
+static int nnk_rec_open;
+static uint32_t nnk_rec_last = 0xFFFFFFFFu;
+static unsigned nnk_rec_frame = 0xFFFFFFFFu;
+static unsigned nnk_rec_entries;
+static unsigned nnk_rec_first_frame;
+
+static void nnk_input_record_tick(void)
+{
+    const char *p = getenv("NNK_INPUT_RECORD");
+    if (!p || !p[0]) return;
+    if (gxd_frames == nnk_rec_frame) return;        /* one line per frame max */
+    nnk_rec_frame = gxd_frames;
+    if (!nnk_rec_open) {
+        nnk_rec_open = 1;
+        nnk_rec = fopen(p, "w");
+        if (!nnk_rec) {
+            fprintf(stderr, "nnk_input: cannot open record %s\n", p);
+            return;
+        }
+        fprintf(nnk_rec, "# Ni no Kuni DS input recording (NNK_INPUT_RECORD) "
+                "- replay with NNK_INPUT_FILE\n");
+        fprintf(nnk_rec, "# binary md5: n/a (recorded from a live run); "
+                "frame = DISPLAY frame\n");
+        fprintf(nnk_rec, "# KEYINPUT active-low, idle 0x3FF; A=bit0 B=bit1 "
+                "Select=bit2 Start=bit3 Right=bit4 Left=bit5 Up=bit6 "
+                "Down=bit7 R=bit8 L=bit9; X=bit10 Y=bit11\n");
+        fflush(nnk_rec);
+    }
+    if (nnk_mask == nnk_rec_last) return;
+    nnk_rec_last = nnk_mask;
+    if (!nnk_rec_entries) nnk_rec_first_frame = gxd_frames;
+    nnk_rec_entries++;
+    {
+        /* Write the operator's KEYINPUT space when X/Y are released (idle
+         * 0x3FF), the 12-bit form only when a DS X/Y bit is actually held. */
+        unsigned v = ((nnk_mask & 0xC00u) == 0xC00u) ? (nnk_mask & 0x3FFu)
+                                                     : (nnk_mask & 0xFFFu);
+        fprintf(nnk_rec, "%u 0x%03X\n", gxd_frames, v);
+        fflush(nnk_rec);
+        nnk_ilog("record frame=%u mask=0x%03X (entry %u)",
+                 gxd_frames, v, nnk_rec_entries);
+    }
+}
+
+static void nnk_input_atexit(void)
+{
+    if (getenv("NNK_INPUT_FILE") || nnk_script_applied || nnk_rec_entries) {
+        fprintf(stderr, "nnk_input: summary script entries=%d applied=%u "
+                "last_frame=%u recorded=%u entries",
+                nnk_script_n, nnk_script_applied, gxd_frames, nnk_rec_entries);
+        if (nnk_rec_entries)
+            fprintf(stderr, " first_recorded_frame=%u", nnk_rec_first_frame);
+        fputc('\n', stderr);
+        fflush(stderr);
+        nnk_ilog("summary: script=%d applied=%u last_frame=%u recorded=%u",
+                 nnk_script_n, nnk_script_applied, gxd_frames, nnk_rec_entries);
+    }
+    if (nnk_rec) { fclose(nnk_rec); nnk_rec = NULL; }
+    if (nnk_in_log) { fflush(nnk_in_log); }
 }
 
 static void nnk_input_tick(void)
@@ -280,6 +488,7 @@ static void nnk_input_tick(void)
             nnk_input_key(sc, down);
         }
     }
+    nnk_input_record_tick();
 }
 
 /* io_read16 hook (spliced at the top of io_read16 by split_dispatch.py):

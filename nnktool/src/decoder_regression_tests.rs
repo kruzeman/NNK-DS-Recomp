@@ -1315,11 +1315,11 @@ fn input_file_is_frame_timed_and_masks_the_key_space() {
     for needle in [
         "if (!p || !p[0]) return;",
         "if (gxd_frames == nnk_file_frame) return;",   // once per DISPLAY FRAME
-        "strtoul(buf, NULL, 0) & 0xFFFu",              // 10 keys + DS X/Y
-        "if ((uint32_t)v == nnk_mask) return;",        // edge-driven, no churn
+        "nnk_script[nnk_script_next].mask",            // the scripted entry's mask
+        "if (v == nnk_mask) return;",                  // edge-driven, no churn
         "gxd_set_keymask(gxd, nnk_mask);",             // same path a key event takes
         "nnk_input_file_tick();",                      // ticked from nnk_input_tick
-        "file mask=0x%03X EXTKEYIN=0x%02X frame=%u",   // visible under NNK_INPUT_TRACE
+        "%s mask=0x%03X EXTKEYIN=0x%02X frame=%u",     // visible under NNK_INPUT_TRACE
     ] {
         assert!(src.contains(needle), "regression: NNK_INPUT_FILE lost: {needle}");
     }
@@ -1328,10 +1328,49 @@ fn input_file_is_frame_timed_and_masks_the_key_space() {
     // and same-frame guards, and a failed fopen returns without touching state.
     let tick = &src[src.find("static void nnk_input_file_tick(void)").expect("tick missing")..];
     let body = &tick[..tick.find("\n}\n").expect("tick end missing")];
-    assert_eq!(body.matches("return;").count(), 5, "fixture: file tick early-outs changed");
+    assert_eq!(body.matches("return;").count(), 2, "fixture: file tick early-outs changed");
     assert!(!body.contains("nnk_mask = 0xFFFu"), "regression: a missing file clears the keys");
     // KEYINPUT is active-low: idle 0x3FF, B = bit1, A = bit0, Start = bit3.
     assert_eq!(0x3FFu32 & !(1u32 << 1), 0x3FDu32, "fixture: B mask");
     assert_eq!(0x3FFu32 & !(1u32 << 0), 0x3FEu32, "fixture: A mask");
     assert_eq!(0x3FFu32 & !(1u32 << 3), 0x3F7u32, "fixture: Start mask");
+}
+
+#[test]
+fn input_script_and_recorder_round_trip_are_locked() {
+    // Class 37 (operator request): the SCRIPT form of `NNK_INPUT_FILE`
+    // (`<frame> <mask>` per line, `#` comments, `end`, EOF holds) and
+    // `NNK_INPUT_RECORD` (edge-only `<frame> 0x%03X` lines, flushed, replayable
+    // verbatim by NNK_INPUT_FILE).
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let p = root.join("tools/nnk_input.inc");
+    let src = std::fs::read_to_string(&p)
+        .unwrap_or_else(|e| panic!("cannot read {}: {}", p.display(), e));
+    for needle in [
+        "static void nnk_script_parse(FILE *f, const char *path)",
+        "t2 = strtok(NULL, \" \\t\\r\\n\");",              // 2nd field = mask
+        "strncmp(p, \"end\", 3)",                          // `end` stops parsing
+        "frame %lu goes backwards",                        // order reported, not re-sorted
+        "gxd_frames >= nnk_script[nnk_script_next].frame",  // applied as the frame passes
+        "pressed=0x%03X released=0x%03X",                  // per-entry delta trace
+        "nnk_input_record_tick();",                        // record ticked per dispatch
+        "if (nnk_mask == nnk_rec_last) return;",           // edge-only recording
+        "if ((v & 0xC00u) == 0) v |= 0xC00u;",              // KEYINPUT-only masks keep X/Y released
+        "fflush(nnk_rec);",                                // crash-safe script
+        "atexit(nnk_input_atexit);",                       // one-line exit summary
+    ] {
+        assert!(src.contains(needle), "regression: script/record lost: {needle}");
+    }
+    // Both forms coexist: the legacy single value becomes entry 0 (frame 0,
+    // constant), the script form sets mode 1 so the constant path cannot fire.
+    let parse = &src[src.find("static void nnk_script_parse").expect("parse missing")..];
+    let body = &parse[..parse.find("\n}\n").expect("parse end missing")];
+    assert!(body.contains("have_single"), "legacy single-value form lost");
+    assert!(body.contains("nnk_script[n].frame = 0;"), "legacy entry is not frame 0");
+    assert!(body.contains("nnk_script_mode = 1;"), "script mode flag lost");
+    // The recorder's header carries the bit legend the operator replays with.
+    assert!(src.contains("A=bit0 B=bit1"), "recorder bit legend lost");
+    // Round-trip fixture arithmetic: B tap = 0x3FD, then idle 0x3FF.
+    assert_eq!(0x3FFu32 & !(1u32 << 1), 0x3FDu32, "fixture: B mask");
+    assert_eq!(0x3FDu32 | (1u32 << 1), 0x3FFu32, "fixture: B release -> idle");
 }
