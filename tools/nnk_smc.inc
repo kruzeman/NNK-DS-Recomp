@@ -1135,9 +1135,133 @@ int nnk_smc_try(uint32_t *pcp) {
  * mode — the caller then halts with the honest "untranslated pc" report, so a
  * genuine data-as-code jump still stops the run instead of running wild.
  * Main-RAM window only (0x02000000..0x03800000), like nnk_smc_try. */
+/* ==========================================================================
+ * Phase-5T — HLE Mobiclip movie decode (host decode feeds the guest planes).
+ *
+ * MEASURED CONTRACT (PHASE5T.md):
+ *   * the intro movie is data/movie/op_u.mods (MODS container, MobiClip video,
+ *     YCoCg 4:2:0, 256x192, 1317 frames);
+ *   * the guest's per-frame plane is a plain raster Y plane: melonDS's slot
+ *     0x022C0880 == the reference decoder's Y plane of frame 130 byte-exactly
+ *     (corr 1.0000, MAE 0.0, 0/49152 differences);
+ *   * the player object is at 0x02278264 (fields +0x38 callback 0x01FF8540,
+ *     +0x3C current source plane, +0x40 next source plane, +0x44 VRAM dst,
+ *     +0x48 stride 0x200);
+ *   * the codec state is at the callback's r0 (0x0227834C): +0x00 stream
+ *     cursor, +0x04 width, +0x08 height, +0x0C..+0x20 the six Y-plane ring
+ *     slots, +0x24..+0x38 the six chroma slots (Y+0xC010).
+ *
+ * HOOK SHAPE (the DQ8 ladder-skip recipe): the guest decode callback
+ * 0x01FF8540 still runs unchanged — the queue, stream cursor, slot ring,
+ * pacing and display state machine all advance exactly as before — and its
+ * *pixel* output is replaced right after it returns to its caller
+ * (0x0207B21C, the instruction after the `blx r1` at 0x0207B218): the host
+ * frame for this decode step is copied into the player's source plane and
+ * every ring slot, so the guest's own unmodified converter/compositor (proven
+ * faithful in Phase-5P) presents host pixels.
+ *
+ * Frame index = decode steps since the movie session started (the guest
+ * decodes exactly one source frame per step); a stream cursor that moves
+ * backwards starts a new session at frame 0.
+ *
+ * OFF unless NNK_MOVIE_YUV names a raw yuv420p file (73728 B/frame). */
+#define P5T_W 256
+#define P5T_H 192
+#define P5T_YSZ (P5T_W * P5T_H)
+#define P5T_CSZ ((P5T_W / 2) * (P5T_H / 2))
+#define P5T_FRAME (P5T_YSZ + 2 * P5T_CSZ)
+#define P5T_PLAYER 0x02278264u
+#define P5T_CB_ENTRY 0x01FF8540u
+#define P5T_CB_RET 0x0207B21Cu
+
+static FILE *p5t_fp;
+static int p5t_state;                 /* 0 unparsed, 1 off, 2 on */
+static long p5t_frames, p5t_index;
+static long p5t_presents, p5t_short;
+static uint32_t p5t_codec, p5t_cursor;
+static uint8_t p5t_buf[P5T_FRAME];
+
+static void p5t_init(void) {
+    const char *p = getenv("NNK_MOVIE_YUV");
+    p5t_state = 1;
+    if (!p || !p[0]) return;
+    p5t_fp = fopen(p, "rb");
+    if (!p5t_fp) { fprintf(stderr, "movie: cannot open %s\n", p); return; }
+    { const char *n = getenv("NNK_MOVIE_FRAMES");
+      p5t_frames = (n && n[0]) ? strtol(n, NULL, 0) : 0;
+      if (p5t_frames <= 0) {
+          fseek(p5t_fp, 0, SEEK_END);
+          p5t_frames = ftell(p5t_fp) / P5T_FRAME;
+          rewind(p5t_fp);
+      } }
+    p5t_state = 2;
+    fprintf(stderr, "movie: hle source=%s frames=%ld plane=%dx%d\n",
+            p, p5t_frames, P5T_W, P5T_H);
+}
+
+/* Copy one 8-bit plane into a guest buffer; silently ignores addresses that
+ * are not main RAM (the host decode never writes IO/VRAM/TCM directly). */
+static int p5t_plane(uint32_t dst, const uint8_t *src, uint32_t n) {
+    uint32_t o;
+    if ((dst & 0xFF000000u) != GBASE) return 0;
+    o = dst & 0x3FFFFFu;
+    if (o + n > GSIZE) return 0;
+    memcpy(gmem + o, src, n);
+    return 1;
+}
+
+/* Callback entry: remember the codec base for this movie session. */
+static void p5t_note_codec(uint32_t codec) {
+    if (p5t_state == 0) p5t_init();
+    if (p5t_state != 2) return;
+    if (codec != p5t_codec) {
+        if (p5t_codec)
+            fprintf(stderr, "movie: session codec 0x%08X -> 0x%08X at step %llu"
+                            " (last index %ld, presents %ld)\n",
+                    p5t_codec, codec, (unsigned long long)steps,
+                    p5t_index, p5t_presents);
+        p5t_codec = codec;
+        p5t_index = -1;
+        p5t_cursor = 0;
+    }
+}
+
+/* Callback return: replace this decode step's pixels with the host frame. */
+static void p5t_present(void) {
+    uint32_t cur, player, src;
+    int i;
+    if (p5t_state != 2) return;
+    cur = p5t_codec ? ld32(p5t_codec) : 0;
+    if (p5t_index < 0 || cur < p5t_cursor) p5t_index = 0;
+    else p5t_index++;
+    p5t_cursor = cur;
+    if (p5t_index >= p5t_frames) {          /* past EOF: hold the last frame */
+        p5t_index = p5t_frames - 1;
+    }
+    if (fseek(p5t_fp, (long)p5t_index * P5T_FRAME, SEEK_SET) != 0) return;
+    if (fread(p5t_buf, 1, P5T_FRAME, p5t_fp) != (size_t)P5T_FRAME) {
+        p5t_short++;
+        return;
+    }
+    player = P5T_PLAYER;
+    src = ld32(player + 0x3Cu);
+    p5t_plane(src, p5t_buf, P5T_YSZ);
+    p5t_plane(ld32(player + 0x40u), p5t_buf, P5T_YSZ);
+    for (i = 0; i < 6; i++)
+        p5t_plane(ld32(p5t_codec + 0x0Cu + 4u * i), p5t_buf, P5T_YSZ);
+    p5t_presents++;
+    if (p5t_presents <= 4 || (p5t_presents % 60) == 0)
+        fprintf(stderr, "movie: present n=%ld frame=%ld cursor=0x%08X src=0x%08X"
+                        " step=%llu\n",
+                p5t_presents, p5t_index, cur, src,
+                (unsigned long long)steps);
+    fflush(stderr);
+}
+
 int nnk_smc_exec_any(uint32_t *pcp) {
     uint32_t pc = *pcp, o, w, npc = 0, cost = 0;
     int thumb, rc;
+
 
     if (pc >= ITCM_LO && pc < ITCM_HI) {
         /* Phase-5M: the ITCM window is a SECOND live-code region.  The band
@@ -1152,6 +1276,9 @@ int nnk_smc_exec_any(uint32_t *pcp) {
         const uint8_t *q = itcm + (pc & (ITCM_PHYS - 1u));
         w = (uint32_t)q[0] | ((uint32_t)q[1] << 8) |
             ((uint32_t)q[2] << 16) | ((uint32_t)q[3] << 24);
+        /* Phase-5T: the movie decode callback's entry names the codec base
+         * (r0 = 0x0227834C) — that is where the host frame source comes from. */
+        if (pc == P5T_CB_ENTRY) p5t_note_codec(r[0]);
     } else {
         if ((pc & 0xFF000000u) != GBASE) return 0;
         o = pc & 0x3FFFFFu;
@@ -1197,6 +1324,10 @@ int nnk_smc_exec_any(uint32_t *pcp) {
                 (unsigned long long)steps, pc, w, thumb ? "thumb" : "arm", smc_t_sticky, npc);
     }
     *pcp = npc;
+    /* Phase-5T: the callback returns to its caller (0x0207B21C, right after
+     * the `blx r1` at 0x0207B218) — replace its pixel output with the host
+     * frame for this decode step, before the guest converter reads the plane. */
+    if (npc == P5T_CB_RET && pc >= ITCM_LO && pc < ITCM_HI) p5t_present();
     return 1;
 }
 
