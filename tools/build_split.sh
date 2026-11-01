@@ -96,6 +96,26 @@ gflags=($GFLAGS $EXTRA)
 rflags=($RFLAGS $EXTRA)
 ldflags=(-lm)
 
+# ---- Phase-5AB: a frozen dispatch image must not drop a committed prelude fix
+# `NNK_IMAGE_C` names a *build artifact* (`nnktool recompile-all` output under
+# the gitignored work/ tree), while the canonical guest-accessor prelude lives
+# in nnktool/src/recompile.rs.  An image frozen before a prelude fix therefore
+# builds a runtime WITHOUT that fix, silently.  Measured (Phase-5AB): the frozen
+# work/phase3a/arm9_thumb_ovl_itcm_p5u.c predates the Phase-5X VRAM/palette/OAM
+# read shadow, and the 13b3c45 binary built from it halts at 0x020E1B32 with
+# r4=0xE3A03102 — `blx r4` after reading the vptr stored at 0x06006004 back as
+# 0 — while the SAME guest parts (md5-identical nnk_part_*.c) built with the
+# shadow run past it.  Apply the transform the canonical source already carries
+# to any image that lacks it; the spliced image is a build artifact next to the
+# split output, so the content-hash cache key stays stable across rebuilds.
+if [[ -f "$IMAGE" ]] && ! grep -q 'gxd_sh_rd' "$IMAGE"; then
+  SPLICED_IMAGE="$(dirname "$SPLIT")/$(basename "$IMAGE" .c).prelude.c"
+  mkdir -p "$(dirname "$SPLICED_IMAGE")"
+  echo "== prelude splice: $IMAGE predates the Phase-5X read shadow -> $SPLICED_IMAGE =="
+  python3 tools/p5x_runtime_splice.py "$IMAGE" "$SPLICED_IMAGE"
+  IMAGE=$SPLICED_IMAGE
+fi
+
 if [[ "$GX" == "1" ]]; then
   [[ -f "$GXDIR/Makefile" ]] || { echo "NNK_GX=1 but $GXDIR/Makefile missing" >&2; exit 2; }
   echo "== gxrender: building libgxrender.a + gx_display.o + gx_gl.o =="

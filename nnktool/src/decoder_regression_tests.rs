@@ -1607,3 +1607,112 @@ fn movie_decode_progress_is_tracked_per_codec() {
     assert_eq!(0x022E_8B74u32 - 0xE8, 0x022E_8A8Cu32, "fixture: player B = codec B - 0xE8");
     assert_ne!(0x0227_834Cu32, 0x022E_8B74u32, "fixture: the two streams have distinct codecs");
 }
+
+/// Phase-5AB, class 39: the VRAM read shadow must make a guest store readable
+/// back through the 0x06000000 window, and the BUILD must not silently drop it.
+///
+/// Measured (operator log, and reproduced headlessly to the exact register
+/// file): the halt at 0x020E1B32 is Thumb
+///     0x020E1B26  adds r0, r5, #4     ; r0 = object+4 = 0x06006004
+///     0x020E1B28  ldr  r4, [r0, #0]   ; the C++ vptr stored there
+///     0x020E1B2C  ldr  r4, [r4, #0x24]; the virtual method
+///     0x020E1B32  blx  r4             ; -> 0xE3A03102, "untranslated pc"
+/// and r5 = 0x06006000, i.e. a guest object kept in the VRAM window.  With the
+/// read shadow in the runtime the round trip is exact and the branch executes
+/// (Phase-5AB probe, `NNK_P5AB`, steps 333,957,453..333,957,727):
+///     w 0x020429C8  0x06006004 <- 0x0206927C
+///     w 0x020FB130  0x06006004 <- 0x0213D074
+///     w 0x020F9004  0x06006004 <- 0x0213CF2C
+///     r 0x020E1B28  0x06006004 -> 0x0213CF2C   (blx r4 taken)
+/// The same guest parts built WITHOUT the shadow (scratch/p5aa/split2, the
+/// 13b3c45 binary's runtime TU) read 0 back and halt at 0x020E1B32, so the
+/// defect is in the build path as much as in the prelude: the frozen image
+/// `work/phase3a/arm9_thumb_ovl_itcm_p5u.c` predates the shadow and
+/// `tools/build_split.sh` used to build it verbatim.
+#[test]
+fn vram_read_shadow_round_trips_a_guest_store() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let rs = std::fs::read_to_string(root.join("nnktool/src/recompile.rs"))
+        .expect("cannot read nnktool/src/recompile.rs");
+
+    // (a) the canonical prelude carries the shadow: one offset function, a
+    //     lazily allocated byte image, and a read helper that refuses an access
+    //     straddling a window edge (it must not silently wrap into the next).
+    for needle in [
+        "static uint32_t gxd_sh_off(uint32_t a) {",
+        "static uint8_t *gxd_sh_wr(uint32_t a) {",
+        "static const uint8_t *gxd_sh_rd(uint32_t a, uint32_t n) {",
+        "if (!gxd_shadow) gxd_shadow = (uint8_t *)calloc(1, GXD_SH_SIZE);",
+        "if (gxd_sh_off(a + n - 1u) != o + (n - 1u)) return NULL;",
+    ] {
+        assert!(rs.contains(needle), "regression: the VRAM read shadow lost: {needle}");
+    }
+    // Every load consults it, with its own width.
+    for n in [4u32, 2, 1] {
+        let needle = format!("{{ const uint8_t *q = gxd_sh_rd(a, {}u);", n);
+        assert!(rs.contains(&needle), "regression: a load no longer reads the shadow: {needle}");
+    }
+    // Every store keeps the shadow current before the GX forward (the
+    // rendering path stays untouched: gxd_io_write still runs afterwards).
+    assert_eq!(
+        rs.matches("uint8_t *q = gxd_sh_wr(a);").count(), 3,
+        "regression: st8/st16/st32 no longer all update the read shadow"
+    );
+
+    // (b) the offset math, re-implemented from the C text: the three windows
+    //     are consecutive slabs of one buffer, and only they are mapped.
+    const VRAM: u32 = 0x8A0000;
+    let off = |a: u32| -> Option<u32> {
+        if (0x0500_0000..0x0500_0000 + 0x800).contains(&a) {
+            return Some(a - 0x0500_0000);
+        }
+        if (0x0600_0000..0x0600_0000 + VRAM).contains(&a) {
+            return Some(0x800 + (a - 0x0600_0000));
+        }
+        if (0x0700_0000..0x0700_0000 + 0x800).contains(&a) {
+            return Some(0x800 + VRAM + (a - 0x0700_0000));
+        }
+        None
+    };
+    // The measured round trip: the object word at 0x06006004 keeps its own
+    // slot, and no other window address collides with it.
+    let obj = off(0x0600_6004).expect("0x06006004 must be shadowed");
+    assert_eq!(obj, 0x800 + 0x6004, "fixture: the vptr word's shadow slot");
+    assert_eq!(off(0x0600_6000).unwrap(), 0x800 + 0x6000);
+    assert_eq!(off(0x0600_6008).unwrap(), 0x800 + 0x6008);
+    assert_eq!(off(0x0500_0000).unwrap(), 0);
+    assert_eq!(off(0x0700_0000).unwrap(), 0x800 + VRAM);
+    assert_eq!(off(0x0600_0000 + VRAM - 1).unwrap(), 0x800 + VRAM - 1);
+    assert_eq!(off(0x0600_0000 + VRAM), None, "past VRAM: not shadowed");
+    assert_eq!(off(0x0500_0800).unwrap_or(0xDEAD), 0xDEAD, "palette window is 2 KiB");
+    assert_eq!(off(0x027E_3A30).unwrap_or(0xDEAD), 0xDEAD, "main RAM is not shadowed");
+    // A 4-byte access at the last shadowed byte must be refused, not wrapped.
+    let last = off(0x0600_0000 + VRAM - 1).unwrap();
+    assert_eq!(off(0x0600_0000 + VRAM - 1 + 3).is_none(), true);
+    assert_ne!(last + 3, off(0x0700_0000).unwrap(), "window edges must not alias");
+    // Distinct windows never share a slot (a store to OAM cannot fabricate a
+    // vptr in the VRAM slab).
+    assert_ne!(off(0x0700_0000).unwrap(), obj);
+    assert_ne!(off(0x0500_0000).unwrap(), obj);
+
+    // (c) the delivery fix: build_split.sh applies the canonical prelude
+    //     transform to a frozen image that lacks it (the 13b3c45 binary was
+    //     built from such an image, which is why the operator still halted).
+    let bs = std::fs::read_to_string(root.join("tools/build_split.sh"))
+        .expect("cannot read tools/build_split.sh");
+    assert!(
+        bs.contains("! grep -q 'gxd_sh_rd' \"$IMAGE\"")
+            && bs.contains("tools/p5x_runtime_splice.py \"$IMAGE\" \"$SPLICED_IMAGE\""),
+        "regression: a frozen dispatch image can again be built without the read shadow"
+    );
+    assert!(
+        bs.find("gxd_sh_rd")
+            .unwrap()
+            < bs.find("if [[ -n \"${NNK_MONO:-}\" ]]").unwrap_or(usize::MAX),
+        "regression: the prelude splice must run before the mono/split build paths"
+    );
+
+    // Fixture sanity from the measured halt.
+    assert_eq!(0x020E_1B32u32 - 0x020E_1B28u32, 10, "fixture: ldr..blx span is 10 bytes of Thumb");
+    assert_eq!(0x0600_6004u32 & 3, 0, "fixture: the vptr word is 4-byte aligned");
+}
