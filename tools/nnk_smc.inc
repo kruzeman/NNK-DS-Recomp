@@ -1240,12 +1240,43 @@ static void p5t_init(void) {
 }
 
 /* Copy one 8-bit plane into a guest buffer; silently ignores addresses that
- * are not main RAM (the host decode never writes IO/VRAM/TCM directly). */
+ * are not main RAM (the host decode never writes IO/VRAM/TCM directly).
+ *
+ * Phase-5W: a movie plane may only land inside the guest's MOVIE ARENA.  The
+ * destinations this hook is handed come from the codec struct (+0x0C..+0x20,
+ * the six Y ring slots) and from the player struct (+0x3C/+0x40, the source
+ * planes).  Measured valid buffers in this session: melonDS's ring slot
+ * 0x022C0880, the native cursors 0x022E48E8 / 0x02355110, the codec structs
+ * 0x0227834C / 0x022E8B74 and the player 0x02278264 -> the arena is
+ * 0x02100000..0x02400000.  At the first decode steps of a session the player's
+ * source-plane fields are NOT yet populated ([player+0x3C] reads 0x20) and the
+ * stale field dropped a full 256x192 plane on the SDK's OSi_ThreadInfo block:
+ * measured in Phase-5W as the block's only write in 2.25e9..2.257e9 steps that
+ * did not come through st8/st16/st32 - the guard exists because too many
+ * things go through the store funnel to see it. */
+#define P5T_ARENA_LO 0x02100000u
+#define P5T_ARENA_HI 0x02400000u
 static int p5t_plane(uint32_t dst, const uint8_t *src, uint32_t n) {
     uint32_t o;
     if ((dst & 0xFF000000u) != GBASE) return 0;
     o = dst & 0x3FFFFFu;
     if (o + n > GSIZE) return 0;
+    if (dst < P5T_ARENA_LO || dst + n > P5T_ARENA_HI) {
+        /* Log once per distinct destination: a wrong field must be visible,
+         * not silently swallowed. */
+        static uint32_t seen[8];
+        static int nseen;
+        int i, have = 0;
+        for (i = 0; i < nseen; i++) if (seen[i] == dst) have = 1;
+        if (!have && nseen < 8) {
+            seen[nseen++] = dst;
+            fprintf(stderr, "movie: plane REFUSED dst=0x%08X n=%u step=%llu"
+                            " pc=0x%08X (outside movie arena 0x%08X..0x%08X)\n",
+                    dst, n, (unsigned long long)steps, last_pc,
+                    P5T_ARENA_LO, P5T_ARENA_HI);
+        }
+        return 0;
+    }
     memcpy(gmem + o, src, n);
     return 1;
 }
