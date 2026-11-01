@@ -3845,7 +3845,13 @@ static void trace_pc(uint32_t pc) {
     }
 }
 
-static void halt_reason(const char *msg) { halt_msg = msg; }
+/* Phase-5AN: keep the FIRST reason.  Every halt path also does
+ * `step_limit = steps` so the loop stops one iteration later — and that last
+ * iteration used to call halt_reason("step budget exhausted"), REPLACING the
+ * real reason.  Measured: the ov17 "data executed as an ARM SWI" halt at
+ * 0x0213D2AC reported "step budget exhausted", which reads like a slow run
+ * instead of a wild jump. */
+static void halt_reason(const char *msg) { if (!halt_msg) halt_msg = msg; }
 
 /* ---- SWI / BIOS HLE ------------------------------------------------------
  * Number convention verified against melonDS's FreeBIOS

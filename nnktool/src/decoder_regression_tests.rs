@@ -1258,11 +1258,14 @@ fn thumb_pic_base_register_is_not_an_interworking_target() {
         src.matches("if (rs == 15u) smc_note_pcbase((int)rd);").count(), 2,
         "regression: `add rd, pc` / `mov rd, pc` no longer tag the register they fill"
     );
-    // (c) the Thumb register-indirect branch carries its state (BX -> bit0,
-    //     BLX Rm -> always ARM; ARM ARM A7.1.4).  It used to strip bit0 and
-    //     note nothing, leaving the target on the stale sticky value.
+    // (c) the Thumb register-indirect branch carries its state.  It used to
+    //     strip bit0 and note nothing, leaving the target on the stale sticky
+    //     value.  Phase-5AN corrected the BLX rM half: melonDS A_BX and
+    //     A_BLX_REG are both `JumpTo(R[m])`, so bit0 decides the state for
+    //     BOTH halves — "BLX is always ARM" is the BLX <imm> rule, not BLX rM
+    //     (class 49: 0x020E2B66 blx r6 with 0x020DEE25 must stay Thumb).
     assert!(
-        src.contains("smc_branch_mode((hw & 0x0080u) ? (*npc) : tv);"),
+        src.contains("smc_branch_mode(tv);"),
         "regression: the Thumb BX/BLX rM arm drops the interworking state again"
     );
 
@@ -2853,5 +2856,125 @@ fn phase_5am_thumb_format5_reads_the_unaligned_pc_in_a_switch_table() {
         ((0x020D_DEA2u32 + 4) & !3u32) + 0x449F & !1u32,
         0x020E_2342,
         "and that is exactly the PC the runtime traced (0x020E2342)"
+    );
+}
+
+// --------------------------------------------------------------- class 49 ---
+// A Thumb `blx rM` interworks on bit0 exactly like `bx rM` (Phase-5AN).
+//
+// The live re-decoder (`tools/nnk_smc.inc`, Thumb format 5 case 3) recorded
+// the target state from the MASKED address for the BLX half (bit7 set), on the
+// belief that "BLX rM is always ARM" — that rule belongs to BLX <imm>.  melonDS
+// implements both halves identically (`src/ARMInterpreter_Branch.cpp`):
+//
+//   void A_BX(ARM* cpu)      { cpu->JumpTo(cpu->R[cpu->CurInstr & 0xF]); }
+//   void A_BLX_REG(ARM* cpu) { u32 lr = cpu->R[15] - 4;
+//                              cpu->JumpTo(cpu->R[cpu->CurInstr & 0xF]);
+//                              cpu->R[14] = lr; }
+//
+// JumpTo takes bit0, so a tagged Thumb pointer stays Thumb through BLX rM.
+// Measured in ov17 (Phase-5AN):
+//
+//   0x020E2B5C  ldr  r6,[r0,#0]        @ object+0x50 -> a vtable
+//   0x020E2B60  ldr  r6,[r6,#8]        @ slot+8 = 0x020DEE25 (THUMB, tagged)
+//   0x020E2B66  blx  r6                @ -> 0x020DEE24, must stay Thumb
+//   0x020DEE24  push {r4,r5,lr}        @ 0xB530
+//   0x020DEE26  sub  sp,#12            @ 0xB083
+//
+// Recorded as ARM, the live decoder ran 0x020DEE24 as the ARM word
+// 0xB083B530 (`andlts r3,r0,r0,lsr r5` — decodable, so nothing complained),
+// swallowed BOTH halves of the prologue at a 4-byte stride and skipped
+// 0x020DEE26: the pc trace jumped 0x020DEE24 -> 0x020DEE28 (measured, native
+// NNK_TRACE_FROM=559829000).  The body then ran 24 bytes off its own frame and
+// the epilogue `pop {r4,r5,pc}` popped 0 — the run halted at step 559,830,681
+// with `untranslated pc=0x00000000`, halt_pc=0x020DEE48.
+#[test]
+fn phase_5an_thumb_blx_rm_interworks_on_bit0_like_melonds() {
+    // The measured vtable target and what the live decoder must derive from it.
+    let r6: u32 = 0x020D_EE25;
+    assert_eq!(r6 & !1u32, 0x020D_EE24, "the dispatch key is the even address");
+    assert_eq!(r6 & 1u32, 1, "bit0 says THUMB — the state BLX rM must carry");
+
+    // The prologue is two 2-byte Thumb instructions; the ARM reading of the
+    // same four bytes is one 4-byte instruction, which is the bug.
+    let push = decode_thumb(0xB530, 0x0000, 0x020D_EE24, 2);
+    assert!(
+        push.text.contains("push"),
+        "0xB530 at 0x020DEE24 must decode as `push {{r4,r5,lr}}`, got {}",
+        push.text
+    );
+    assert_eq!(push.words.len(), 1, "a 16-bit Thumb push is ONE halfword");
+    let sub = decode_thumb(0xB083, 0x0000, 0x020D_EE26, 2);
+    assert!(
+        sub.text.contains("sub") && sub.text.contains("sp"),
+        "0xB083 at 0x020DEE26 must decode as `sub sp,#12`, got {}",
+        sub.text
+    );
+    assert_eq!(sub.words.len(), 1, "a 16-bit Thumb sub is ONE halfword");
+
+    // Thumb stride 2 reaches the `sub sp,#12` the ARM stride 4 skipped; the
+    // ARM stride is the step value the halted run measured (EE24 -> EE28).
+    let thumb_next = 0x020D_EE24u32 + 2;
+    assert_eq!(thumb_next, 0x020D_EE26, "Thumb executes the prologue's 2nd half");
+    let arm_next = 0x020D_EE24u32 + 4;
+    assert_eq!(
+        arm_next, 0x020D_EE28,
+        "the ARM reading lands on the measured trace's next pc (0x020DEE28)"
+    );
+    // The whole prologue-to-epilogue span is 0x24 bytes: `push {r4,r5,lr}` +
+    // `sub sp,#12` at the front, `add sp,#12` + `pop {r4,r5,pc}` at the back.
+    // Losing the first pair's 24 bytes of frame is what made the epilogue pop 0.
+    assert_eq!(0x020D_EE48u32 - 0x020D_EE24u32, 0x24);
+    assert_eq!(0x020D_EE48u32, 0x020D_EE46u32 + 2, "the pop sits after `add sp,#12`");
+
+    // The Rust static emitter already notes the RAW register (Phase-5K); this
+    // pins that the BLX half keeps the tag, so a future edit cannot make the
+    // compiled and live implementations disagree again.
+    let insn = Insn {
+        addr: 0x020E_2B66,
+        words: vec![0x47B0],
+        text: "blx r6".into(),
+        kind: Kind::Bx { rm: 6, link: true },
+    };
+    let mut out = Vec::new();
+    let e = super::emit_insn(&insn, 0x020E_2B66, true, false, String::new(), &mut out, true);
+    let body = e.body.join("\n");
+    assert!(
+        body.contains("nnk_smc_note_branch(_t)"),
+        "emitter: blx r6 must carry the raw tagged target for the live decoder: {}",
+        body
+    );
+    assert!(
+        body.contains("pc = _t & ~1u"),
+        "emitter: blx r6's dispatch key is the even address: {}",
+        body
+    );
+    assert!(
+        body.contains("r[6]"),
+        "emitter: blx r6 takes its target from r[6]: {}",
+        body
+    );
+    assert!(
+        body.contains("0x020E2B69u"),
+        "emitter: the Thumb blx link is (addr+2)|1 (ARM ARM B1.3.3 T1): {}",
+        body
+    );
+
+    // The live re-decoder must hand the UNMASKED target to smc_branch_mode for
+    // both BX and BLX rM.
+    let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../tools/nnk_smc.inc");
+    let src = std::fs::read_to_string(&p)
+        .unwrap_or_else(|e| panic!("cannot read {}: {}", p.display(), e));
+    let at = src
+        .find("/* format 5: hi-reg / BX */")
+        .expect("Thumb format 5 arm is gone");
+    let block = &src[at..(at + 3000).min(src.len())];
+    assert!(
+        block.contains("smc_branch_mode(tv);"),
+        "smc_exec_thumb: BLX rM must record the tagged target"
+    );
+    assert!(
+        !block.contains("smc_branch_mode((hw & 0x0080u)"),
+        "smc_exec_thumb: the masked-target BLX rM arm is back"
     );
 }
