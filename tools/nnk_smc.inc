@@ -1258,6 +1258,142 @@ static void p5t_present(void) {
     fflush(stderr);
 }
 
+/* ==========================================================================
+ * Phase-5U probe — the B1/B2 measurement (NNK_P5U=1, off by default).
+ *
+ *   NNK_P5U=1            enable
+ *   NNK_P5U_FROM=<step>  first step counted (default 0)
+ *   NNK_P5U_EVERY=<n>    sample interval in steps (default 10,000,000)
+ *   NNK_P5U_TOP=<n>      histogram entries reported at exit (default 24)
+ *
+ * Prints, per sample: step, cycles, vcount(), gxd_frames (NNK_GX builds), the
+ * PC, the next 8 dispatched PCs (the loop body), and the witness words
+ * player+0x30..+0x48 / +0xA4 plus the codec's first words.  At exit it prints
+ * the top PCs of the window (the spin loop) and the callback entry/return
+ * counts.  This is a measurement, not a model: it changes no guest state.
+ */
+static int p5u_state;                         /* 0 unparsed, 1 off, 2 on */
+static uint64_t p5u_from, p5u_every = 10000000ull, p5u_next;
+static int p5u_capture;                       /* print this many more PCs */
+static long p5u_samples, p5u_top_n = 24;
+static long p5u_cb_in, p5u_cb_ret;
+#define P5U_HBITS 15
+#define P5U_HSZ (1u << P5U_HBITS)
+static uint32_t p5u_hpc[P5U_HSZ];
+static uint32_t p5u_hit[P5U_HSZ];
+
+static void p5u_report(void) {
+    long i, k, shown = 0;
+    const char *mp = getenv("NNK_P5U_MEM");
+    if (mp && mp[0]) {
+        /* Full post-run snapshot so the hot loop can be disassembled. */
+        char p[512];
+        FILE *f;
+        snprintf(p, sizeof p, "%s.ram.bin", mp);
+        f = fopen(p, "wb");
+        if (f) { fwrite(gmem, 1, GSIZE, f); fclose(f); }
+        snprintf(p, sizeof p, "%s.itcm.bin", mp);
+        f = fopen(p, "wb");
+        if (f) { fwrite(itcm, 1, ITCM_PHYS, f); fclose(f); }
+        fprintf(stderr, "p5u: memory snapshot -> %s.{ram,itcm}.bin\n", mp);
+    }
+    fprintf(stderr, "p5u: report window=[%llu,%llu] cb_entry=%ld cb_ret=%ld"
+                    " samples=%ld\n",
+            (unsigned long long)p5u_from, (unsigned long long)steps,
+            p5u_cb_in, p5u_cb_ret, p5u_samples);
+    /* simple selection: repeatedly take the largest remaining count */
+    for (k = 0; k < p5u_top_n; k++) {
+        uint32_t best = 0;
+        long bi = -1;
+        for (i = 0; i < P5U_HSZ; i++)
+            if (p5u_hit[i] > best) { best = p5u_hit[i]; bi = i; }
+        if (bi < 0 || best == 0) break;
+        fprintf(stderr, "p5u: hot #%ld pc=0x%08X hits=%u\n",
+                ++shown, p5u_hpc[bi], p5u_hit[bi]);
+        p5u_hit[bi] = 0;
+    }
+    fflush(stderr);
+}
+
+static void p5u_init(void) {
+    const char *s = getenv("NNK_P5U");
+    p5u_state = 1;                             /* off unless enabled */
+    if (!s || !s[0] || s[0] == '0') return;
+    s = getenv("NNK_P5U_FROM");
+    if (s && s[0]) p5u_from = (uint64_t)strtoull(s, NULL, 0);
+    s = getenv("NNK_P5U_EVERY");
+    if (s && s[0]) p5u_every = (uint64_t)strtoull(s, NULL, 0);
+    s = getenv("NNK_P5U_TOP");
+    if (s && s[0]) p5u_top_n = strtol(s, NULL, 0);
+    if (p5u_every == 0) p5u_every = 1;
+    p5u_next = p5u_from;
+    p5u_state = 2;
+    atexit(p5u_report);
+    fprintf(stderr, "p5u: on from=%llu every=%llu\n",
+            (unsigned long long)p5u_from, (unsigned long long)p5u_every);
+}
+
+/* Called for EVERY dispatched instruction from trace_pc (the compiled
+ * dispatch cases and nnk_smc_exec_any both go through it), so the histogram
+ * covers both the translated and the live-decoded paths. */
+static void p5u_track(uint32_t pc);
+static void p5u_hook(uint32_t pc) {
+    if (p5u_state == 0) p5u_init();
+    if (p5u_state != 2) return;
+    p5u_track(pc);
+}
+
+static void p5u_track(uint32_t pc) {
+    if (steps < p5u_from) return;
+    {
+        uint32_t h = (pc * 2654435761u) >> (32 - P5U_HBITS);
+        uint32_t i = h;
+        for (;;) {
+            if (p5u_hit[i] == 0 || p5u_hpc[i] == pc) {
+                p5u_hpc[i] = pc; p5u_hit[i]++; break;
+            }
+            i = (i + 1u) & (P5U_HSZ - 1u);
+            if (i == h) break;
+        }
+    }
+    if (pc == P5T_CB_ENTRY) p5u_cb_in++;
+    if (pc == P5T_CB_RET) p5u_cb_ret++;
+    if (p5u_capture > 0) {
+        fprintf(stderr, "p5u:   -> pc=0x%08X step=%llu\n", pc,
+                (unsigned long long)steps);
+        p5u_capture--;
+    }
+    if (steps >= p5u_next) {
+        uint32_t p = P5T_PLAYER, c = ld32(p + 0x34u);
+        p5u_samples++;
+        p5u_next = steps + p5u_every;
+        fprintf(stderr,
+            "p5u: t step=%llu cyc=%llu vc=%u gxf=%u pc=0x%08X"
+            " player[30]=%08X [34]=%08X [38]=%08X [3C]=%08X [40]=%08X"
+            " [44]=%08X [48]=%08X [A4]=%08X"
+            " codec[00]=%08X [04]=%08X [0C]=%08X [10]=%08X [20]=%08X"
+            " r0=%08X r1=%08X r2=%08X r3=%08X lr=%08X sp=%08X"
+            " disp=%04X ie=%08X if=%08X ime=%u cpsr=%02X\n",
+            (unsigned long long)steps, (unsigned long long)cycles, vcount(),
+#ifdef NNK_GX
+            gxd_frames,
+#else
+            0u,
+#endif
+            pc,
+            ld32(p + 0x30u), c, ld32(p + 0x38u), ld32(p + 0x3Cu),
+            ld32(p + 0x40u), ld32(p + 0x44u), ld32(p + 0x48u),
+            ld32(p + 0xA4u),
+            c ? ld32(c) : 0u, c ? ld32(c + 4u) : 0u,
+            c ? ld32(c + 0x0Cu) : 0u, c ? ld32(c + 0x10u) : 0u,
+            c ? ld32(c + 0x20u) : 0u,
+            r[0], r[1], r[2], r[3], r[14], r[13],
+            dispstat, ie, iflags, ime, cpsr_ctl);
+        p5u_capture = 8;
+        fflush(stderr);
+    }
+}
+
 int nnk_smc_exec_any(uint32_t *pcp) {
     uint32_t pc = *pcp, o, w, npc = 0, cost = 0;
     int thumb, rc;

@@ -1111,3 +1111,63 @@ fn compiled_blx_immediate_carries_the_state_it_switches_to() {
     assert_eq!(T_BLX_I3_H2 & 0x1000, 0x0000, "fixture sanity: blx suffix bit12 = 0");
 }
 
+/// Class 19 (Phase-5U): the interrupt model the movie stall hangs on.
+///
+/// Measured (`PHASE5U.md` §3): after the movie start the guest parks in the
+/// SDK scheduler (0x020067E0 / 0x02006E80 / 0x02008D20.., 1,097,539 hits per
+/// hot PC over 64 M steps) with DISPSTAT bit 3 set, IE = 0x00040018 and
+/// IF = 0x000C0019 — i.e. enabled+pending sources that CANNOT be delivered
+/// because CPSR.I stays set (32/32 probe samples).  The two facts this class
+/// locks are the ones a future fix must not silently lose:
+///
+///  * the runtime HAS a real VBlank IRQ producer (IF bit 0 on the VCOUNT==192
+///    edge, gated on DISPSTAT bit 3) and rule-based delivery — both spliced by
+///    `tools/split_dispatch.py`, not by the generated image, so a regenerated
+///    image keeps them;
+///  * the delivery gate is exactly `ime && (ie & iflags) && !I`, so the stall
+///    is the guest's masked state and never a missing raise.
+#[test]
+fn runtime_interrupt_model_reaches_the_vblank_and_stops_at_cpsr_i() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let sd = std::fs::read_to_string(root.join("tools/split_dispatch.py"))
+        .expect("cannot read tools/split_dispatch.py");
+    // Phase-5F: the VBlank producer, on the DISPSTAT-bit-3-gated 192 edge.
+    for needle in [
+        "Phase-5F VBlank IRQ producer",
+        "if (p5f_vc == 192u && (dispstat & 0x8u)) iflags |= 0x1u;",
+    ] {
+        assert!(sd.contains(needle), "regression: Phase-5F VBlank producer lost: {needle}");
+    }
+    // Phase-4N: rule-based delivery once the boot script is exhausted.
+    assert!(
+        sd.contains("\" && (irq_trig_n >= IRQ_TRIG_N || steps > irq_trig_log[irq_trig_n])\""),
+        "regression: rule-based IRQ delivery splice lost (only the 3 boot triggers would deliver)"
+    );
+    // The gate itself, in the generator prelude.
+    let rs = std::fs::read_to_string(root.join("nnktool/src/recompile.rs"))
+        .expect("cannot read nnktool/src/recompile.rs");
+    assert!(
+        rs.contains("&& ime && (ie & iflags) && !(cpsr_ctl & 0x80u))"),
+        "regression: the IRQ delivery gate no longer honours CPSR.I/IME/IE&IF"
+    );
+    // The Phase-5U measurement harness: the probe hook and the two witness PCs.
+    let inc = std::fs::read_to_string(root.join("tools/nnk_smc.inc"))
+        .expect("cannot read tools/nnk_smc.inc");
+    for needle in [
+        "static void p5u_hook(uint32_t pc)",
+        "#define P5T_CB_ENTRY 0x01FF8540u",
+        "#define P5T_CB_RET 0x0207B21Cu",
+        "NNK_P5U_FROM",
+    ] {
+        assert!(inc.contains(needle), "regression: Phase-5U probe lost: {needle}");
+    }
+    let splice = std::fs::read_to_string(root.join("tools/p5u_probe_splice.py"))
+        .expect("cannot read tools/p5u_probe_splice.py");
+    assert!(
+        splice.contains("p5u_hook(pc);") && splice.contains("static void trace_pc(uint32_t pc) {"),
+        "regression: the probe no longer hooks trace_pc (the only call site both dispatch paths share)"
+    );
+    // The movie player's call site the callback cadence is counted at.
+    assert_eq!(0x0207B218u32 & 3, 0, "fixture sanity: the `blx r1` is ARM-aligned");
+}
+
