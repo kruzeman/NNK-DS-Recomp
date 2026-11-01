@@ -143,7 +143,20 @@ The guest has NOT reached the "Skip the cutscene? Yes/No" dialog.  GOAL 2 is not
 landed; its premise changed: the ov6→ov17 call happens in melonDS too, so the
 remaining gap is not "we enter a path melonDS never enters".
 
-## 6. Evidence
+## 6. Regression checks (all green)
+
+| check | measurement |
+|---|---|
+| movie band, unscripted (`NNK_STEP_LIMIT=2400000000`, 4291 frames presented, shots every 25) | top-screen luma corr **0.9986..0.9990**, MAE 1.53..2.96 vs `op_u` refs f16..f37, frames **4125..4275** — same band and same numbers as Phase-5AD |
+| notice screen | f100 bottom: pirate art + "We do not condone piracy" |
+| Mobiclip splash | f500 top: "mobiclip VIDEO CODEC", bottom "Licensed by Nintendo" |
+| boot order after it | f300 LEVEL5, f700 "New Game" menu |
+| ROM-only | `./work/split/arm9_5an "Ni No Kuni.nds"` — no derived files, `smc: generation-0 ... derived from the ROM` |
+| speed | 200M steps: **29.40 s** (this build) vs **29.97 s** (5AM master) = 1.9% faster, well inside the 20% band |
+| `cargo test` | 53 passed |
+| `verify_phase2a.sh` | strict common prefix **1000 / 1000**, resync 1000/1000, rc=0 |
+
+## 7. Evidence
 
 ```
 work/phase5an/trace1.err + trace3.txt   pre-fix halt at 559,830,681 (untranslated pc=0)
@@ -154,7 +167,10 @@ work/phase5an/fix1.err / fix2.err       post-fix run: 560,128,158, 1006 frames
 work/phase5an/fix2.*.ppm(.png)          f100 notice (pirate, "We do not condone
                                         piracy"), f300 LEVEL5, f500 Mobiclip
                                         splash, f700 title menu, f1000 frontier
+work/phase5an/bb.err                    unscripted 2.4e9-step run, 4291 frames
+work/phase5an/band_bbshots/ + png/      the 0.9986..0.9990 band captures
 work/phase5an/verify2a.log              verify_phase2a: 1000/1000, rc=0
+work/phase5an/speed_*.err               200M-step wall clock, both builds
 ```
 
 No game bytes were committed.  The only guest constants in the test are Thumb
