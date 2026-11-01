@@ -1422,3 +1422,101 @@ fn movie_plane_writes_stay_inside_the_movie_arena() {
     assert_eq!(0x022C0880u32 >= 0x02100000 && 0x022C0880u32 < 0x02400000, true,
                "fixture: the measured melonDS ring slot sits inside the arena");
 }
+
+/// Class 38 (Phase-5AA): the intro drives TWO concurrent movies, one per
+/// screen, so decode-step tracking must be PER CODEC.
+///
+/// Measured (melonDS REGPROBE at 0x0207B218, 40 consecutive hits, ts
+/// 2,272,165,619..2,307,573,062): r1 is always the ITCM callback
+/// 0x01FF8540, r5 alternates 0x02278264 / 0x022E8A8C, r0 alternates
+/// 0x0227834C / 0x022E8B74 — two player objects, two codec structs, each with
+/// its own MODS header at player+4 and its own six-slot Y ring.  melonDS's
+/// main RAM at ts 2.6179e9 matches player 0x02278264's ring slot 0x022C0880
+/// to op_u frame 130 and player 0x022E8A8C's ring slot 0x023310A8 to op_d
+/// frame 130 (best-frame correlation 0.708 / MAE 16.9).  The old HLE kept ONE
+/// global index and reset it whenever the codec changed, so every present of
+/// the alternating session showed frame 0 (Phase-5W measured four byte-
+/// identical display frames).  This class pins the per-codec stream table,
+/// the per-stream cursor reset rule, the second source file, and the measured
+/// owner relation player = codec - 0xE8 (with [player+0x34] == codec).
+#[test]
+fn movie_decode_progress_is_tracked_per_codec() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let inc = std::fs::read_to_string(root.join("tools/nnk_smc.inc"))
+        .expect("cannot read tools/nnk_smc.inc");
+
+    // One entry per codec; the struct carries the per-stream cursor and index.
+    assert!(inc.contains("#define P5T_MAXSTREAM 4"), "the stream table disappeared");
+    let st = inc
+        .find("typedef struct {\n    uint32_t codec;")
+        .expect("regression: the per-codec stream struct is gone");
+    let st_body = &inc[st..st + 400.min(inc.len() - st)];
+    for needle in ["uint32_t cursor;", "long index;", "long frames, presents, shortr;", "FILE *fp;"] {
+        assert!(st_body.contains(needle), "regression: stream field lost: {needle}");
+    }
+
+    // Registration is by codec address, and a new session starts at frame 0.
+    let reg = inc
+        .find("static P5tStream *p5t_stream(uint32_t codec) {")
+        .expect("regression: p5t_stream is gone");
+    let reg_body = &inc[reg..];
+    let reg_body = &reg_body[..reg_body.find("\n}\n").expect("p5t_stream end missing")];
+    assert!(
+        reg_body.contains("if (p5t_str[i].codec == codec) return &p5t_str[i];"),
+        "regression: codecs are no longer looked up by address (the session restarts)"
+    );
+    assert!(reg_body.contains("s->index = -1;"), "regression: a new stream no longer starts at frame 0");
+    assert!(
+        reg_body.contains("getenv(\"NNK_MOVIE_YUV2\")"),
+        "regression: the second screen's source file (op_d) lost its env"
+    );
+
+    // Present uses THIS decode step's codec: its own stream, cursor and index.
+    let pr = inc
+        .find("static void p5t_present(void) {")
+        .expect("regression: p5t_present is gone");
+    let pr_body = &inc[pr..];
+    let pr_body = &pr_body[..pr_body.find("\n}\n").expect("p5t_present end missing")];
+    assert!(
+        pr_body.contains("if (p5t_str[i].codec == p5t_codec) s = &p5t_str[i];"),
+        "regression: present no longer selects the current codec's stream"
+    );
+    assert!(
+        pr_body.contains("if (s->index < 0) s->index = 0;")
+            && pr_body.contains("s->cursor = cur;")
+            && pr_body.contains("s->presents++"),
+        "regression: the frame index is no longer a plain per-stream decode-step count"
+    );
+    // The measured owner relation (player = codec - 0xE8) is used for the
+    // report; the plane WRITE must stay on the codec's six ring slots — the
+    // guest's present function fills player+0x3C/+0x40 itself from the arrays
+    // at player+0x5C/+0x60, which hold exactly those slots.  Writing the
+    // player's fields from the HLE is the Phase-5W stale-destination hazard.
+    assert!(
+        pr_body.contains("player = p5t_codec - 0xE8u;"),
+        "regression: the measured owner relation left the present path"
+    );
+    assert!(
+        !pr_body.contains("player + 0x3Cu") && !pr_body.contains("player + 0x40u"),
+        "regression: the HLE writes the player's source-plane fields again (Phase-5W hazard)"
+    );
+    assert!(
+        pr_body.contains("ld32(p5t_codec + 0x0Cu + 4u * i)"),
+        "regression: the six codec Y ring slots are no longer the write target"
+    );
+    // The single global index must be gone entirely.
+    assert!(
+        !inc.contains("p5t_index") && !inc.contains("p5t_frames"),
+        "regression: the removed single-stream globals came back"
+    );
+    // The hook still fires only at the measured callback return.
+    assert!(
+        inc.contains("if (npc == P5T_CB_RET && pc >= ITCM_LO && pc < ITCM_HI) p5t_present();"),
+        "regression: the movie present hook left the callback return site"
+    );
+
+    // Fixture sanity from the two measured codec/player pairs.
+    assert_eq!(0x0227_834Cu32 - 0xE8, 0x0227_8264u32, "fixture: player A = codec A - 0xE8");
+    assert_eq!(0x022E_8B74u32 - 0xE8, 0x022E_8A8Cu32, "fixture: player B = codec B - 0xE8");
+    assert_ne!(0x0227_834Cu32, 0x022E_8B74u32, "fixture: the two streams have distinct codecs");
+}
