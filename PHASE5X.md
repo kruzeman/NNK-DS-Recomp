@@ -114,11 +114,9 @@ A=`0x3FE`, B=`0x3FD`, Start=`0x3F7`), 10/11 = DS X/Y.  This is the reproducible
 form of a human session: the operator taps when he SEES a prompt, which
 step-timed injection cannot express.
 
-**Still to do (operator's scripted form):** accept a SCRIPT as well as a single
-value — one `<frame> <mask>` entry per line (frame decimal, mask hex, `#`
-comments, `end`/EOF holds), parsed once per file change and applied in order as
-the frame counter passes each entry, with a delta trace per entry and a
-one-line exit summary (entries applied, last frame).
+**Scripted form + recorder (implemented, see PHASE5Z.md).**
+`NNK_INPUT_FILE` now also accepts a SCRIPT (`<frame> <mask>` per line) and
+`NNK_INPUT_RECORD` writes the effective mask as a replayable script.
 
 ## 6. Verification
 

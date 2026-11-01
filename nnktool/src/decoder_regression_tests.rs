@@ -1315,11 +1315,11 @@ fn input_file_is_frame_timed_and_masks_the_key_space() {
     for needle in [
         "if (!p || !p[0]) return;",
         "if (gxd_frames == nnk_file_frame) return;",   // once per DISPLAY FRAME
-        "strtoul(buf, NULL, 0) & 0xFFFu",              // 10 keys + DS X/Y
-        "if ((uint32_t)v == nnk_mask) return;",        // edge-driven, no churn
+        "v &= 0xFFFu;",                             // 10 keys + DS X/Y
+        "if (v == nnk_mask) return;",                  // edge-driven, no churn
         "gxd_set_keymask(gxd, nnk_mask);",             // same path a key event takes
         "nnk_input_file_tick();",                      // ticked from nnk_input_tick
-        "file mask=0x%03X EXTKEYIN=0x%02X frame=%u",   // visible under NNK_INPUT_TRACE
+        "script applied frame=%u mask=0x%03X entry=%d/%d ", // visible under NNK_INPUT_TRACE
     ] {
         assert!(src.contains(needle), "regression: NNK_INPUT_FILE lost: {needle}");
     }
@@ -1328,7 +1328,7 @@ fn input_file_is_frame_timed_and_masks_the_key_space() {
     // and same-frame guards, and a failed fopen returns without touching state.
     let tick = &src[src.find("static void nnk_input_file_tick(void)").expect("tick missing")..];
     let body = &tick[..tick.find("\n}\n").expect("tick end missing")];
-    assert_eq!(body.matches("return;").count(), 5, "fixture: file tick early-outs changed");
+    assert_eq!(body.matches("return;").count(), 2, "fixture: file tick early-outs changed");
     assert!(!body.contains("nnk_mask = 0xFFFu"), "regression: a missing file clears the keys");
     // KEYINPUT is active-low: idle 0x3FF, B = bit1, A = bit0, Start = bit3.
     assert_eq!(0x3FFu32 & !(1u32 << 1), 0x3FDu32, "fixture: B mask");
