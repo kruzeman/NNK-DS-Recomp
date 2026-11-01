@@ -242,8 +242,67 @@ static void smc_stats(void) {
 }
 
 /* ---- code-window write tracking ----------------------------------------- */
+/* Phase-5N: generic guest-store watch.  NNK_STOREWATCH="lo:hi" (+_PATH, _N)
+ * logs every store whose byte range overlaps [lo,hi) with the RAW guest
+ * address, the value it REPLACES (read through the guest data path, so the
+ * DTCM/ITCM windows are honoured) and the executing PC.  It answers "who
+ * wrote this guest word, and when" by measurement.  NNK_STOREWATCH_MASK=<m>
+ * tests (addr & m) instead: with m=0x7FFF plus "0x50:0x58" it catches every
+ * store that lands in the 32 KiB ITCM array's first 0x58 bytes whatever the
+ * guest-side alias — and only stores that actually route into the ITCM
+ * window (addr < itcm_size) are logged in that mode.
+ * Lazy env parse on the first store; one integer test per store afterwards. */
+static FILE *storewatch_fp = NULL;
+static int storewatch_state = 0;          /* 0 unparsed, 1 off, 2 on */
+static uint32_t storewatch_lo = 0, storewatch_hi = 0;
+static uint32_t storewatch_mask = 0xFFFFFFFFu;
+static long storewatch_n = 0, storewatch_limit = 2000;
+static void storewatch_init(void) {
+    const char *s = getenv("NNK_STOREWATCH");
+    storewatch_state = 1;
+    if (!s || !s[0]) return;
+    { const char *q = s;
+      while (*q == ' ' || *q == ',') q++;
+      storewatch_lo = (uint32_t)strtoul(q, (char **)&q, 0);
+      while (*q == ' ' || *q == ':' || *q == '-') q++;
+      storewatch_hi = (uint32_t)strtoul(q, (char **)&q, 0);
+      if (!storewatch_hi) storewatch_hi = storewatch_lo + 4u; }
+    { const char *p = getenv("NNK_STOREWATCH_PATH");
+      const char *m = getenv("NNK_STOREWATCH_N");
+      const char *k = getenv("NNK_STOREWATCH_MASK");
+      if (m && m[0]) storewatch_limit = (long)strtol(m, NULL, 0);
+      if (k && k[0]) storewatch_mask = (uint32_t)strtoul(k, NULL, 0);
+      if (p && p[0]) storewatch_fp = fopen(p, "w"); }
+    if (!storewatch_fp) return;
+    storewatch_state = 2;
+    fprintf(stderr, "storewatch: 0x%08X..0x%08X mask=0x%08X limit=%ld\n",
+            storewatch_lo, storewatch_hi, storewatch_mask, storewatch_limit);
+}
+static void storewatch_hit(uint32_t a, uint32_t n) {
+    if (!storewatch_fp) return;
+    /* lr names the caller of the routine that stores; r0-r3 the arguments
+     * that selected this store; sp lets the stack frame be walked later. */
+    fprintf(storewatch_fp,
+            "W%u 0x%08X old=0x%08X pc=0x%08X lr=0x%08X r0=0x%08X r1=0x%08X r2=0x%08X r3=0x%08X sp=0x%08X step=%llu\n",
+            n * 8u, a, ld32(a), last_pc, r[14], r[0], r[1], r[2], r[3], r[13],
+            (unsigned long long)steps);
+    fflush(storewatch_fp);
+    if (++storewatch_n >= storewatch_limit) {
+        fclose(storewatch_fp);
+        storewatch_fp = NULL; storewatch_state = 1;
+    }
+}
 static inline void smc_note(uint32_t a, uint32_t n) {
     uint32_t o, b, e;
+    /* Phase-5N store watch: inline range test first (two compares, same cost
+     * shape as the Phase-4V probes below); the logging body is only reached
+     * on a hit.  NNK_STOREWATCH unset leaves storewatch_state == 1. */
+    if (!storewatch_state) storewatch_init();
+    if (storewatch_state == 2) {
+        uint32_t _sw = a & storewatch_mask;
+        if (storewatch_mask != 0xFFFFFFFFu && a >= itcm_size) _sw = 0xFFFFFFFFu;
+        if (_sw >= storewatch_lo && _sw < storewatch_hi) storewatch_hit(a, n);
+    }
     /* Phase-4V probe: who writes the DTCM IRQ-vector slot and the halted
      * code word?  Fires on the exact bytes (mirrors included). */
     if (a >= 0x027E3FC0u && a <= 0x027E3FFFu)
