@@ -791,6 +791,26 @@ fn emit_insn(
             if global {
                 // Interworking call — dispatch to the callee's even address;
                 // which case exists there (ARM or Thumb) selects the state.
+                //
+                // Phase-5O: the STATE the BLX switches to is fully determined
+                // by the ENCODING (Thumb `blx imm` -> ARM, ARM `blx imm` ->
+                // Thumb; ARM ARM A7.1.4), so it must be carried into the
+                // runtime exactly like the `bx`/`blx Rm` and `pop {..,pc}`
+                // forms do (Phase-5J/5K).  Without the note an UNROOTED
+                // callee fell through to the live re-decoder's map/register/
+                // sticky guess: measured `0x020F6ED6 blx 0x02054144` (Thumb
+                // words 0xF75D 0xE936) left `smc_t_sticky` = Thumb, so the
+                // live decoder re-decoded the ARM `push {r4,lr}` at
+                // 0x02054144 as Thumb, walked 0x02054146..0x020541BE through
+                // the ARM bytes, branched into the middle of the movie
+                // player's table generator at 0x02054764 (prologue skipped),
+                // and the 5th-argument slot it reloads from [[sp,#0x128]]
+                // held 1 instead of a destination pointer: `str r0,[r1,r7,
+                // lsl #2]` with r7=0x14 wrote to guest address 0x51, i.e.
+                // ITCM[0x51..0x54], zeroing the dispatcher's literal pool
+                // 0x01FF8050/4 (Phase-5N mechanism).
+                let raw = if thumb { *target & !1u32 } else { *target | 1u32 };
+                body.push(format!("nnk_smc_note_branch(0x{:08X}u);", raw));
                 flow = Flow::Indirect(None);
                 pc_written = true;
                 body.push(format!("r[14] = 0x{:08X}u;", linkv));
