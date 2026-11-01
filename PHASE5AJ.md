@@ -223,3 +223,19 @@ Every acceptance item above is met on a binary built from committed sources;
 `cargo test` is 47/47.  `NNK_SMC_IMAGE` and `NNK_MOVIE_YUV*` now only exist as
 A/B overrides (they still work — that is how §5.1's legacy column was run), and
 `run.sh`/`README.md` document them that way.
+
+## 7. `tools/verify_phase2a.sh` (SKIP_MELONDS=1) on this tree
+
+A/A2/B/C1/C2 ran green with this commit: A2 prints `RESULT: PASS`, C1
+`agreed 1942/2020 (96.1%)`, C2 `body fully covered 1854 (95.5%)`.
+
+Section D (the **mono** baseline: `recompile-all` -> one TU -> `cc -O0` on a
+27 MB C file) is a long build on this host and was cut short twice by the
+420 s terminal cap, not by a compile error: the failure it DID hit first was
+`nnk_rom.inc: No such file or directory`, because that script copies the
+runtime fragments next to the generated TU by hand — it now copies
+`nnk_rom.inc` too (`tools/verify_phase2a.sh`).  After that fix `cc` proceeds
+past the include (no diagnostic), and section D asserts nothing: it prints
+`native trace lines` / `native summary` / `HLE hits` for a human to read, on
+the mono image that is NOT the shipped build.  The shipped build (the split
+pipeline) compiles, passes the prelude audit and is what §5 measures.
