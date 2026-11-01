@@ -2147,7 +2147,55 @@ static inline int win_off(uint32_t a, uint32_t n, uint32_t *off) {
     if (a < GBASE || (uint64_t)a + n > (uint64_t)GBASE + GSIZE) return 0;
     *off = a - GBASE; return 1;
 }
+/* Phase-5X: read shadow for the GX-routed memory windows.
+ *
+ * WHY (measured): the merged display API is WRITE-ONLY for the windows it
+ * owns.  `gxd_io_write` routes palette (0x05000000), VRAM (0x06000000..
+ * 0x0689FFFF) and OAM (0x07000000) bytes into its VRAMCNT-mapped banks, but
+ * `gxd_io_read` serves only KEYINPUT/KEYCNT/VRAMSTAT and returns 0 for every
+ * window address — and the runtime's own ld32/ld16/ld8 never looked at the
+ * window at all, so a guest read of VRAM returned 0 unconditionally.
+ *   The post-skip path keeps a C++ object in the window: the constructor at
+ * 0x020E1AC4 stores its vptr into [0x06006004] (step 331,707,2xx) and the
+ * virtual call `blx r4` 267 steps later read 0x00000000 back from that very
+ * word, loaded [0x24] instead of a vtable slot and branched to 0xE3A03102 —
+ * `untranslated pc=0xe3a03102`.
+ * The shadow makes the guest's read-modify-write self-consistent.  Writes
+ * still go to gx_display unchanged (rendering path untouched), and reads fall
+ * through to the old behaviour for every address outside the three windows. */
+#ifdef NNK_GX
+#define GXD_SH_VRAM 0x8A0000u          /* 0x06000000..0x0689FFFF */
+#define GXD_SH_SIZE (0x800u + GXD_SH_VRAM + 0x800u)
+static uint8_t *gxd_shadow;            /* lazily allocated on the first write */
+static uint32_t gxd_sh_off(uint32_t a) {
+    if (a >= 0x05000000u && a < 0x05000800u) return a - 0x05000000u;
+    if (a >= 0x06000000u && a < 0x06000000u + GXD_SH_VRAM) return 0x800u + (a - 0x06000000u);
+    if (a >= 0x07000000u && a < 0x07000800u) return 0x800u + GXD_SH_VRAM + (a - 0x07000000u);
+    return 0xFFFFFFFFu;
+}
+/* write side: allocate on demand, NULL when the address is outside the windows */
+static uint8_t *gxd_sh_wr(uint32_t a) {
+    uint32_t o = gxd_sh_off(a);
+    if (o == 0xFFFFFFFFu) return NULL;
+    if (!gxd_shadow) gxd_shadow = (uint8_t *)calloc(1, GXD_SH_SIZE);
+    return gxd_shadow ? gxd_shadow + o : NULL;
+}
+/* read side: an n-byte access that stays inside one window, else NULL */
+static const uint8_t *gxd_sh_rd(uint32_t a, uint32_t n) {
+    uint32_t o;
+    if (!gxd_shadow) return NULL;
+    o = gxd_sh_off(a);
+    if (o == 0xFFFFFFFFu) return NULL;
+    if (gxd_sh_off(a + n - 1u) != o + (n - 1u)) return NULL;
+    return gxd_shadow + o;
+}
+#endif
+
 static inline uint32_t ld32(uint32_t a) {
+#ifdef NNK_GX
+    { const uint8_t *q = gxd_sh_rd(a, 4u);
+      if (q) return (uint32_t)q[0] | ((uint32_t)q[1] << 8) | ((uint32_t)q[2] << 16) | ((uint32_t)q[3] << 24); }
+#endif
     if (a < itcm_size) {
         const uint8_t *p = itcm + (a & (ITCM_PHYS - 1u));
         return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
@@ -2171,6 +2219,8 @@ static inline void smc_note(uint32_t a, uint32_t n);
 
 static inline void st32(uint32_t a, uint32_t v) {
 #ifdef NNK_GX
+    { uint8_t *q = gxd_sh_wr(a);        /* Phase-5X: shadow the guest's own write */
+      if (q) { q[0] = (uint8_t)v; q[1] = (uint8_t)(v >> 8); q[2] = (uint8_t)(v >> 16); q[3] = (uint8_t)(v >> 24); } }
     if (gxd && gxd_mem_io(a)) { gxd_io_write(gxd, a, v, 4); return; }
 #endif
     smc_note(a, 4u);
@@ -2189,6 +2239,10 @@ static inline void st32(uint32_t a, uint32_t v) {
       p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24); } }
 }
 static inline uint32_t ld16(uint32_t a) {
+#ifdef NNK_GX
+    { const uint8_t *q = gxd_sh_rd(a, 2u);
+      if (q) return (uint32_t)q[0] | ((uint32_t)q[1] << 8); }
+#endif
     if (a < itcm_size) {
         const uint8_t *p = itcm + (a & (ITCM_PHYS - 1u));
         return (uint32_t)p[0] | ((uint32_t)p[1] << 8);
@@ -2206,6 +2260,8 @@ static inline uint32_t ld16(uint32_t a) {
 }
 static inline void st16(uint32_t a, uint16_t v) {
 #ifdef NNK_GX
+    { uint8_t *q = gxd_sh_wr(a);
+      if (q) { q[0] = (uint8_t)v; q[1] = (uint8_t)(v >> 8); } }
     if (gxd && gxd_mem_io(a)) { gxd_io_write(gxd, a, v, 2); return; }
 #endif
     smc_note(a, 2u);
@@ -2224,6 +2280,9 @@ static inline void st16(uint32_t a, uint16_t v) {
       p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); } }
 }
 static inline uint32_t ld8(uint32_t a) {
+#ifdef NNK_GX
+    { const uint8_t *q = gxd_sh_rd(a, 1u); if (q) return (uint32_t)q[0]; }
+#endif
     if (a < itcm_size) return itcm[a & (ITCM_PHYS - 1u)];
     if ((a & dtcm_mask) == dtcm_base) return dtcm[a & (DTCM_PHYS - 1u)];
     if (is_gba_rom(a)) return (gba_bus16(a & ~1u) >> ((a & 1u) * 8)) & 0xFFu;
@@ -2234,6 +2293,7 @@ static inline uint32_t ld8(uint32_t a) {
 }
 static inline void st8(uint32_t a, uint32_t v) {
 #ifdef NNK_GX
+    { uint8_t *q = gxd_sh_wr(a); if (q) q[0] = (uint8_t)v; }
     if (gxd && gxd_mem_io(a)) { gxd_io_write(gxd, a, v, 1); return; }
 #endif
     smc_note(a, 1u);
