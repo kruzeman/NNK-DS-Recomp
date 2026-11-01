@@ -239,6 +239,172 @@ static int smc_state_from_regs(uint32_t pc)
     return -1;                            /* no register carries this pc */
 }
 
+/* ==========================================================================
+ * Phase-5AP: the ROM-derived `pc -> form` map as the PRIMARY authority.
+ *
+ * The barriers of 5AM / 5AN / 5AO were one question asked three times: in
+ * which processor state does a pc execute that the recompiler did not reach
+ * through a known branch?  tools/gen_pcform.py answers it from the ROM image
+ * alone (recursive descent from every ROM-declared entry plus every pointer
+ * into code, with the hardware's interworking rules) and emits
+ * nnk_pcform_map.h: disjoint [lo,hi) runs tagged thumb|arm.
+ *
+ * For a pc the COMPILED map already classifies (nnk_pc_is_thumb) nothing
+ * changes -- that map is exact.  For every other pc the ROM map WINS; the
+ * runtime's own inference (branch register / predecessor stride / sticky) is
+ * still computed, but only as a cross-check.  NNK_STATE_CONFLICTS=1 prints
+ * every disagreement between the two, every pc that executes in BOTH forms,
+ * every decode that had to fall back to the other state, and every executed
+ * pc the map does not cover (a HOLE -- counted and listed, never hidden).
+ * ========================================================================== */
+#if defined(__has_include)
+#  if __has_include("nnk_pcform_map.h")
+#    include "nnk_pcform_map.h"
+#  else
+#    define NNK_PCFORM_THUMB_RUNS 0
+#    define NNK_PCFORM_ARM_RUNS 0
+static inline int nnk_pcform_lookup(uint32_t pc) { (void)pc; return -1; }
+#  endif
+#else
+#  include "nnk_pcform_map.h"
+#endif
+
+static int smc_stconf;                /* NNK_STATE_CONFLICTS */
+static unsigned long long smc_nmap;   /* states decided by the ROM map */
+static unsigned long long smc_nconf;  /* map vs runtime-inference disagreements */
+static unsigned long long smc_nflip;  /* a pc executed in BOTH forms */
+static unsigned long long smc_nhole;  /* executions of pcs the map lacks */
+static uint32_t smc_hole_pc[64];      /* bounded hole list */
+static unsigned smc_nhole_pc;
+#define SMC_SEEN_N (1u << 20)
+static uint32_t *smc_seen_key;        /* (pc>>1)+1, 0 = empty */
+static signed char *smc_seen_form;
+
+static void smc_conflict_init(void)
+{
+    const char *p = getenv("NNK_STATE_CONFLICTS");
+    if (!p || !p[0] || p[0] == '0') return;
+    smc_stconf = 1;
+    smc_seen_key = calloc(SMC_SEEN_N, sizeof(uint32_t));
+    smc_seen_form = calloc(SMC_SEEN_N, 1);
+    fprintf(stderr, "smc: NNK_STATE_CONFLICTS=1 (pcform map: %d thumb runs, "
+            "%d arm runs)\n", NNK_PCFORM_THUMB_RUNS, NNK_PCFORM_ARM_RUNS);
+}
+
+static void smc_note_hole(uint32_t pc)
+{
+    unsigned i;
+    smc_nhole++;
+    for (i = 0; i < smc_nhole_pc; i++)
+        if (smc_hole_pc[i] == pc) return;
+    if (smc_nhole_pc < (unsigned)(sizeof(smc_hole_pc) / sizeof(smc_hole_pc[0])))
+        smc_hole_pc[smc_nhole_pc++] = pc;
+}
+
+/* Record "this pc executed in this state" and report a state FLIP. */
+static void smc_note_seen(uint32_t pc, int thumb)
+{
+    uint32_t k = (pc >> 1) + 1u;
+    uint32_t idx;
+    unsigned i;
+    if (!smc_stconf || !smc_seen_key) return;
+    idx = (k * 2654435761u) & (SMC_SEEN_N - 1u);
+    for (i = 0; i < 8; i++) {
+        unsigned s = (idx + i) & (SMC_SEEN_N - 1u);
+        if (smc_seen_key[s] == k) {
+            if (smc_seen_form[s] != (signed char)thumb) {
+                smc_nflip++;
+                fprintf(stderr, "stateconf FLIP pc=0x%08X %s->%s step=%llu\n",
+                        pc, smc_seen_form[s] ? "thumb" : "arm",
+                        thumb ? "thumb" : "arm", (unsigned long long)steps);
+                smc_seen_form[s] = (signed char)thumb;
+            }
+            return;
+        }
+        if (smc_seen_key[s] == 0) {
+            smc_seen_key[s] = k;
+            smc_seen_form[s] = (signed char)thumb;
+            return;
+        }
+    }
+}
+
+/* Phase-5AP: the map describes the ROM image, so it only speaks for bytes the
+ * guest has NOT rewritten.  The arena window is decrypted in place by the
+ * guest's own rolling-key routine (0x0215B468, ten passes), so generation-0
+ * bytes there are CIPHERTEXT: decoding them yields a confident but meaningless
+ * form.  Measured: without this test the map forced Thumb at 0x0215A7C4 (a
+ * decrypted overlay routine) and the run halted at step 13,643,665 instead of
+ * 560,192,510.  `smc_gen[band] == 0` means "still the generation-0 image". */
+static int smc_map_live_ok(uint32_t pc)
+{
+    if (!smc_armed) return 0;
+    if (pc >= GBASE && (pc - GBASE) < GSIZE)
+        return smc_gen[(pc - GBASE) >> SMC_BAND_SHIFT] == 0u;
+    return 0;   /* ITCM is a live array the guest filled: not a ROM image */
+}
+
+static unsigned long long smc_nlive;   /* map skipped: guest-rewritten band */
+static uint32_t smc_live_pc[16];
+static unsigned smc_nlive_pc;
+
+static int smc_infer_state(uint32_t pc, uint32_t prev_pc, int *form, const char **src)
+{
+    int m = smc_state_from_regs(pc);
+    if (m >= 0) { *form = m; *src = "branch-register"; return m; }
+    m = smc_state_from_stride(pc, prev_pc);
+    if (m >= 0) { *form = m; *src = "predecessor-stride"; return m; }
+    *form = smc_t_sticky;
+    *src = "sticky";
+    return smc_t_sticky;
+}
+
+/* The state of a pc the COMPILED map cannot classify: the ROM map decides
+ * when it covers the pc, otherwise the runtime guess is used and REPORTED. */
+static int smc_pick_state(uint32_t pc, uint32_t prev_pc)
+{
+    int inf, pf;
+    const char *src;
+    smc_infer_state(pc, prev_pc, &inf, &src);
+    pf = smc_map_live_ok(pc) ? nnk_pcform_lookup(pc) : -1;
+    if (pf < 0 && smc_stconf && smc_armed && !smc_map_live_ok(pc)) {
+        unsigned i;
+        smc_nlive++;
+        for (i = 0; i < smc_nlive_pc; i++)
+            if (smc_live_pc[i] == pc) return inf;
+        if (smc_nlive_pc < (unsigned)(sizeof(smc_live_pc) / sizeof(smc_live_pc[0])))
+            smc_live_pc[smc_nlive_pc++] = pc;
+        return inf;
+    }
+    if (pf >= 0) {
+        smc_nmap++;
+        if (smc_stconf) {
+            if (pf != inf) {
+                smc_nconf++;
+                fprintf(stderr, "stateconf MAP pc=0x%08X map=%s runtime=%s(%s) "
+                        "step=%llu\n", pc, pf ? "thumb" : "arm",
+                        inf ? "thumb" : "arm", src,
+                        (unsigned long long)steps);
+            }
+            smc_note_seen(pc, pf);
+        }
+        return pf;
+    }
+    if (smc_stconf) smc_note_hole(pc);
+    return inf;
+}
+
+/* A decode that had to be retried in the other state: the chosen form was
+ * WRONG for that pc.  Always a conflict when the map is authoritative. */
+static void smc_note_fallback(uint32_t pc, int chosen_thumb)
+{
+    if (!smc_stconf) return;
+    smc_nconf++;
+    fprintf(stderr, "stateconf FALLBACK pc=0x%08X chose=%s decoded_as=%s step=%llu\n",
+            pc, chosen_thumb ? "thumb" : "arm", chosen_thumb ? "arm" : "thumb",
+            (unsigned long long)steps);
+}
+
 /* ---- generation-0 image segments ---------------------------------------
  * The COMPILED generation is the image `nnktool recompile-all` decoded, which
  * is NOT the file the runtime loads: the ARM9 binary is stored compressed and
@@ -324,6 +490,7 @@ static void smc_arm(void) {
         if (!smc_seg_n) return;
         smc_build_band_map();
         smc_armed = 1;
+        smc_conflict_init();   /* Phase-5AP: NNK_STATE_CONFLICTS */
         p = getenv("NNK_SMC_TRACE");
         if (p && p[0]) smc_trace_left = atoi(p);
         p = getenv("NNK_SMC_TRACE_FROM");
@@ -364,6 +531,7 @@ static void smc_arm(void) {
     if (!smc_seg_n) return;
     smc_build_band_map();
     smc_armed = 1;
+    smc_conflict_init();   /* Phase-5AP: NNK_STATE_CONFLICTS */
     p = getenv("NNK_SMC_TRACE");
     if (p && p[0]) smc_trace_left = atoi(p);
     p = getenv("NNK_SMC_TRACE_FROM");
@@ -395,6 +563,16 @@ static void smc_stats(void) {
     fprintf(stderr, "smc: probes=%llu stale=%llu redecoded=%llu halts=%llu "
             "state_fallbacks=%llu on_demand=%llu\n",
             smc_ntry, smc_nhit, smc_ninsn, smc_nhalt, smc_nfb, smc_nany);
+    if (smc_stconf) {
+        fprintf(stderr, "stateconf: map_decisions=%llu conflicts=%llu flips=%llu "
+                "hole_executions=%llu hole_pcs=%u live_band_skips=%llu\n",
+                smc_nmap, smc_nconf, smc_nflip, smc_nhole, smc_nhole_pc, smc_nlive);
+        for (i = 0; i < (int)smc_nlive_pc; i++)
+            fprintf(stderr, "stateconf: live-band pc=0x%08X (guest-rewritten, map skipped)\n",
+                    smc_live_pc[i]);
+        for (i = 0; i < (int)smc_nhole_pc; i++)
+            fprintf(stderr, "stateconf: hole pc=0x%08X\n", smc_hole_pc[i]);
+    }
     for (i = 0; i < (int)SMC_BAND_N && shown < 12; i++) {
         if (!smc_gen[i]) continue;
         fprintf(stderr, "smc: band 0x%08X gen=%u redecoded=%u\n",
@@ -812,8 +990,14 @@ static int smc_exec_arm(uint32_t pc, uint32_t w, uint32_t *npc, uint32_t *costp)
                      * (`if (cpu->Num == 1) pc &= ~0x1;`) and otherwise lets
                      * JumpTo take the loaded word's bit0.  The unconditional
                      * smc_branch_mode(lv) fabricated an interworking on the
-                     * one-register form. */
-                    uint32_t raw = (cnt == 1u) ? (lv & ~1u) : lv;
+                     * one-register form.
+                     * Phase-5AP: that mask is WRONG for the SP-based form —
+                     * `ldmfd sp!,{pc}` is A_POP, where the loaded word IS the
+                     * target and a Thumb `blx` leaves LR = (ret | 1).  Masking
+                     * it made the Thumb caller 0x020E3390 `blx 0x02043BD0`
+                     * return to 0x020E3394 in ARM state (halt step 560,192,510),
+                     * exactly like the emitted case fixed in recompile.rs. */
+                    uint32_t raw = (cnt == 1u && rn != 13u) ? (lv & ~1u) : lv;
                     *npc = raw & ~1u; smc_branch_mode(raw);
                 }
                 else if (user_bank && i == 13u) bank13_set_usr(lv);
@@ -1290,30 +1474,21 @@ int nnk_smc_try(uint32_t *pcp) {
     trace_pc(pc);
     thumb = nnk_pc_is_thumb(pc);
     { int st;
-      if (smc_carried_thumb(pc, &st)) thumb = st;             /* Phase-5C */
+      if (smc_carried_thumb(pc, &st)) { thumb = st;              /* Phase-5C */
+          if (smc_stconf) smc_note_seen(pc, thumb); }
       else if (!thumb) {
-        /* Phase-5J: the stale-band hook reused the map + carried state only,
-         * so a PC the map cannot classify (any case whose emitted flow is not
-         * the addr+2 fall-through — every `pop {..,pc}`/branch — and every
-         * unrooted PC) fell straight to the ARM decode, whose
-         * Thumb-bytes-as-ARM decode succeeds silently.  Same resolution as
-         * nnk_smc_exec_any (Phase-4Z): a register still carrying the tagged
-         * target, else the last resolved state.
-         * Measured: 0x020F5CC4 (`adds r0,r4,#0;` + `pop {..,pc}`) executed
-         * here as one ARM `ldrsh` (word 0xBDF81C20) instead of two Thumb ops,
-         * which turned sp into 0x02E7FFF0 at the next ARM `andcs sp,r1,r1`. */
-        int m = smc_state_from_regs(pc);
-        if (m < 0) m = smc_state_from_stride(pc, prev_pc);   /* Phase-5AO */
-        if (m < 0) m = smc_t_sticky;
-        thumb = (m > 0);
+        /* Phase-5AP: the ROM-derived map is the authority here; the runtime
+         * inference (branch register -> predecessor stride -> sticky) is only
+         * the cross-check that smc_pick_state() reports against it. */
+        thumb = smc_pick_state(pc, prev_pc);
       } }
     rc = thumb ? smc_exec_thumb(pc, &npc, &cost) : smc_exec_arm(pc, w, &npc, &cost);
     if (!rc && thumb) {
         rc = smc_exec_arm(pc, w, &npc, &cost);
-        if (rc) { smc_nfb++; thumb = 0; }
+        if (rc) { smc_nfb++; smc_note_fallback(pc, thumb); thumb = 0; }
     } else if (!rc && !thumb && (pc & 1u) == 0u) {
         rc = smc_exec_thumb(pc, &npc, &cost);
-        if (rc) { smc_nfb++; thumb = 1; }
+        if (rc) { smc_nfb++; smc_note_fallback(pc, thumb); thumb = 1; }
     }
     if (!rc) {
         smc_nhalt++;
@@ -1872,21 +2047,17 @@ int nnk_smc_exec_any(uint32_t *pcp) {
     smc_nany++;
     trace_pc(pc);
     thumb = nnk_pc_is_thumb(pc);
-    { int st; if (smc_carried_thumb(pc, &st)) { thumb = st; goto smc_mode_done; } }
-    if (!thumb) {
-        int m = smc_state_from_regs(pc);
-        if (m < 0) m = smc_state_from_stride(pc, prev_pc);   /* Phase-5AO */
-        if (m < 0) m = smc_t_sticky;
-        thumb = (m > 0);
-    }
+    { int st; if (smc_carried_thumb(pc, &st)) { thumb = st;
+        if (smc_stconf) smc_note_seen(pc, thumb); goto smc_mode_done; } }
+    if (!thumb) thumb = smc_pick_state(pc, prev_pc);   /* Phase-5AP: ROM map */
   smc_mode_done:;
     rc = thumb ? smc_exec_thumb(pc, &npc, &cost) : smc_exec_arm(pc, w, &npc, &cost);
     if (!rc && thumb) {
         rc = smc_exec_arm(pc, w, &npc, &cost);
-        if (rc) { smc_nfb++; thumb = 0; }
+        if (rc) { smc_nfb++; smc_note_fallback(pc, thumb); thumb = 0; }
     } else if (!rc && !thumb && (pc & 1u) == 0u) {
         rc = smc_exec_thumb(pc, &npc, &cost);
-        if (rc) { smc_nfb++; thumb = 1; }
+        if (rc) { smc_nfb++; smc_note_fallback(pc, thumb); thumb = 1; }
     }
     if (!rc) {
         /* Phase-5I diagnostic: name the exact word/state a live-decode failure

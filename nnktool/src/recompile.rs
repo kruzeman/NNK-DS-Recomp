@@ -678,13 +678,27 @@ fn emit_insn(
                         // For a SINGLE-register list melonDS instead forces the
                         // tag: `if (Num==1) pc |= 0x1` in T_POP, `pc &= ~0x1`
                         // in A_LDM (Phase-5J).
-                        if regs.len() == 1 {
+                        if regs.len() == 1 && *rn != 13 {
                             body.push(if thumb {
                                 "nnk_smc_note_branch(_t | 1u);".into()
                             } else {
                                 "nnk_smc_note_branch(_t & ~1u);".into()
                             });
+                        } else if regs.len() == 1 && thumb {
+                            // T_POP: melonDS keeps a single-register Thumb pop
+                            // in Thumb state (Phase-5J, measured).
+                            body.push("nnk_smc_note_branch(_t | 1u);".into());
                         } else {
+                            // Phase-5AP: `pop {pc}` / `ldmfd sp!,{pc}` is the
+                            // A_POP form, and there the loaded word IS the
+                            // hardware's interworking target, bit0 included: a
+                            // Thumb `blx` leaves LR = (ret | 1).  Masking it
+                            // made the Thumb caller 0x020E3390 `blx 0x02043BD0`
+                            // return to 0x020E3394 in ARM state, so ov17's
+                            // callback body was re-decoded as ARM garbage that
+                            // stored through `stmiapl sl!`, wrecking sp
+                            // (measured: entry sp=0x027E39D0 -> 0xFFFFFFF0 ->
+                            // `ldmfd sp!,{pc}` popped 0, halt step 560,192,510).
                             body.push("nnk_smc_note_branch(_t);".into());
                         }
                         pc_written = true;

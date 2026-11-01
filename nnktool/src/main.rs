@@ -10,6 +10,7 @@
 //   recompile-entry <image> <out.c> [--base A] [--entry A] [--max-insns N]
 
 mod decode;
+mod pcform;
 mod recover;
 mod recompile;
 
@@ -274,7 +275,8 @@ fn usage() -> ! {
          \n  nnktool disasm <image> [--base 0xADDR] [--start 0xADDR] [--end 0xADDR] [--mode arm|thumb] [--count N]\
          \n  nnktool decompile <image> <out_dir> [--base 0xADDR] [--entry 0xADDR] [--seeds <ghidra.tsv>] [--max-insns N] [--max-funcs N]\
          \n  nnktool recompile-entry <image> <out.c> [--base 0xADDR] [--entry 0xADDR] [--max-insns N]\
-         \n  nnktool recompile-all <image> <out.c> [--base 0xADDR] [--entry 0xADDR] [--seeds <ghidra.tsv>] [--max-insns N] [--max-funcs N]"
+         \n  nnktool recompile-all <image> <out.c> [--base 0xADDR] [--entry 0xADDR] [--seeds <ghidra.tsv>] [--max-insns N] [--max-funcs N]\
+         \n  nnktool pcform <manifest> <out.h>   (Phase-5AP ROM-derived pc->form map)"
     );
     exit(2);
 }
@@ -414,6 +416,43 @@ fn main() {
             let entry = opt(&args, "--entry").map(|s| parse_addr(&s)).unwrap_or(ARM9_ENTRY);
             let max_insns = opt(&args, "--max-insns").map(|s| parse_addr(&s) as usize).unwrap_or(20_000);
             cmd_recompile_entry(&image, base, entry, Path::new(pos[2]), max_insns);
+        }
+        "pcform" => {
+            // Phase-5AP: ROM-derived pc -> form map.
+            //   nnktool pcform <manifest> <out.h>
+            if pos.len() != 3 {
+                usage();
+            }
+            let (imgs, seeds) = pcform::load_manifest(Path::new(pos[1]));
+            let verbose = std::env::var("NNK_PCFORM_VERBOSE").map(|v| v != "0").unwrap_or(false);
+            let (runs, stats) = pcform::build(&imgs, &seeds, verbose);
+            if let Err(e) = pcform::write_header(Path::new(pos[2]), &runs, &stats, pos[1]) {
+                die(&format!("cannot write {}: {}", pos[2], e));
+            }
+            let nt = runs.iter().filter(|r| r.thumb).count();
+            eprintln!(
+                "pcform: {} images, {} seeds, {} rounds -> {} runs ({} thumb / {} arm), \
+                 {} Thumb bytes, {} ARM bytes, {} ambiguous, {} clipped bytes -> {}",
+                imgs.len(),
+                stats.seeds,
+                stats.rounds,
+                runs.len(),
+                nt,
+                runs.len() - nt,
+                stats.thumb_bytes,
+                stats.arm_bytes,
+                stats.overlaps.len(),
+                stats.clipped_bytes,
+                pos[2]
+            );
+            for (lo, hi, thumb) in stats.overlaps.iter().take(20) {
+                eprintln!(
+                    "pcform: OVERLAP 0x{:08X}..0x{:08X} also {} (conflicting form)",
+                    lo,
+                    hi,
+                    if *thumb { "thumb" } else { "arm" }
+                );
+            }
         }
         "recompile-all" => {
             if pos.len() != 3 {

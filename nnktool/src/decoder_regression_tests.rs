@@ -510,7 +510,7 @@ fn runtime_smc_redecoder_interworks_on_ldm_pc_and_links_arm_blx_even() {
     //     except for the one-register list where melonDS masks bit0
     //     (A_LDM: `if (cpu->Num == 1) pc &= ~0x1;`) — Phase-5J.
     assert!(
-        src.contains("uint32_t raw = (cnt == 1u) ? (lv & ~1u) : lv;")
+        src.contains("uint32_t raw = (cnt == 1u && rn != 13u) ? (lv & ~1u) : lv;")
             && src.contains("*npc = raw & ~1u; smc_branch_mode(raw);"),
         "regression: an ARM `pop/LDM {{..,pc}}` no longer interworks on the loaded word"
     );
@@ -745,8 +745,14 @@ fn interworking_targets_carry_their_state_across_the_dispatch() {
         "regression: nnk_rt.h no longer declares the state hook for the band TUs"
     );
     assert!(
-        src.matches("smc_state_from_regs(pc)").count() >= 2,
-        "regression: only one of the two live dispatch hooks resolves the target state"
+        src.matches("smc_state_from_regs(pc)").count() >= 1,
+        "regression: the dispatch hooks no longer resolve the target state"
+    );
+    assert_eq!(
+        src.matches("thumb = smc_pick_state(pc, prev_pc);").count(),
+        2,
+        "regression: both live dispatch hooks must resolve the state through \
+         smc_pick_state() (Phase-5AP), not each with its own ladder"
     );
     // (c) a multi-register Thumb pop{..,pc} must NOT force Thumb: returning to
     //     an ARM caller (0x0207CAC4, the ARM BLX caller of 0x020F5C98) has to
@@ -756,7 +762,7 @@ fn interworking_targets_carry_their_state_across_the_dispatch() {
         "regression: the Thumb POP arm forces bit0 for every register list again"
     );
     assert!(
-        src.contains("uint32_t raw = (cnt == 1u) ? (lv & ~1u) : lv;"),
+        src.contains("uint32_t raw = (cnt == 1u && rn != 13u) ? (lv & ~1u) : lv;"),
         "regression: the ARM LDM arm no longer masks bit0 for a one-register list"
     );
 }
@@ -3071,23 +3077,152 @@ fn phase_5ao_unrooted_fallthrough_state_comes_from_the_stride_not_stale_sticky()
         2,
         "both dispatch hooks must snapshot the predecessor BEFORE trace_pc(pc)"
     );
+    // Phase-5AP: both ladders now delegate to smc_pick_state(), where the ROM
+    // map is the authority and the inference order (branch register ->
+    // predecessor stride -> sticky) is the cross-check.  The order rule is
+    // pinned in that single place.
     assert_eq!(
-        src.matches("m = smc_state_from_stride(pc, prev_pc);").count(),
+        src.matches("thumb = smc_pick_state(pc, prev_pc);").count(),
         2,
-        "both ladders must try the stride rule"
+        "both ladders must resolve through smc_pick_state()"
     );
-    // NEGATIVE guard: in every ladder the stride rule has to come first.
-    for (i, _) in src.match_indices("int m = smc_state_from_regs(pc);") {
+    assert!(
+        src.contains("static int smc_infer_state(uint32_t pc, uint32_t prev_pc, int *form, const char **src)"),
+        "smc_infer_state() is gone"
+    );
+    {
+        let i = src.find("int m = smc_state_from_regs(pc);").expect("regs rule");
         let tail = &src[i..(i + 400).min(src.len())];
-        let stride = tail
-            .find("m = smc_state_from_stride(pc, prev_pc);")
-            .unwrap_or_else(|| panic!("ladder at byte {i} lost the stride rule"));
-        let sticky = tail
-            .find("m = smc_t_sticky;")
-            .unwrap_or_else(|| panic!("ladder at byte {i} lost the sticky fallback"));
+        let stride = tail.find("m = smc_state_from_stride(pc, prev_pc);").expect("stride rule");
+        let sticky = tail.find("*form = smc_t_sticky;").expect("sticky fallback");
         assert!(
             stride < sticky,
-            "ladder at byte {i} consults the STALE sticky state before the stride rule"
+            "smc_infer_state() consults the STALE sticky state before the stride rule"
         );
     }
+}
+
+// Phase-5AP, class 51: the ARM `pop {pc}` interworking note must keep bit0.
+//
+// Measured chain (operator session, step 560,192,510): ov17's Thumb function
+// 0x020E3328 does `blx 0x02043BD0`; the ARM stub saves LR (= 0x020E3395,
+// bit0 SET, the hardware's Thumb return tag), calls a vtable method and
+// `ldmfd sp!,{pc}`s back.  The emitted case handed the runtime `_t & ~1u`, so
+// the state note said ARM and 0x020E3394 (Thumb code: `adds r1,r4,#0`) was
+// re-decoded as the ARM word 0x1C221C21 — `stmiapl sl!,{...}` — which stored
+// over the frame: sp went 0x027E39D0 -> 0xFFFFFFF0, the next `ldmfd sp!,{pc}`
+// popped 0 and the run halted with "dispatch to untranslated pc 0x00000000".
+#[test]
+fn phase_5ap_thumb_blx_return_keeps_its_state_in_the_arm_pop_note() {
+    // 1. The call site: Thumb `blx <imm>` = 0xF760 0xEC1E at 0x020E3390.
+    let call = decode_thumb(0xF760, 0xEC1E, 0x020E_3390, 4);
+    assert!(
+        call.text.contains("blx"),
+        "0xF760 0xEC1E at 0x020E3390 must decode as a blx, got {}",
+        call.text
+    );
+    match thumb_flow(0x020E_3390, &call) {
+        Flow::Call(t, callee_thumb) => {
+            assert_eq!(t, 0x0204_3BD0, "blx target");
+            assert!(!callee_thumb, "`blx <imm>` enters ARM state (the stub is ARM)");
+        }
+        other => panic!("blx must be Flow::Call, got {:?}", other),
+    }
+    // 2. The hardware's return tag: Thumb BL/BLX writes LR = (pc+4) | 1.
+    assert_eq!(0x020E_3390u32 + 4, 0x020E_3394, "the return address the trace shows");
+    assert_eq!((0x020E_3390u32 + 4) | 1, 0x020E_3395, "LR carries bit0 = Thumb");
+    // 3. What actually sits there is Thumb, and the ARM reading is garbage.
+    let adds = decode_thumb(0x1C21, 0x1C22, 0x020E_3394, 2);
+    assert!(
+        adds.text.contains("adds") && adds.text.contains("r1"),
+        "0x1C21 at 0x020E3394 is `adds r1,r4,#0`, got {}",
+        adds.text
+    );
+    let garbage = decode_arm(0x1C22_1C21, 0x020E_3394);
+    assert!(
+        garbage.text.contains("cdp") || garbage.text.contains("stc") || garbage.text.contains("<UNDEFINED>"),
+        "the ARM reading of the Thumb bytes must be the coprocessor garbage we \
+         executed, got {}",
+        garbage.text
+    );
+    // 4. The ARM pop that returns there is a SINGLE-register list on SP.
+    let pop = decode_arm(0xE8BD_8000, 0x0204_3C04);
+    assert!(
+        pop.text.contains("pop") || pop.text.contains("ldm"),
+        "0xE8BD8000 at 0x02043C04 is `ldmfd sp!,{{pc}}`, got {}",
+        pop.text
+    );
+    assert!(pop.text.contains("pc"), "the list must name pc");
+
+    // 5. Emitter invariant: the SP-base single-register pop hands the RAW word
+    //    to the runtime; the forced tag stays only for the non-SP form.
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let rc = std::fs::read_to_string(root.join("src/recompile.rs")).expect("recompile.rs");
+    assert!(
+        rc.contains("if regs.len() == 1 && *rn != 13 {"),
+        "the single-register test must EXCLUDE the SP base (A_POP keeps bit0)"
+    );
+    assert_eq!(
+        rc.matches("nnk_smc_note_branch(_t & ~1u);").count(),
+        1,
+        "only the non-SP single-register LDM may force the ARM tag"
+    );
+    assert_eq!(
+        rc.matches("body.push(\"nnk_smc_note_branch(_t);\".into());").count(),
+        1,
+        "the pop/ldm-into-pc path must hand the raw loaded word"
+    );
+
+    // 6. The frozen image gets the same transform from the splice, and only
+    //    for SP-based pops.  Run it for real on a synthetic case pair.
+    let py = root.join("../tools/p5ap_pop_note_splice.py");
+    assert!(py.exists(), "missing {}", py.display());
+    let dir = std::env::temp_dir().join("nnk_p5ap_splice_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let inp = dir.join("in.c");
+    let outp = dir.join("out.c");
+    std::fs::write(
+        &inp,
+        "case 0x1u:\n            { uint32_t _base = r[13];\n            uint32_t _t = ld32(_a + 0u);\n            pc = _t & ~1u;\n            nnk_smc_note_branch(_t & ~1u);\n        case 0x2u:\n            { uint32_t _base = r[0];\n            uint32_t _t = ld32(_a + 0u);\n            pc = _t & ~1u;\n            nnk_smc_note_branch(_t & ~1u);\n",
+    )
+    .unwrap();
+    let st = std::process::Command::new("python3")
+        .arg(&py)
+        .arg(&inp)
+        .arg(&outp)
+        .status()
+        .expect("python3");
+    assert!(st.success(), "splice failed");
+    let out = std::fs::read_to_string(&outp).unwrap();
+    assert!(
+        out.contains("Phase-5AP pop-note splice applied"),
+        "the spliced image must carry the marker the build looks for"
+    );
+    let notes: Vec<&str> = out
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| l.starts_with("nnk_smc_note_branch"))
+        .collect();
+    assert_eq!(notes, vec!["nnk_smc_note_branch(_t);", "nnk_smc_note_branch(_t & ~1u);"]);
+
+    // 7. Runtime wiring: the ROM map is consulted, and only for bands the guest
+    //    has not rewritten (generation-0 bytes are the ones we analysed).
+    let smc = std::fs::read_to_string(root.join("../tools/nnk_smc.inc")).expect("nnk_smc.inc");
+    assert!(
+        smc.contains("#include \"nnk_pcform_map.h\""),
+        "the runtime must include the generated ROM map"
+    );
+    assert!(
+        smc.contains("pf = smc_map_live_ok(pc) ? nnk_pcform_lookup(pc) : -1;"),
+        "the map must be authoritative only while the band is generation-0"
+    );
+    assert!(
+        smc.contains("NNK_STATE_CONFLICTS"),
+        "the conflict diagnostic switch is gone"
+    );
+    assert_eq!(
+        smc.matches("thumb = smc_pick_state(pc, prev_pc);").count(),
+        2,
+        "both ladders must resolve through smc_pick_state()"
+    );
 }
