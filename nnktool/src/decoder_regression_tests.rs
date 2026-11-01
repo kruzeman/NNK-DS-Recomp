@@ -1248,3 +1248,90 @@ fn cpsr_i_transitions_are_observable_through_the_single_ctl_funnel() {
     assert_eq!(0x02008D28u32 & 3, 0, "fixture: OS_DisableInterrupts' msr is ARM-aligned");
     assert_eq!(0x02008D40u32 & 3, 0, "fixture: OS_RestoreInterrupts' msr is ARM-aligned");
 }
+
+/// Class 21 (Phase-5W): the HLE movie plane may only land inside the guest's
+/// movie arena.  The measured failure: at the movie start the codec/player
+/// structs hand the HLE plane copy destinations that are not the ring slots
+/// yet ([player+0x3C] read 0x20, and a stale source-plane field dropped a full
+/// 256x192 plane on the SDK's OSi_ThreadInfo block 0x0206C684).  The block's
+/// only write between 2.25e9 and 2.257e9 steps that did not come through
+/// st8/st16/st32 is that memcpy, and the block went zero on the instruction
+/// right after it ran (step 2,256,256,945, pc 0x0207B21C, prev 0x01FF9E00).
+/// So `p5t_plane` must refuse anything outside 0x02100000..0x02400000 (the
+/// range every measured movie buffer lives in: melonDS ring slot 0x022C0880,
+/// native cursors 0x022E48E8 / 0x02355110, codecs 0x0227834C / 0x022E8B74,
+/// player 0x02278264) and it must say so instead of silently swallowing it.
+#[test]
+fn movie_plane_writes_stay_inside_the_movie_arena() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let inc = std::fs::read_to_string(root.join("tools/nnk_smc.inc"))
+        .expect("cannot read tools/nnk_smc.inc");
+
+    assert!(
+        inc.contains("#define P5T_ARENA_LO 0x02100000u")
+            && inc.contains("#define P5T_ARENA_HI 0x02400000u"),
+        "regression: the movie arena bounds changed — the plane guard is what \
+         keeps the SDK thread block intact"
+    );
+
+    // The guard must be the LAST check before the copy, and the copy must be
+    // the only write path (one memcpy in the function).
+    let body_start = inc
+        .find("static int p5t_plane(uint32_t dst, const uint8_t *src, uint32_t n) {")
+        .expect("p5t_plane signature missing");
+    let body = &inc[body_start..];
+    let end = body.find("\n}\n").expect("p5t_plane body end missing");
+    let body = &body[..end];
+    let guard = body
+        .find("if (dst < P5T_ARENA_LO || dst + n > P5T_ARENA_HI) {")
+        .expect("regression: p5t_plane lost its arena guard");
+    let copy = body
+        .find("memcpy(gmem + o, src, n);")
+        .expect("regression: p5t_plane lost its copy");
+    assert!(guard < copy, "regression: the copy runs before the arena guard");
+    assert_eq!(
+        body.matches("memcpy(gmem + o, src, n);").count(),
+        1,
+        "regression: p5t_plane grew a second, unguarded copy path"
+    );
+    assert_eq!(
+        body.matches("return 0;").count(),
+        3,
+        "regression: p5t_plane's refusals (not RAM / past RAM / outside arena) changed"
+    );
+    assert!(
+        inc.contains("movie: plane REFUSED dst=0x%08X"),
+        "regression: a refused plane destination must be logged, not swallowed"
+    );
+
+    // The probe that measured it: a per-instruction state diff (cannot be
+    // bypassed by any store path) plus the region store watch, on the two
+    // addresses the measurement names.
+    let splice = std::fs::read_to_string(root.join("tools/p5w_store_probe_splice.py"))
+        .expect("cannot read tools/p5w_store_probe_splice.py");
+    for needle in [
+        "static void p5w_diff(uint32_t pc)",
+        "static void p5w_store(uint32_t a, uint32_t v, unsigned n)",
+        "static void p5w_snap(uint32_t *h)",
+        "#define P5W_LO 0x0206C680u",
+        "#define P5W_HI 0x0206C6B0u",
+        "0x0206C684u",
+        "2250000000ull",
+        "NNK_P5W_FROM",
+    ] {
+        assert!(splice.contains(needle), "regression: Phase-5W probe lost: {needle}");
+    }
+    // trace_pc is the shared dispatch point the diff hooks (one call per
+    // instruction: the diff attributes a change to the previous instruction).
+    assert!(
+        splice.contains("p5u_hook(pc);\\n    p5w_diff(pc);")
+            && splice.contains("p5w_park(pc);"),
+        "regression: the Phase-5W diff no longer hooks trace_pc"
+    );
+
+    // Fixture sanity: the payload the guard must exclude is the SDK block.
+    assert_eq!(0x0206C684u32 >= 0x02000000 && 0x0206C684u32 < 0x02100000, true,
+               "fixture: OSi_ThreadInfo sits below the movie arena");
+    assert_eq!(0x022C0880u32 >= 0x02100000 && 0x022C0880u32 < 0x02400000, true,
+               "fixture: the measured melonDS ring slot sits inside the arena");
+}
