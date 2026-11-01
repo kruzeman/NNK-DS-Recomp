@@ -1244,8 +1244,27 @@ static uint8_t p5t_buf[P5T_FRAME];
 
 static void p5t_init(void) {
     const char *p = getenv("NNK_MOVIE_YUV");
+    FILE *probe;
     p5t_state = 1;
     if (!p || !p[0]) return;
+    /* Phase-5AC: NNK_MOVIE_YUV must NAME a readable raw yuv420p file (73728 B
+     * per 256x192 frame); it is not a boolean.  A bare truthy value ("1",
+     * "on") used to switch the HLE ON with no source at all: p5t_stream()
+     * then failed to fopen("1") for the FIRST codec, p5t_nstr stayed 0, and
+     * the hook wrote nothing for the whole run — measured in Phase-5AC as
+     * cfg1 (NNK_MOVIE_YUV=1) vs cfg0 (unset) producing 14/14 BYTE-IDENTICAL
+     * display frames, i.e. exactly the HLE-off picture, while the startup
+     * banner still claimed "hle src1=1".  Only a source that actually opens
+     * enables the present path, and the fallback is announced. */
+    probe = fopen(p, "rb");
+    if (!probe) {
+        fprintf(stderr, "movie: NNK_MOVIE_YUV=%s is not a readable yuv420p file"
+                        " -> HLE OFF (the guest's own decoder runs).  Canonical"
+                        " configuration: NNK_MOVIE_YUV=<op_u.yuv>"
+                        " NNK_MOVIE_YUV2=<op_d.yuv>\n", p);
+        return;
+    }
+    fclose(probe);
     p5t_state = 2;
     fprintf(stderr, "movie: hle src1=%s src2=%s plane=%dx%d\n",
             p, (getenv("NNK_MOVIE_YUV2") && getenv("NNK_MOVIE_YUV2")[0])
