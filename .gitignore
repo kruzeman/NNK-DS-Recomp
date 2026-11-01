@@ -43,3 +43,6 @@ worktrees/
 # Phase-4G: build-state symlinks into the main checkout are not tracked
 /work
 /nnktool/target
+
+# Screenshots of guest content (operator review only — never committed)
+shots/
