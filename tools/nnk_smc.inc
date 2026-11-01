@@ -41,6 +41,11 @@
 #ifndef NNK_SMC_INC
 #define NNK_SMC_INC
 
+/* Phase-5AJ: the card image accessor + DS code-compression decompressor.
+ * nnk_smc.inc owns the generation-0 snapshot, so it owns the derivation of
+ * that snapshot from the ROM (nnk_rom_arm9_dec / nnk_rom_arena_window). */
+#include "nnk_rom.inc"
+
 #define SMC_BAND_SHIFT 15
 #define SMC_BAND_N (GSIZE >> SMC_BAND_SHIFT)
 
@@ -229,8 +234,56 @@ static void smc_arm(void) {
     }
     img = getenv("NNK_SMC_IMAGE");
     if (!img || !img[0]) {
-        fprintf(stderr, "smc: NNK_SMC_IMAGE unset; tracking off "
-                "(want \"addr:path[,addr:path]\" of the recompiler inputs)\n");
+        /* Phase-5AJ: the generation-0 snapshot is DERIVED from the card image.
+         * No file, no NNK_SMC_IMAGE: the decompressed ARM9 is the recompiler's
+         * arm9 input (SMC segment at 0x02000000) and the arena window is the
+         * recompiler's overlay input (segment at 0x020C0000).  NNK_SMC_IMAGE
+         * stays as a reviewer override for A/B runs. */
+        uint8_t *a9 = NULL, *win = NULL;
+        size_t a9len = 0, winlen = 0;
+        int oid = NNK_SMC_GEN0_OVL;
+        const char *os = getenv("NNK_SMC_GEN0_OVL");
+        if (os && os[0]) oid = atoi(os);
+        if (!nnk_rom_ready()) {
+            fprintf(stderr, "smc: no card image and NNK_SMC_IMAGE unset; tracking off "
+                    "(pass the .nds as argv[1], or \"addr:path[,addr:path]\" to override)\n");
+            return;
+        }
+        if (nnk_rom_arm9_dec(&a9, &a9len) == 0) {
+            smc_seg[smc_seg_n].addr = 0x02000000u;
+            smc_seg[smc_seg_n].len  = (uint32_t)a9len;
+            smc_seg[smc_seg_n].data = a9;
+            fprintf(stderr, "smc: generation-0 arm9 0x%08X..0x%08X (%zu bytes) "
+                    "derived from the ROM (fnv=%016llx)\n", 0x02000000u,
+                    (unsigned)(0x02000000u + a9len), a9len,
+                    (unsigned long long)nnk_rom_fnv64(a9, a9len));
+            smc_seg_n++;
+        } else {
+            fprintf(stderr, "smc: cannot decompress the ARM9 out of the card image\n");
+        }
+        if (nnk_rom_arena_window(oid, NNK_SMC_GEN0_BASE, NNK_SMC_GEN0_LEN,
+                                 &win, &winlen) == 0) {
+            smc_seg[smc_seg_n].addr = NNK_SMC_GEN0_BASE;
+            smc_seg[smc_seg_n].len  = (uint32_t)winlen;
+            smc_seg[smc_seg_n].data = win;
+            fprintf(stderr, "smc: generation-0 arena window 0x%08X..0x%08X "
+                    "(%zu bytes, overlay %d at its OVT base) derived from the ROM\n",
+                    NNK_SMC_GEN0_BASE, (unsigned)(NNK_SMC_GEN0_BASE + winlen),
+                    winlen, oid);
+            smc_seg_n++;
+        } else {
+            fprintf(stderr, "smc: no overlay %d for the arena window; "
+                    "overlay code will be re-decoded on demand\n", oid);
+        }
+        if (!smc_seg_n) return;
+        smc_build_band_map();
+        smc_armed = 1;
+        p = getenv("NNK_SMC_TRACE");
+        if (p && p[0]) smc_trace_left = atoi(p);
+        p = getenv("NNK_SMC_TRACE_FROM");
+        if (p && p[0]) smc_trace_from = strtoull(p, NULL, 0);
+        fprintf(stderr, "smc: armed, %d generation-0 segments (ROM-derived), %d bands%s\n",
+                smc_seg_n, (int)SMC_BAND_N, smc_trace_left ? ", tracing" : "");
         return;
     }
     while (*img && smc_seg_n < SMC_SEG_N) {

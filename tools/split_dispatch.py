@@ -452,6 +452,11 @@ def main():
                     os.path.join(outdir, "nnk_mobiclip.inc"))
     shutil.copyfile(os.path.join(here, "nnk_mobiclip_dec.inc"),
                     os.path.join(outdir, "nnk_mobiclip_dec.inc"))
+    # Phase-5AJ: the card-image accessor + DS code-compression decompressor.
+    # nnk_smc.inc #includes it (the generation-0 snapshot is derived from the
+    # ROM), so it must sit next to nnk_main.c like the fragments above.
+    shutil.copyfile(os.path.join(here, "nnk_rom.inc"),
+                    os.path.join(outdir, "nnk_rom.inc"))
 
     # ---- Phase-4M: VRAMCNT_A..I model hooks -----------------------------
     # The generated image's IO model is store-only AND 8-bit-only for

@@ -2378,3 +2378,167 @@ fn phase_5ag_prelude_manifest_is_complete_and_current() {
     );
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+// ---------------------------------------------------------------- class 46 ---
+// Phase-5AJ: the card image is the ONLY input.  Before this class the shipped
+// binary took `arm9_stored_padded.bin` as argv[1] and needed
+// `NNK_SMC_IMAGE="0x02000000:<arm9.bin>,0x020C0000:<ovl_p4f4.bin>"`, i.e. three
+// files derived off-line from the ROM.  Measured in a directory holding only
+// the runner and the ROM:
+//
+//     $ ./nnk_runner arm9_stored_padded.bin
+//     cannot open guest image arm9_stored_padded.bin
+//
+// The fix derives all three at start-up from argv[1] with the runtime fragment
+// tools/nnk_rom.inc (never a copy of it), so this class exercises the C that
+// actually ships.
+
+/// Build the host harness for tools/nnk_rom.inc with the host cc.  Returns the
+/// path on success; the harness #includes the runtime fragment itself.
+fn p5aj_build_harness(root: &std::path::Path, out: &std::path::Path) -> Result<(), String> {
+    let src = root.join("tools/rom_derive_selftest.c");
+    assert!(src.is_file(), "missing {}", src.display());
+    let out_c = std::process::Command::new("cc")
+        .arg("-O2")
+        .arg("-std=c11")
+        .arg(format!("-I{}", root.join("tools").display()))
+        .arg(&src)
+        .arg("-o")
+        .arg(out)
+        .output()
+        .map_err(|e| format!("cannot run cc: {e}"))?;
+    if out_c.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&out_c.stderr).into_owned())
+    }
+}
+
+fn p5aj_run(exe: &std::path::Path, args: &[&std::ffi::OsStr]) -> std::process::Output {
+    let mut c = std::process::Command::new(exe);
+    for a in args {
+        c.arg(a);
+    }
+    c.output().expect("cannot run the rom_derive harness")
+}
+
+/// Phase-5AJ, class 46 (a)+(b): the DERIVATION itself, from the shipped
+/// fragment.  A non-card file is rejected (it must not be silently treated as
+/// a card image), and — when the ROM and the off-line references are present —
+/// the three derived images reproduce the references byte for byte.
+#[test]
+fn phase_5aj_rom_derivation_matches_the_references() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let tmp = std::env::temp_dir().join(format!("nnk_p5aj_derive_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).expect("cannot create p5aj temp dir");
+    let exe = tmp.join("rom_derive");
+    if let Err(e) = p5aj_build_harness(&root, &exe) {
+        panic!("cc cannot build tools/rom_derive_selftest.c (the runtime fragment): {e}");
+    }
+
+    // (a) NEGATIVE guard: a 8 KiB blob of 0xAB is not a NITRO card image.  The
+    // old contract's failure mode was "cannot open guest image"; the new one
+    // must still REFUSE to guess.
+    let fake = tmp.join("not_a_card.bin");
+    std::fs::write(&fake, vec![0xABu8; 0x2000]).unwrap();
+    let bad = p5aj_run(&exe, &[fake.as_os_str()]);
+    assert!(!bad.status.success(), "the harness accepted 8 KiB of 0xAB as a card image");
+    assert!(
+        String::from_utf8_lossy(&bad.stderr).contains("not a NITRO card image"),
+        "the rejection must name the reason, got: {}",
+        String::from_utf8_lossy(&bad.stderr)
+    );
+
+    // (b) the real thing, if this tree has it.  Both the ROM and the off-line
+    // references are build-host state (never committed), so their absence is a
+    // skip, not a failure — the constants below are the pinned derivation.
+    let rom = std::env::var_os("NNK_TEST_ROM")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("/home/hermes/NiNoKuni/Ni No Kuni.nds"));
+    if !rom.is_file() {
+        eprintln!("skip: no card image at {} (set NNK_TEST_ROM)", rom.display());
+        let _ = std::fs::remove_dir_all(&tmp);
+        return;
+    }
+    let out = p5aj_run(&exe, &[rom.as_os_str(), tmp.as_os_str()]);
+    assert!(
+        out.status.success(),
+        "the derivation failed on {}:\n{}",
+        rom.display(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    // The pinned derivation: boot image = ROM arm9 slice zero-padded, arm9 =
+    // the recompiler input, arena = the zero window with ov17 placed.
+    for (line, len, fnv) in [
+        ("guest", 445_304usize, "75cf0984527e4c41"),
+        ("arm9dec", 445_304, "6087d11200ee29b2"),
+        ("arena", 786_432, "6d1bfd9443da9efd"),
+    ] {
+        assert!(
+            text.contains(&format!("{line:<10}len={len} fnv={fnv}")),
+            "the {line} derivation changed (len={len} fnv={fnv}); measured:\n{text}"
+        );
+    }
+    // Byte-for-byte against the files the old pipeline required.
+    for (derived, reference, why) in [
+        ("guest.bin", "work/phase3a/arm9_stored_padded.bin", "the guest image the dispatch loop boots"),
+        ("arm9dec.bin", "work/ghidra_src/arm9.bin", "the recompiler input (= SMC generation 0)"),
+    ] {
+        let a = std::fs::read(tmp.join(derived)).expect("derived image missing");
+        let rp = std::path::Path::new("/home/hermes/NiNoKuni").join(reference);
+        if rp.is_file() {
+            let b = std::fs::read(&rp).expect("cannot read the reference");
+            assert_eq!(a, b, "{derived} must be byte-identical to {reference} ({why})");
+        } else {
+            eprintln!("skip byte compare: no reference at {}", rp.display());
+        }
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// Phase-5AJ, class 46 (c): the shipped build carries the splice and the
+/// canonical prelude carries the derivation — the "frozen image predates the
+/// fix" class that 5AB/5AF/5AG were about.
+#[test]
+fn phase_5aj_build_and_prelude_take_the_card_image() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let build = std::fs::read_to_string(root.join("tools/build_split.sh"))
+        .expect("cannot read tools/build_split.sh");
+    assert!(
+        build.contains("tools/p5aj_rom_splice.py") && build.contains("5aj_rom_only_input"),
+        "build_split.sh no longer splices the Phase-5AJ ROM-only-input transform"
+    );
+    let prelude = std::fs::read_to_string(root.join("nnktool/src/recompile.rs"))
+        .expect("cannot read nnktool/src/recompile.rs");
+    assert!(
+        prelude.contains("nnk_rom_image_load(path, gmem, IMAGE_LEN)"),
+        "the canonical main() stopped deriving the guest image from argv[1]"
+    );
+    // NEGATIVE guard: the old contract opened argv[1] as a raw guest image.
+    assert!(
+        !prelude.contains("if (!fp) { fprintf(stderr, \"cannot open guest image %s"),
+        "the canonical main() went back to fopen(argv[1]) as the guest-image contract"
+    );
+    let frag = std::fs::read_to_string(root.join("tools/nnk_rom.inc"))
+        .expect("cannot read tools/nnk_rom.inc");
+    for marker in [
+        "nnk_code_decompress",     // DS code compression (reversed LZ77)
+        "nnk_rom_guest_image",     // the boot image, zero-padded
+        "nnk_rom_arm9_dec",        // the recompiler input
+        "nnk_rom_arena_window",    // the SMC overlay window
+        "NNK_SMC_IMAGE",           // ... which stays a debug override only
+        "mmap",                    // 512 MiB card image costs no RSS
+    ] {
+        assert!(frag.contains(marker), "tools/nnk_rom.inc lost {marker:?}");
+    }
+    let smc = std::fs::read_to_string(root.join("tools/nnk_smc.inc"))
+        .expect("cannot read tools/nnk_smc.inc");
+    assert!(
+        smc.contains("#include \"nnk_rom.inc\"")
+            && smc.contains("(ROM-derived)")
+            && !smc.contains("smc: NNK_SMC_IMAGE unset; tracking off"),
+        "smc_arm() no longer derives its generation-0 snapshot from the ROM"
+    );
+}

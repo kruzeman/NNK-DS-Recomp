@@ -68,6 +68,10 @@ $NNK recompile-all $IMG $W/arm9_all.c --base 0x02000000 --entry 0x02000800 --see
 # they must sit next to the generated TU (the split build copies them itself).
 cp tools/nnk_smc.inc $W/ 2>/dev/null || true
 cp tools/nnk_boot.inc $W/ 2>/dev/null || true
+# Phase-5AJ: nnk_smc.inc derives its generation-0 snapshot from the card image
+# through tools/nnk_rom.inc (which it #includes), so that fragment must be next
+# to the generated TU as well.
+cp tools/nnk_rom.inc $W/ 2>/dev/null || true
 [ -f $W/nnk_smc_map.h ] || cp out/split/c/nnk_smc_map.h $W/ 2>/dev/null || true
 # -O0 keeps this acceptance run fast (cc is the bottleneck on a 17 MB file:
 # -O0 ~2 min, -O1 minutes, -O2 ~15 min).  Optimization level does not change
