@@ -2789,3 +2789,46 @@ fn phase_5ak_audio_silence_fill_reaches_the_stream_object() {
     assert!(SIBLING_OBJ < last);
     assert!(SIBLING_OBJ + 0x1B8 == ABORTING_OBJ, "the measured 0x1B8 stride");
 }
+
+// ---------------------------------------------------------------- class 47 ---
+// Phase-5AL: the melonDS A/B of the same scripted session.  melonDS DOES reach
+// 0x02044868 (85 hits in 2600 frames, all through the vtable slot +0x50 from
+// ov17 0x020D9CB8, lr=0x020D9CEC) and it takes the NORMAL path, because the
+// stream object it arrives with has [obj+0x124] == 0:
+//
+//   melonDS  ts=343350336  obj=0x022D26B8  vptr=0x0213B70C  [+0x9C]=0x0505
+//                          [+0x124]=0x00000000  -> beq 0x020448A4 (normal)
+//   native   step=334058027  obj=0x022CC8CC  [+0x124]=0x80808080
+//                          -> ld16(0x80808080)=0 <= 0x80 -> bl 0x020090D8
+//
+// So branch (c) of the card is refuted: the shutdown is not game behaviour.
+// What the two runs agree on, and what this class locks:
+//  * the guard's NULL test is the whole difference (identical instruction
+//    stream, identical caller, identical vptr, identical object class), and
+//  * the object's payload size, measured from the ROM's own arithmetic in the
+//    allocation loop at 0x020E1B54 (`movs r0,#0x25; lsls r0,#4; subs r0,#0xA8`).
+#[test]
+fn phase_5al_the_guard_is_benign_on_the_melonds_object_and_the_payload_is_0x1a8() {
+    // (0x25 << 4) - 0xA8 = the block the post-movie object loop asks the guest
+    // heap for; + 0x10 of allocator header = the measured 0x1B8 sibling stride.
+    let payload = (0x25u32 << 4) - 0xA8;
+    assert_eq!(payload, 0x1A8, "the measured allocation size at 0x020E1B6B");
+    assert_eq!(payload + 0x10, 0x1B8, "the measured object stride");
+
+    // The vendored window decoder: 0x80808080 is outside every mapped window,
+    // so the guard's `ldrh r0,[r0]` reads 0 (melonDS: NDS::ARM9Read16 has no
+    // case for 0x80xxxxxx and returns 0).
+    let ld16 = |_a: u32| 0u16;
+    // melonDS's object: 0x0505 latched, new state 0, NULL data pointer.
+    assert_eq!(
+        nns_stream_state_guard(0x0505, 0, 0, &ld16),
+        StreamGuard::Normal,
+        "melonDS reaches the guard with [obj+0x124] == 0 and returns normally"
+    );
+    // Our object: same call, but the field holds the 0x80 silence fill's words.
+    assert_eq!(
+        nns_stream_state_guard(0x0505, 0, 0x8080_8080, &ld16),
+        StreamGuard::Terminate,
+        "our object's uninitialised +0x124 is what parks the guest"
+    );
+}
