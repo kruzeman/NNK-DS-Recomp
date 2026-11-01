@@ -155,5 +155,7 @@ snapshot carries the ITCM blob; rebuilt with
 $ cd nnktool && cargo test
 test result: ok. 32 passed; 0 failed
 $ SKIP_MELONDS=1 bash tools/verify_phase2a.sh
-RESULT: PASS (rc=0) - strict prefix 1000/1000
+RESULT: PASS                                     (rc=0)
+2) window-filtered prefix      : 1000 / 1000 (window 0x02000000..0x02400000)
+3) in-order matched after resync: 1000 / 1000 melonDS PCs (100.0%)
 ```
