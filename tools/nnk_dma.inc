@@ -528,19 +528,88 @@ void nnk_ipc_send(uint32_t v) {
     }
 }
 
-/* Phase-4R state + forward decls (defined below, used by nnk_ipc_tick) */
-#define NNK_P4R_QMAX 32
+/* ---- Phase-4R state + forward decls (defined below, used by nnk_ipc_tick) */
+/* Phase-5AI: the host queue is no longer a bounded drop buffer.  It models the
+ * ARM7's send side: a word that is produced STAYS here until the ARM9 drains
+ * the recv FIFO (hardware: the ARM7's send blocks when the FIFO is full, it
+ * does not lose the word).  Measured worst case in this project is a guest that
+ * stops draining for good (Phase-5AI: the guest halts at 0x02009110 with
+ * CPSR.I=1), which parks at most this many words — 4,096 words is ~707 frames
+ * at the measured 5.79 words/1e6 cycles, i.e. far past any real backlog — and
+ * then the producer STALLS (nnk_p4r_stalled) instead of dropping. */
+#define NNK_P4R_QMAX 4096
 static struct { uint32_t word; uint64_t at; } nnk_p4r_q[NNK_P4R_QMAX];
 static unsigned nnk_p4r_qn;
 static unsigned nnk_p4r_emitted, nnk_p4r_drop_log;
 static int nnk_p4r_armed;
+static int nnk_p4r_stalled;              /* Phase-5AI: ARM7 blocked, nothing lost */
 static struct { uint32_t word; uint64_t period; uint64_t next; } nnk_p4r_stream[3];
 static void nnk_p4r_arm(uint64_t t0);
 static void nnk_p4r_schedule(void);
 
+/* ---- Phase-5AI: the ARM9 drain probe (NNK_IPC_PROBE=1) -------------------
+ * The Phase-4R producer is the model of the ARM7's periodic sends; the ARM9
+ * side is a 16-word recv FIFO (arm9_recv_fifo) that the guest drains with a
+ * read of 0x04100000 (the SDK mailbox loop at pc 0x0200BB44, or the BIOS
+ * IPCRecv IRQ stub).  A guest that stops reading therefore fills the FIFO and
+ * the host-side 32-entry producer queue drops words.
+ *
+ * This probe measures WHICH of the two happened: it watches the FIFO depth at
+ * every dispatch, remembers the step/cycle of the last observed drain, and
+ * complains when a full frame (560,190 cyc, the measured VBlank period) goes
+ * by without one — printing the guest's pc and cpsr, i.e. where it is stuck
+ * and whether it has IRQs disabled (cpsr I = 0x80).  Diagnostic only: it is
+ * off unless NNK_IPC_PROBE=1 and changes no emulated state. */
+static int p4r_probe, p4r_probe_init;
+static unsigned p4r_prev_depth;
+static uint64_t p4r_last_read_step, p4r_last_read_cyc, p4r_probe_next;
+static unsigned p4r_nodrain_log, p4r_drain_log;
+static void nnk_p4r_probe_tick(void) {
+    if (!p4r_probe_init) {
+        const char *s = getenv("NNK_IPC_PROBE");
+        p4r_probe_init = 1;
+        p4r_probe = (s && s[0] == '1') ? 1 : 0;
+        p4r_prev_depth = arm9_recv_n;
+        p4r_last_read_cyc = cycles;
+    }
+    if (!p4r_probe) return;
+    if (arm9_recv_n < p4r_prev_depth) {      /* the guest popped a word */
+        if (p4r_nodrain_log) {               /* report the resume */
+            fprintf(stderr, "p4r: drain RESUMED after %llu cyc depth=%u "
+                    "pc=0x%08X cpsr=%08X step=%llu\n",
+                    (unsigned long long)(cycles - p4r_last_read_cyc),
+                    (unsigned)arm9_recv_n, last_pc, (unsigned)cpsr_ctl,
+                    (unsigned long long)steps);
+            p4r_nodrain_log = 0; p4r_probe_next = 0;
+            if (++p4r_drain_log >= 12u) p4r_probe = 2;  /* stop logging */
+        }
+        p4r_last_read_step = steps;
+        p4r_last_read_cyc = cycles;
+    }
+    if (p4r_probe == 1 && cycles >= p4r_last_read_cyc + 560190u &&
+        (!p4r_probe_next || cycles >= p4r_probe_next)) {
+        if (p4r_nodrain_log < 40u) {
+            fprintf(stderr, "p4r: NO DRAIN for %llu cyc depth=%u qn=%u "
+                    "pc=0x%08X cpsr=%08X lr=0x%08X mode=%02X "
+                    "last_read_step=%llu step=%llu cyc=%llu\n",
+                    (unsigned long long)(cycles - p4r_last_read_cyc),
+                    (unsigned)arm9_recv_n, (unsigned)nnk_p4r_qn, last_pc,
+                    (unsigned)cpsr_ctl, r[14], (unsigned)(cpsr_ctl & 0x1Fu),
+                    (unsigned long long)p4r_last_read_step,
+                    (unsigned long long)steps, (unsigned long long)cycles);
+            p4r_nodrain_log++;
+        }
+        p4r_probe_next = cycles + 560190u * 4u;
+    }
+}
+
 static void nnk_ipc_tick(void) {
+    nnk_p4r_probe_tick();              /* Phase-5AI: drain probe (opt-in) */
     nnk_p4s_tick();                    /* Phase-4S: card-phase completion */
-    if (nnk_ipc_reply_pend && cycles >= nnk_ipc_reply_at) {
+    if (nnk_ipc_reply_pend && cycles >= nnk_ipc_reply_at && arm9_recv_n < 16u) {
+        /* Phase-5AI: a reply the guest is waiting on is never dropped and never
+         * overruns the 16-word recv FIFO — it waits for a free slot (the
+         * hardware send would block the same way). */
         nnk_ipc_reply_pend = 0;
         if (arm9_recv_n < 16u) arm9_recv_fifo[arm9_recv_n++] = nnk_ipc_reply_word;
         iflags |= 0x00040000u;               /* IRQ_IPCRecv: the ARM7 answered */
@@ -591,6 +660,7 @@ static void nnk_ipc_tick(void) {
             nnk_p4b_pend = 1;                /* FIFO full: retry next dispatch */
         }
     }
+    p4r_prev_depth = arm9_recv_n;      /* Phase-5AI: depth the guest can pop */
 }
 
 /* ---- Phase-4R: the ARM7 periodic IPC producer (measured rhythm) ----------
@@ -636,9 +706,10 @@ static void nnk_ipc_tick(void) {
  * Rare words NOT modelled here (measured, out of this phase's window):
  * 0x0000006B x5, a burst at ts 50,485,392..50,498,023. */
 static void nnk_p4r_enqueue(uint32_t word, uint64_t at) {
-    if (nnk_p4r_qn >= NNK_P4R_QMAX) {        /* ARM7 FIFO-full: melonDS would */
-        if (nnk_p4r_drop_log < 8u) {         /* stall the sender; we drop the */
-            fprintf(stderr, "ipc: p4r FIFO-full drop 0x%08X at=%llu step=%llu\n",
+    if (nnk_p4r_qn >= NNK_P4R_QMAX) {        /* unreachable: schedule() stalls */
+        if (nnk_p4r_drop_log < 8u) {         /* first, and it must be loud:   */
+            fprintf(stderr, "ipc: p4r INTERNAL queue overflow 0x%08X at=%llu "
+                    "step=%llu (schedule() must back-pressure first)\n",
                     word, (unsigned long long)at, (unsigned long long)steps);
             nnk_p4r_drop_log++;
         }
@@ -667,6 +738,26 @@ static void nnk_p4r_schedule(void) {
     int i;
     for (i = 0; i < 3; i++) {
         while (cycles >= nnk_p4r_stream[i].next) {
+            /* Phase-5AI back-pressure: the ARM7's send FIFO is full, so the
+             * ARM7 BLOCKS — the word is not produced yet and `next` stays put
+             * (nothing is lost, no reordering inside a stream; the catch-up
+             * burst on drain is what hardware does when the FIFO frees up). */
+            if (nnk_p4r_qn >= NNK_P4R_QMAX) {
+                if (!nnk_p4r_stalled) {
+                    nnk_p4r_stalled = 1;
+                    fprintf(stderr, "ipc: p4r ARM7 send BLOCKED (FIFO full: "
+                            "qn=%u) — back-pressure, 0 words dropped "
+                            "step=%llu cyc=%llu\n", (unsigned)nnk_p4r_qn,
+                            (unsigned long long)steps,
+                            (unsigned long long)cycles);
+                }
+                return;
+            }
+            if (nnk_p4r_stalled) {
+                nnk_p4r_stalled = 0;
+                fprintf(stderr, "ipc: p4r ARM7 send RESUMED step=%llu cyc=%llu\n",
+                        (unsigned long long)steps, (unsigned long long)cycles);
+            }
             nnk_p4r_enqueue(nnk_p4r_stream[i].word, nnk_p4r_stream[i].next);
             nnk_p4r_stream[i].next += nnk_p4r_stream[i].period;
         }
