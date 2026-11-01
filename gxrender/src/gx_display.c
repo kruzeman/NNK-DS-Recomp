@@ -413,6 +413,8 @@ struct Gxd {
     int bulk_win;          /* 1: image came from gxd_load_2d_state and its
                             * window latch bytes are authoritative */
     uint32_t powcnt;
+    uint8_t wramcnt;       /* WRAMCNT (0x04000247) - not a VRAM bank (Phase-5Y) */
+    uint32_t vram_drop;    /* VRAM window stores with no bank mapped (Phase-5Y) */
 
     /* screens */
     uint32_t screen[2][FB_PIXELS];
@@ -664,11 +666,27 @@ static void vram_write_byte(Gxd *g, uint32_t a, uint8_t v)
         return;
     }
 
-    for (bank = 0; bank < VRAM_BANKS; bank++)
-        if (map[idx] & (1u << bank)) {
-            g->vram[bank][rel & (vram_bank_size[bank] - 1)] = v;
-            g->flat_dirty = 1;
+    {
+        int hit = 0;
+        for (bank = 0; bank < VRAM_BANKS; bank++)
+            if (map[idx] & (1u << bank)) {
+                g->vram[bank][rel & (vram_bank_size[bank] - 1)] = v;
+                g->flat_dirty = 1;
+                hit = 1;
+                if (getenv("NNK_VRAM_TRACE") && rel >= 0x200u && rel < 0x600u)
+                    fprintf(stderr, "vramw a=0x%08X rel=0x%X -> bank %d\n", a, rel, bank);
+            }
+        if (!hit) {
+            /* Phase-5Y: no bank mapped in this window block - the store is
+             * dropped (melonDS behaves the same, but a drop is invisible unless
+             * counted, and a dropped OBJ tile upload renders as missing
+             * glyphs). */
+            g->vram_drop++;
+            if (getenv("NNK_VRAM_TRACE"))
+                fprintf(stderr, "vramdrop a=0x%08X rel=0x%X mapblock=0x%X n=%u\n",
+                        a, rel, map[idx], g->vram_drop);
         }
+    }
 }
 
 /* =====================================================================
@@ -945,15 +963,49 @@ static void global_write(Gxd *g, uint32_t addr, uint32_t val, int width)
     }
     case 0x04000240: case 0x04000241: case 0x04000242: case 0x04000243:
     case 0x04000244: case 0x04000245: case 0x04000246: case 0x04000247:
-    case 0x04000248: {
-        int bank = (int)(addr - 0x04000240);
+    case 0x04000248: case 0x04000249: {
+        /* Phase-5Y: the register layout is NOT a flat 0x240+bank table.
+         * melonDS NDS.cpp ARM9Write8/16/32:  0x240..0x246 = VRAMCNT_A..G,
+         * 0x247 = WRAMCNT (no VRAM bank!), 0x248 = VRAMCNT_H,
+         * 0x249 = VRAMCNT_I.  The previous flat `a - 0x240` model put H at
+         * 0x247 and I at 0x248, so the guest's WRAMCNT store (0x03) became
+         * VRAMCNT_H, the real H store (0x82) landed on I and the real I store
+         * (0x83) was dropped — which un-mapped the engine-B *BG extended
+         * palette* bank and left the boss/dialog 2D layer with no colours. */
+        static const int slot[10] = { 0, 1, 2, 3, 4, 5, 6, -1, 7, 8 };
         if (width == 1) {
-            g->vramcnt[bank] = (uint8_t)(val & 0xFF);
+            int b = slot[(addr - 0x04000240) & 0xF];
+            if (b >= 0) g->vramcnt[b] = (uint8_t)(val & 0xFF);
+            else        g->wramcnt = (uint8_t)(val & 0xFF);
+        } else if (width == 2 && !(addr & 1) &&
+                   addr >= 0x04000240 && addr <= 0x04000248) {
+            int i;
+            for (i = 0; i < 2; i++) {
+                int b = slot[(addr - 0x04000240 + i) & 0xF];
+                uint8_t v = (uint8_t)(val >> (8 * i));
+                if (b >= 0) g->vramcnt[b] = v;
+                else        g->wramcnt = v;
+            }
+        } else if (width == 4 &&
+                   (addr == 0x04000240 || addr == 0x04000244 || addr == 0x04000248)) {
+            int i;
+            for (i = 0; i < 4; i++) {
+                int b = slot[(addr - 0x04000240 + i) & 0xF];
+                uint8_t v = (uint8_t)(val >> (8 * i));
+                if (b >= 0) g->vramcnt[b] = v;
+                else        g->wramcnt = v;
+            }
         } else {
             int i;
-            for (i = 0; i < width && bank + i < VRAM_BANKS; i++)
-                g->vramcnt[bank + i] = (uint8_t)(val >> (8 * i));
+            for (i = 0; i < width; i++) gxd_io_write(g, addr + (uint32_t)i,
+                                                     (val >> (8 * i)) & 0xFF, 1);
+            return;
         }
+        if (getenv("NNK_VRC_TRACE"))
+            fprintf(stderr, "vrc W%d 0x%08X 0x%08X -> %02x%02x%02x%02x%02x%02x%02x%02x%02x\n",
+                    width, addr, val, g->vramcnt[0], g->vramcnt[1], g->vramcnt[2],
+                    g->vramcnt[3], g->vramcnt[4], g->vramcnt[5], g->vramcnt[6],
+                    g->vramcnt[7], g->vramcnt[8]);
         memcpy(gl + G_VRAMCNT, g->vramcnt, VRAM_BANKS);
         gl[G_VRAMSTAT] = 0;
         remap_all(g);
@@ -1482,6 +1534,42 @@ void gxd_close(Gxd *g)
     free(g);
 }
 
+/* ---- Phase-5Y: full 2D state dump (differential analysis) ----------------
+ * NNK_GX_STATE_DUMP=<path> NNK_GX_STATE_DUMP_FRAME=<n> writes, at the start of
+ * presentation frame <n> (after the flat views are rebuilt and the window
+ * latch is applied, i.e. exactly the state gx2d_render_frame is about to
+ * consume), a raw image:
+ *   +0x000000  0x195400  the GX2D state image (g->img: engine regs A/B,
+ *                        global block, palette, OAM, VRAMFlat_* views)
+ *   +0x195400  0x120000  the nine raw VRAM banks, 0x20000 bytes each
+ * so the exact bytes the renderer saw can be decoded offline (regs, tile
+ * data, palette, OAM) without another rebuild.  One file per dump; the
+ * dump is written once and then disabled. */
+static void state_dump(Gxd *g)
+{
+    static int done;
+    const char *p, *f;
+    char path[512];
+    FILE *fp;
+    int b;
+    if (done) return;
+    p = getenv("NNK_GX_STATE_DUMP");
+    f = getenv("NNK_GX_STATE_DUMP_FRAME");
+    if (!p || !p[0]) return;
+    if (f && f[0] && (unsigned)strtoul(f, NULL, 0) != g->frames) return;
+    done = 1;
+    snprintf(path, sizeof path, "%s", p);
+    fp = fopen(path, "wb");
+    if (!fp) { fprintf(stderr, "gx: state dump: cannot write %s\n", path); return; }
+    fwrite(g->img, 1, IMG_RAW + 0x80000u, fp);
+    for (b = 0; b < VRAM_BANKS; b++) fwrite(g->vram[b], 1, 0x20000, fp);
+    fclose(fp);
+    fprintf(stderr, "gx: state dump frame=%u -> %s (powcnt=%08x vramcnt=%02x%02x%02x%02x%02x%02x%02x%02x%02x)\n",
+            g->frames, path, g->powcnt, g->vramcnt[0], g->vramcnt[1], g->vramcnt[2],
+            g->vramcnt[3], g->vramcnt[4], g->vramcnt[5], g->vramcnt[6],
+            g->vramcnt[7], g->vramcnt[8]);
+}
+
 static void latch_unit(Gxd *g)
 {
     /* SWAP_BUFFERS latches the env and swaps the retained polygon set
@@ -1538,6 +1626,7 @@ void gxd_frame(Gxd *g)
     {
         Gx2DState st;
         const uint32_t *fb;
+        state_dump(g);
         gx2d_state_load(&st, g->img);
         if (g->fb3d_override)
             fb = g->fb3d_override;
