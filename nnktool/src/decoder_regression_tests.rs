@@ -1039,3 +1039,75 @@ fn runtime_live_decoder_covers_the_itcm_window() {
         "regression: ITCM live decoding no longer reads the guest-owned itcm array"
     );
 }
+
+// --------------------------------------------------------------- class 18 ---
+// `blx <imm>` must CARRY the state it switches to (Phase-5O, barrier I3).
+//
+// BLX immediate is the one interworking transfer whose target state is fully
+// determined by the encoding: the Thumb halfword pair (suffix 11101) targets
+// ARM, the ARM form (cond=1111, bits 27..25=101) targets Thumb (ARM ARM
+// A7.1.4).  The compiled cases emitted `pc = target & ~1u;` with no
+// `nnk_smc_note_branch`, so an UNROOTED callee was resolved by the live
+// decoder's map/register/sticky guess.
+//
+// Measured: 0x020F6ED6 `blx 0x02054144` (0xF75D 0xE936) left smc_t_sticky =
+// Thumb; the live decoder re-decoded the ARM `push {r4,lr}` at 0x02054144 as
+// Thumb, ran 0x02054146..0x020541BE through the ARM bytes and branched into
+// the middle of the movie-player table generator at 0x02054764 (its prologue
+// skipped).  The 5th argument it reloads from [[sp,#0x128]] was 1, not a
+// destination pointer, so `str r0,[r1,r7,lsl #2]` with r7 = 0x14 stored to
+// guest address 0x51 == ITCM[0x51..0x54] and zeroed the IRQ dispatcher's
+// literal pool 0x01FF8050/4 (the Phase-5N mechanism).
+const T_BLX_I3_H1: u16 = 0xF75D; // blx 0x02054144 — measured at 0x020F6ED6
+const T_BLX_I3_H2: u16 = 0xE936; // suffix 11101 = BLX (switches to ARM)
+const T_BLX_I3_SITE: u32 = 0x020F_6ED6;
+const T_BLX_I3_TARGET: u32 = 0x0205_4144;
+
+#[test]
+fn compiled_blx_immediate_carries_the_state_it_switches_to() {
+    // (a) the encoding: Thumb BLX imm is Kind::BlxImm on the even target.
+    let insn = decode_thumb(T_BLX_I3_H1, T_BLX_I3_H2, T_BLX_I3_SITE, 4);
+    match insn.kind {
+        Kind::BlxImm { target } => assert_eq!(
+            target, T_BLX_I3_TARGET,
+            "0xF75D 0xE936 at 0x020F6ED6 is `blx 0x02054144`"
+        ),
+        other => panic!("F75D E936 must decode as Kind::BlxImm, got {:?}", other),
+    }
+    // (b) NEGATIVE neighbour: flipping suffix bit12 gives BL, which stays in
+    //     Thumb — a fix that switched state for every Thumb call would run the
+    //     whole Thumb call graph in ARM state.
+    let bl = decode_thumb(T_BLX_I3_H1, T_BLX_I3_H2 | 0x1000, T_BLX_I3_SITE, 4);
+    assert!(
+        !matches!(bl.kind, Kind::BlxImm { .. }),
+        "0xF75D 0xF936 is `bl`, not `blx`: it must not be treated as interworking"
+    );
+    // (c) the EMITTER records the state the BLX switches to, derived from the
+    //     state of the site (`thumb` param of emit_insn).
+    let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/recompile.rs");
+    let em = std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("cannot read {}: {}", p.display(), e));
+    let at = em.find("Kind::BlxImm { target } =>").expect("Kind::BlxImm arm missing");
+    let end = at + em[at..].find("Kind::Mem {").expect("Kind::Mem arm missing");
+    let block = &em[at..end];
+    assert!(
+        block.contains("let raw = if thumb { *target & !1u32 } else { *target | 1u32 };"),
+        "regression: the BLX-immediate note no longer derives the callee state from the site state"
+    );
+    assert!(
+        block.contains("nnk_smc_note_branch(0x{:08X}u);"),
+        "regression: compiled `blx <imm>` drops the state bit again (unrooted callee re-decoded by guess)"
+    );
+    // (d) the FROZEN-image splice uses the same encoding test and never guesses.
+    let t = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../tools/p5o_blx_note.py");
+    let tool = std::fs::read_to_string(&t).unwrap_or_else(|e| panic!("cannot read {}: {}", t.display(), e));
+    assert!(
+        tool.contains("(w & 0xFE000000) == 0xFA000000") && tool.contains("(h2 & 0xF800) == 0xE800"),
+        "regression: the BLX splice no longer decides the site state from the ARM/Thumb encodings"
+    );
+    assert!(
+        tool.contains("if st == 'thumb' else (target | 1)"),
+        "regression: the BLX splice no longer tags an ARM-form target as Thumb"
+    );
+    assert_eq!(T_BLX_I3_H2 & 0x1000, 0x0000, "fixture sanity: blx suffix bit12 = 0");
+}
+
