@@ -1529,6 +1529,11 @@ static void p5u_track(uint32_t pc) {
             "p5u: t step=%llu cyc=%llu vc=%u gxf=%u pc=0x%08X"
             " player[30]=%08X [34]=%08X [38]=%08X [3C]=%08X [40]=%08X"
             " [44]=%08X [48]=%08X [A4]=%08X"
+            " pA[98]=%08X [9C]=%08X [A0]=%08X [A8]=%08X [AC]=%08X [B0]=%08X"
+            " hd[00]=%08X [04]=%08X [08]=%08X [0C]=%08X [10]=%08X [14]=%08X"
+            " [18]=%08X [1C]=%08X [20]=%08X [24]=%08X [28]=%08X [2C]=%08X"
+            " [30]=%08X [88]=%08X [8C]=%08X [90]=%08X [94]=%08X"
+            " clk[0C]=%08X [10]=%08X [14]=%08X"
             " codec[00]=%08X [04]=%08X [0C]=%08X [10]=%08X [20]=%08X"
             " r0=%08X r1=%08X r2=%08X r3=%08X lr=%08X sp=%08X"
             " disp=%04X ie=%08X if=%08X ime=%u cpsr=%02X\n",
@@ -1542,6 +1547,25 @@ static void p5u_track(uint32_t pc) {
             ld32(p + 0x30u), c, ld32(p + 0x38u), ld32(p + 0x3Cu),
             ld32(p + 0x40u), ld32(p + 0x44u), ld32(p + 0x48u),
             ld32(p + 0xA4u),
+            /* Phase-5AD: the movie player's stream counters.  +0x9C/+0xA0 are
+             * the pair the per-frame decode driver 0x0207B1D0 compares before
+             * it consumes a frame (`if ([+0x9C] > [+0xA0]) return 0`), so they
+             * are the ring-full witness; 0x0208AFAC+0xC is the movie clock the
+             * present gate 0x0207D1A4 compares against its iteration counter. */
+            ld32(p + 0x98u), ld32(p + 0x9Cu), ld32(p + 0xA0u),
+            ld32(p + 0xA8u), ld32(p + 0xACu), ld32(p + 0xB0u),
+            /* Phase-5AD: the player's header fields.  +0x0C is what the decode
+             * step 0x0207AFB4 compares against its own +0x98 counter to decide
+             * the movie is FINISHED (`cmp [0x98],[0x0C]; moveq r0,#0`), so the
+             * pair is the direct witness for a premature end of session. */
+            ld32(p + 0x00u), ld32(p + 0x04u), ld32(p + 0x08u),
+            ld32(p + 0x0Cu), ld32(p + 0x10u), ld32(p + 0x14u),
+            ld32(p + 0x18u), ld32(p + 0x1Cu), ld32(p + 0x20u),
+            ld32(p + 0x24u), ld32(p + 0x28u), ld32(p + 0x2Cu),
+            ld32(p + 0x30u), ld32(p + 0x88u), ld32(p + 0x8Cu),
+            ld32(p + 0x90u), ld32(p + 0x94u),
+            ld32(0x0208AFACu + 0x0Cu), ld32(0x0208AFACu + 0x10u),
+            ld32(0x0208AFACu + 0x14u),
             c ? ld32(c) : 0u, c ? ld32(c + 4u) : 0u,
             c ? ld32(c + 0x0Cu) : 0u, c ? ld32(c + 0x10u) : 0u,
             c ? ld32(c + 0x20u) : 0u,

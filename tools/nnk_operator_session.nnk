@@ -5,6 +5,15 @@
 #   D-pad Right=0x3EF Left=0x3DF Up=0x3BF Down=0x37F | R=0x2FF L=0x1FF
 # Start every 36 frames (advance one prompt) from frame 13,
 # then DS A at frame 917 = the operator's movie skip (~510M steps).
+#
+# WARNING (Phase-5AD, measured): this script SKIPS THE INTRO MOVIE.
+#   The movie player leaves its frame loop on an A|Start edge (0x0207D230 -
+#   0x0207D248, overlay 13).  With this script the game enters the movie player
+#   at display frame 578, presents 7 frames, and the press at frame 589 ends the
+#   session at master step 327,550,216: the Mobiclip splash and the intro movie
+#   are never shown, and the band f3700..f4300 stays flat black (both screens).
+#   For a band/acceptance measurement run WITHOUT this file (or with a schedule
+#   that has no presses after the movie window): see PHASE5AD.md.
 0 0x3FF
 13 0x3F7
 15 0x3FF
