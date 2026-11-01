@@ -3209,8 +3209,11 @@ fn phase_5ap_thumb_blx_return_keeps_its_state_in_the_arm_pop_note() {
     //    has not rewritten (generation-0 bytes are the ones we analysed).
     let smc = std::fs::read_to_string(root.join("../tools/nnk_smc.inc")).expect("nnk_smc.inc");
     assert!(
-        smc.contains("#include \"nnk_pcform_map.h\""),
-        "the runtime must include the generated ROM map"
+        smc.lines().any(|l| {
+            let t = l.trim_start();
+            t.starts_with('#') && t.contains("include") && t.contains("nnk_pcform_map.h")
+        }),
+        "the runtime must include the generated ROM map (directly or behind __has_include)"
     );
     assert!(
         smc.contains("pf = smc_map_live_ok(pc) ? nnk_pcform_lookup(pc) : -1;"),

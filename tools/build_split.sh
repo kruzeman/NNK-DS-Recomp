@@ -236,10 +236,25 @@ fi
 # ---- split (or reuse the existing split output) ---------------------------
 # Phase-5AP: the ROM-derived pc->form map is a generated build artifact under
 # the gitignored work/ tree; tools/gen_pcform.py produces it.  Default to the
-# standard location so a build after generating it picks it up automatically
-# (an absent file yields an EMPTY map, i.e. the pre-5AP behaviour).
+# standard location so a build after generating it picks it up automatically.
+# An absent map is generated from the ROM; if that fails the build stops
+# (NNK_ALLOW_NO_PCFORM=1 opts into a deliberately degraded image).
+if [[ -z "${NNK_PCFORM_MAP:-}" && ! -f work/phase5ap/nnk_pcform_map.h && -f tools/gen_pcform.py ]]; then
+  # Phase-5AP: never build without the state authority by accident.  A missing
+  # map used to yield an EMPTY map (the pre-5AP behaviour) -- that is the same
+  # silent-degradation class as 5AB/5AG, so generate it from the ROM instead.
+  echo "== Phase-5AP: pcform map missing -- generating it from the ROM"
+  ROM_FOR_MAP="${NNK_ROM_PATH:-Ni No Kuni.nds}"
+  python3 tools/gen_pcform.py --rom "$ROM_FOR_MAP" --outdir work/phase5ap \
+      --tool nnktool/target/release/nnktool >/dev/null 2>&1 || true
+fi
 if [[ -z "${NNK_PCFORM_MAP:-}" && -f work/phase5ap/nnk_pcform_map.h ]]; then
   NNK_PCFORM_MAP=$PWD/work/phase5ap/nnk_pcform_map.h
+fi
+if [[ -z "${NNK_PCFORM_MAP:-}" && "${NNK_ALLOW_NO_PCFORM:-0}" != "1" ]]; then
+  echo "ERROR: work/phase5ap/nnk_pcform_map.h is absent and could not be generated" >&2
+  echo "       (set NNK_ALLOW_NO_PCFORM=1 to build a degraded image deliberately)" >&2
+  exit 2
 fi
 export NNK_PCFORM_MAP="${NNK_PCFORM_MAP:-}"
 if [[ -n "$NNK_PCFORM_MAP" ]]; then
