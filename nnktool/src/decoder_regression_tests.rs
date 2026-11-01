@@ -2470,3 +2470,159 @@ fn phase_5ai_arm7_producer_backpressures_instead_of_dropping() {
         "regression: the NNK_IPC_PROBE drain instrument is gone"
     );
 }
+
+// ---------------------------------------------------------------- class 46 ---
+// Phase-5AK: `[stream+0x124]` = 0x80808080 is UNINITIALISED MEMORY, not a bad
+// decode.  Measured chain (PHASE5AK.md, storewatch over 0x022CC714..0x022CCA80,
+// steps 323,128,149..334,200,000 of the scripted A|Start run):
+//
+//   323,133,063  0x02009BB4  memset-0   0x022CC700..0x022CC87C   (the sibling
+//                            object's block only — it ends AT the object that
+//                            aborts, 0x022CC8CC)
+//   323,133,127  0x02009CF0  memset-0x80 0x022CC890..0x022D2890   (the movie
+//                            audio driver's 8-bit-silence fill of right-channel
+//                            buffer #5; caller ov13 0x0207AB58 =
+//                            memset([[[player+0x60]] + ch*4], 0x80,
+//                            ([player+0x14]>>1)<<8), ch = 0..4)
+//   323,133,172  0x02009CF0  writes 0x022CC8CC = 0x80808080  (the aborting
+//                            object's first word) .. 323,133,391 covers +0x124
+//   323, 89x,xxx 0x01FFDAD4  copies 0x022BA9A8 -> 0x022CC8C8 (audio decode)
+//   334,057,213  0x02043700  ctor base   0x02069264 -> [this]
+//   334,057,222  0x020437FC  ctor        0x020692A8 -> [this]   (+0x14..+0x38
+//                            zeroed by three memsets, PHASE5AK.md §2)
+//   334,057,415  0x02043EC8  0x02043E98 ctor writes +0x54/+0x98/+0x9C/+0xA0/
+//                            +0xFC/+0x100/+0x120, sets +0x14=0x80000,
+//                            +0x18=0x60000
+//   334,057,429  0x020DBD90  ov17 thunk
+//   334,057,437  0x020D9ADC  final vptr 0x0213B70C
+//
+//   ** +0x124 is NEVER written by any constructor. **  Its only writer in the
+//   whole image is 0x02044788 (`str r0,[sl,#292]`), the stream *data* setup:
+//   `[this+0x124] = ([data] == 0x54414154 /* "TAAT" */) ? data+8 : 0`.  That
+//   function is reached exactly once in this run — step 42,038,614, during
+//   boot — and never for the post-movie stream objects.  So they inherit
+//   whatever the heap block held, and the block is the tail of the movie
+//   audio buffer, still 0x80-filled.
+//
+// The guard that reads it (0x02044868, vtable slot +0x50):
+//   e5950124  ldr  r0,[r5,#292]@0x124
+//   e3500000  cmp  r0,#0
+//   0a000003  beq  normal          ; NULL -> normal path (THE SIBLING)
+//   e1d000b0  ldrh r0,[r0]
+//   e1500004  cmp  r0,r4           ; r4 = new state (0x80)
+//   8a000000  bhi  normal
+//   ebff120c  bl   0x020090D8      ; SDK terminate (assert) -> IRQ-off WFI
+//
+// 0x80808080 is outside every mapped window, so the runtime's ld16() answers 0
+// and 0 <= 0x80 takes the terminate branch.  This is NOT a window/stride bug
+// and NOT the VRAM shadow: melonDS answers the same 0 (src/NDS.cpp
+// ARM9Read16's tail is a bare `return 0;` for an unknown address), so the abort
+// is *layout*-driven — any model whose heap hands these objects a block that
+// was 0x80-filled parks here.  The test locks the class, not a fake fix.
+
+/// Result of the NNS stream state-setter guard at 0x02044868.
+#[derive(Debug, PartialEq, Eq)]
+enum StreamGuard {
+    /// `ldrh [this+0x9C] == state`: the setter returns at 0x02044878.
+    AlreadyInState,
+    /// `[this+0x124] == 0` or `ldrh [that] > state`: the normal path.
+    Normal,
+    /// `ldrh [[this+0x124]] <= state`: `bl 0x020090D8` (terminate).
+    Terminate,
+}
+
+/// The guard, transcribed from the ARM words quoted above.  `read16` is the
+/// guest `ldrh` (the runtime's `ld16()`/melonDS's `ARM9Read16`).
+fn nns_stream_state_guard(current: u16, state: u32, data: u32, read16: &dyn Fn(u32) -> u16) -> StreamGuard {
+    if current as u32 == state {
+        return StreamGuard::AlreadyInState;
+    }
+    if data != 0 && (read16(data) as u32) <= state {
+        return StreamGuard::Terminate;
+    }
+    StreamGuard::Normal
+}
+
+/// The runtime's window decode for a 16-bit guest read, transcribed from
+/// `win_off()` (nnk_main.c): main RAM is 0x02000000..0x02FFFFFF mirrored four
+/// times (MainRAMMask 0x3FFFFF), the flat window is GBASE..GBASE+GSIZE
+/// (0x02000000 + 24 MiB), everything else is "not memory" -> ld16() == 0.
+fn runtime_ld16_mapped(addr: u32) -> bool {
+    const GBASE: u32 = 0x0200_0000;
+    const GSIZE: u32 = 24 * 1024 * 1024;
+    if (addr & 0xFF00_0000) == 0x0200_0000 {
+        return true; // 4 MiB main RAM, mirrored
+    }
+    (addr as u64) + 2 <= GBASE as u64 + GSIZE as u64
+}
+
+#[test]
+fn phase_5ak_stream_state_guard_terminates_on_the_unmapped_data_pointer() {
+    const SIBLING_OBJ_124: u32 = 0x022C_C838; // [0x022CC714+0x124] = 0
+    const ABORTING_OBJ_124: u32 = 0x022C_C9F0; // [0x022CC8CC+0x124] = 0x80808080
+    const SILENCE_FILL: u32 = 0x8080_8080; // memset(right[i], 0x80, 0x6000)
+    const STATE: u32 = 0x80; // r4 at the abort (PHASE5AI §3)
+
+    // The runtime's ld16(): a mapped address reads the guest window, anything
+    // else is 0.  0x80808080 is outside every window (class (c) is refuted):
+    // it is neither inside the 4 MiB main-RAM mirror (bits 31..24 are 0x80,
+    // not 0x02) nor inside the flat window (0x80808080 > 0x03800000).
+    assert!(!runtime_ld16_mapped(SILENCE_FILL));
+    assert!(runtime_ld16_mapped(SIBLING_OBJ_124)); // 0x022CC838 is main RAM
+    let unmapped_zero = |_a: u32| 0u16;
+    // ... and melonDS agrees: NDS::ARM9Read16's `switch (addr & 0xFF000000)`
+    // has no case for 0x80xxxxxx and falls through to `return 0;`.
+    assert_eq!(unmapped_zero(SILENCE_FILL), 0);
+
+    // SIBLING: the field is 0 -> `beq normal`, no dereference at all.
+    assert_eq!(
+        nns_stream_state_guard(0x7E, STATE, 0, &unmapped_zero),
+        StreamGuard::Normal
+    );
+    // ABORTING OBJECT: 0x80808080 -> ld16() == 0 -> 0 <= 0x80 -> terminate.
+    assert_eq!(
+        nns_stream_state_guard(0x00, STATE, SILENCE_FILL, &unmapped_zero),
+        StreamGuard::Terminate
+    );
+    // The same guard with a state already latched returns even earlier (the
+    // measured 0x02044878 pop in the 0x020D9C80 calls of the 6-iteration loop).
+    assert_eq!(
+        nns_stream_state_guard(STATE as u16, STATE, SILENCE_FILL, &unmapped_zero),
+        StreamGuard::AlreadyInState
+    );
+    // Counterfactual, documented NOT as a fix: only a read that answered
+    // 0xFFFF (DS open bus) would make `bhi` pass.  melonDS does not do that
+    // for an unknown address, so changing our ld16() would diverge from the
+    // reference instead of matching it.
+    let open_bus_ffff = |_a: u32| 0xFFFFu16;
+    assert_eq!(
+        nns_stream_state_guard(0x00, STATE, SILENCE_FILL, &open_bus_ffff),
+        StreamGuard::Normal
+    );
+}
+
+#[test]
+fn phase_5ak_audio_silence_fill_reaches_the_stream_object() {
+    // The 0x80 fill's geometry, measured at the memset entry (0x02009C90,
+    // NNK_DEBUG_AT_PC): r0 = [player+0x60][ch], r1 = 0x80,
+    // r2 = ([player+0x14] >> 1) << 8, ch = 0..[player+0xA8]-1 = 0..4.
+    const PLAYER_14: u32 = 0xC0; // 192 samples/frame -> 0x6000 bytes
+    let len = (PLAYER_14 >> 1) << 8;
+    assert_eq!(len, 0x6000, "the fill length measured at 0x02009C90");
+    let buffers = [0x0228_4810u32, 0x0229_6830, 0x022A_8850, 0x022B_A870, 0x022C_C890];
+    for w in buffers.windows(2) {
+        assert_eq!(w[1] - w[0], 0x1_2020, "the measured pool stride");
+    }
+    // The aborting object lies inside buffer #5 — the fill covers it, so every
+    // byte of the object that no constructor writes keeps the 0x80 pattern.
+    const ABORTING_OBJ: u32 = 0x022C_C8CC;
+    let last = *buffers.last().unwrap();
+    assert!(last < ABORTING_OBJ && ABORTING_OBJ < last + len);
+    assert_eq!(ABORTING_OBJ - last, 0x3C, "obj = buffer#5 + 0x3C (measured)");
+    // ... while the sibling, one object earlier, sits OUTSIDE that buffer and
+    // was explicitly cleared by the memset-0 at 0x02009BB4 (0x022CC700..
+    // 0x022CC87C), which is why its +0x124 reads 0.
+    const SIBLING_OBJ: u32 = 0x022C_C714;
+    assert!(SIBLING_OBJ < last);
+    assert!(SIBLING_OBJ + 0x1B8 == ABORTING_OBJ, "the measured 0x1B8 stride");
+}
