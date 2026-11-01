@@ -264,6 +264,16 @@ the frame-917 A press, frame 589 present), the exonerated guards
 
 ```
 cd nnktool && cargo test --release   -> 42 passed; 0 failed   (class 41 new)
-SKIP_MELONDS=1 sh tools/verify_phase2a.sh  -> see §9
+SKIP_MELONDS=1 sh tools/verify_phase2a.sh -> green:
+   A 192/192 + 64/64 + 64/64 + 125/125, A2 Thumb battery 51/51 vs binutils,
+   B 2020 functions / 72959 cases recovered, C1 1942/2020 (96.1%) agree with
+   Ghidra, C2 body coverage 100.0% (>=1 insn) / 96.5% byte-weighted,
+   D recompile-all -> cc -> run (20M steps, no HLE halt), E/F melonDS vs
+   native PC trace 1000/1000 = 100.0% (strict prefix and after resync)
 ```
+
+No regression to the acceptance checks of earlier phases: A/A2/B/C/D/E/F all
+report their previous values; this phase's only runtime change is a diagnostic
+(`NNK_P5U`) whose fields are reads (`st32` count in the block is 0, locked by
+class 41).
 
