@@ -1204,6 +1204,18 @@ int nnk_smc_try(uint32_t *pcp) {
  * decodes exactly one source frame per step); a stream cursor that moves
  * backwards starts a new session at frame 0.
  *
+ * Phase-5AA: the intro drives TWO independent movies, one per screen — the
+ * callback's r0 alternates between two codec structs (0x0227834C and
+ * 0x022E8B74 in the measured runs), each owned by its own player object
+ * (player + 0x34 == codec; player + 0x38 callback; module code in overlay 13).
+ * melonDS at ts 2.6179e9 holds player 0x02278264 (codec 0x0227834C, ring
+ * 0x022C0880) whose plane is op_u frame 130 and player 0x022E8A8C (codec
+ * 0x022E8B74, ring 0x023310A8) whose plane is op_d frame 130.  A single
+ * global frame index reset on every codec change, so every present showed
+ * frame 0.  Each codec now has its own stream state (index, cursor, source
+ * file); source 1 = NNK_MOVIE_YUV, source 2 = NNK_MOVIE_YUV2 (defaults to
+ * source 1), further sessions reuse source 1.
+ *
  * OFF unless NNK_MOVIE_YUV names a raw yuv420p file (73728 B/frame). */
 #define P5T_W 256
 #define P5T_H 192
@@ -1213,30 +1225,82 @@ int nnk_smc_try(uint32_t *pcp) {
 #define P5T_PLAYER 0x02278264u
 #define P5T_CB_ENTRY 0x01FF8540u
 #define P5T_CB_RET 0x0207B21Cu
+#define P5T_MAXSTREAM 4
 
-static FILE *p5t_fp;
+/* Phase-5AA: one entry per codec (per movie), not one global cursor. */
+typedef struct {
+    uint32_t codec;      /* stream struct base = the callback's r0 */
+    uint32_t cursor;     /* [codec] at the previous present of THIS stream */
+    long index;          /* next frame index (-1 = session start) */
+    long frames, presents, shortr;
+    FILE *fp;
+} P5tStream;
+
 static int p5t_state;                 /* 0 unparsed, 1 off, 2 on */
-static long p5t_frames, p5t_index;
-static long p5t_presents, p5t_short;
-static uint32_t p5t_codec, p5t_cursor;
+static P5tStream p5t_str[P5T_MAXSTREAM];
+static int p5t_nstr;
+static uint32_t p5t_codec;            /* codec of the CURRENT decode step */
 static uint8_t p5t_buf[P5T_FRAME];
 
 static void p5t_init(void) {
     const char *p = getenv("NNK_MOVIE_YUV");
     p5t_state = 1;
     if (!p || !p[0]) return;
-    p5t_fp = fopen(p, "rb");
-    if (!p5t_fp) { fprintf(stderr, "movie: cannot open %s\n", p); return; }
-    { const char *n = getenv("NNK_MOVIE_FRAMES");
-      p5t_frames = (n && n[0]) ? strtol(n, NULL, 0) : 0;
-      if (p5t_frames <= 0) {
-          fseek(p5t_fp, 0, SEEK_END);
-          p5t_frames = ftell(p5t_fp) / P5T_FRAME;
-          rewind(p5t_fp);
-      } }
     p5t_state = 2;
-    fprintf(stderr, "movie: hle source=%s frames=%ld plane=%dx%d\n",
-            p, p5t_frames, P5T_W, P5T_H);
+    fprintf(stderr, "movie: hle src1=%s src2=%s plane=%dx%d\n",
+            p, (getenv("NNK_MOVIE_YUV2") && getenv("NNK_MOVIE_YUV2")[0])
+                   ? getenv("NNK_MOVIE_YUV2") : "(src1)",
+            P5T_W, P5T_H);
+}
+
+/* Register a codec and open its frame source.  Stream 1 uses NNK_MOVIE_YUV,
+ * stream 2 NNK_MOVIE_YUV2 (falling back to stream 1's file), later sessions
+ * stream 1's file again — a session restart at a new codec address starts a
+ * new stream at frame 0, exactly like a new movie session on the real player. */
+static P5tStream *p5t_stream(uint32_t codec) {
+    P5tStream *s;
+    const char *p, *n;
+    int i;
+    for (i = 0; i < p5t_nstr; i++)
+        if (p5t_str[i].codec == codec) return &p5t_str[i];
+    if (p5t_nstr >= P5T_MAXSTREAM) {
+        fprintf(stderr, "movie: no stream slot for codec 0x%08X (dropped)\n", codec);
+        return NULL;
+    }
+    p = (p5t_nstr == 1) ? getenv("NNK_MOVIE_YUV2") : NULL;
+    if (!p || !p[0]) p = getenv("NNK_MOVIE_YUV");
+    s = &p5t_str[p5t_nstr];
+    s->codec = codec;
+    s->cursor = 0;
+    s->index = -1;
+    s->frames = 0;
+    s->presents = 0;
+    s->shortr = 0;
+    s->fp = fopen(p, "rb");
+    if (!s->fp) {
+        fprintf(stderr, "movie: stream %d cannot open %s\n", p5t_nstr, p);
+        return NULL;
+    }
+    n = getenv("NNK_MOVIE_FRAMES");
+    s->frames = (n && n[0]) ? strtol(n, NULL, 0) : 0;
+    if (s->frames <= 0) {
+        fseek(s->fp, 0, SEEK_END);
+        s->frames = ftell(s->fp) / P5T_FRAME;
+        rewind(s->fp);
+    }
+    if (s->frames <= 0) s->frames = 1;
+    fprintf(stderr, "movie: stream %d codec=0x%08X source=%s frames=%ld step=%llu\n",
+            p5t_nstr, codec, p, s->frames, (unsigned long long)steps);
+    p5t_nstr++;
+    return s;
+}
+
+/* Callback entry: remember which codec this decode step belongs to. */
+static void p5t_note_codec(uint32_t codec) {
+    if (!p5t_state) p5t_init();
+    if (p5t_state != 2) return;
+    if (!p5t_stream(codec)) return;
+    p5t_codec = codec;
 }
 
 /* Copy one 8-bit plane into a guest buffer; silently ignores addresses that
@@ -1281,51 +1345,55 @@ static int p5t_plane(uint32_t dst, const uint8_t *src, uint32_t n) {
     return 1;
 }
 
-/* Callback entry: remember the codec base for this movie session. */
-static void p5t_note_codec(uint32_t codec) {
-    if (p5t_state == 0) p5t_init();
-    if (p5t_state != 2) return;
-    if (codec != p5t_codec) {
-        if (p5t_codec)
-            fprintf(stderr, "movie: session codec 0x%08X -> 0x%08X at step %llu"
-                            " (last index %ld, presents %ld)\n",
-                    p5t_codec, codec, (unsigned long long)steps,
-                    p5t_index, p5t_presents);
-        p5t_codec = codec;
-        p5t_index = -1;
-        p5t_cursor = 0;
-    }
-}
-
-/* Callback return: replace this decode step's pixels with the host frame. */
+/* Callback return: replace this decode step's pixels with the host frame of
+ * THIS stream.  Only the current codec's six Y ring slots are written (the
+ * decoder's real output buffers, which the converter selects through
+ * [player+0x5C][[player+0xC4]]), so the two concurrent movies never write
+ * into each other's planes. */
 static void p5t_present(void) {
-    uint32_t cur, player, src;
+    P5tStream *s = NULL;
+    uint32_t cur, player;
     int i;
     if (p5t_state != 2) return;
-    cur = p5t_codec ? ld32(p5t_codec) : 0;
-    if (p5t_index < 0 || cur < p5t_cursor) p5t_index = 0;
-    else p5t_index++;
-    p5t_cursor = cur;
-    if (p5t_index >= p5t_frames) {          /* past EOF: hold the last frame */
-        p5t_index = p5t_frames - 1;
+    for (i = 0; i < p5t_nstr; i++)
+        if (p5t_str[i].codec == p5t_codec) s = &p5t_str[i];
+    if (!s || !s->fp) return;
+    cur = ld32(p5t_codec);
+    /* One source frame per decode step (measured: melonDS's ring holds
+     * consecutive op_u/op_d frames 125..130 at f130).  The stream cursor
+     * [codec] is NOT monotonic — it oscillates between two read positions
+     * (0x022E48E8/0x022E6A88/0x022E4A58/0x022E6B28 in the measured run) —
+     * so it must not be used to detect a session restart; a new session is a
+     * NEW codec address, which registers as a new stream at frame 0. */
+    if (s->index < 0) s->index = 0;
+    else s->index++;
+    s->cursor = cur;
+    if (s->index >= s->frames) {           /* past EOF: hold the last frame */
+        s->index = s->frames - 1;
     }
-    if (fseek(p5t_fp, (long)p5t_index * P5T_FRAME, SEEK_SET) != 0) return;
-    if (fread(p5t_buf, 1, P5T_FRAME, p5t_fp) != (size_t)P5T_FRAME) {
-        p5t_short++;
+    if (fseek(s->fp, (long)s->index * P5T_FRAME, SEEK_SET) != 0) return;
+    if (fread(p5t_buf, 1, P5T_FRAME, s->fp) != (size_t)P5T_FRAME) {
+        s->shortr++;
         return;
     }
-    player = P5T_PLAYER;
-    src = ld32(player + 0x3Cu);
-    p5t_plane(src, p5t_buf, P5T_YSZ);
-    p5t_plane(ld32(player + 0x40u), p5t_buf, P5T_YSZ);
+    /* The decoder's OUTPUT buffers are the codec's six Y ring slots
+     * (codec+0x0C..+0x20).  The player's own source-plane fields are NOT
+     * written here: overlay 13's present function (0x0207B2AC) fills
+     * player+0x3C/+0x40 from the arrays at player+0x5C/+0x60 — whose six
+     * entries ARE those ring slots (verified in both engines) — immediately
+     * before it calls the converter, so a write there is both unnecessary and
+     * (measured, Phase-5W) the exact field that once handed p5t_plane a stale
+     * destination.  The six slots cover every ring index the converter can
+     * select ([player+0xC4]). */
     for (i = 0; i < 6; i++)
         p5t_plane(ld32(p5t_codec + 0x0Cu + 4u * i), p5t_buf, P5T_YSZ);
-    p5t_presents++;
-    if (p5t_presents <= 4 || (p5t_presents % 60) == 0)
-        fprintf(stderr, "movie: present n=%ld frame=%ld cursor=0x%08X src=0x%08X"
-                        " step=%llu\n",
-                p5t_presents, p5t_index, cur, src,
-                (unsigned long long)steps);
+    player = p5t_codec - 0xE8u;
+    s->presents++;
+    if (s->presents <= 8 || (s->presents % 60) == 0)
+        fprintf(stderr, "movie: present stream=%d codec=0x%08X n=%ld frame=%ld"
+                        " cursor=0x%08X player=0x%08X slot0=0x%08X step=%llu\n",
+                (int)(s - p5t_str), p5t_codec, s->presents, s->index, cur,
+                player, ld32(p5t_codec + 0x0Cu), (unsigned long long)steps);
     fflush(stderr);
 }
 
