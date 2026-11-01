@@ -83,6 +83,11 @@ static unsigned long long smc_trace_from; /* NNK_SMC_TRACE_FROM: suppress
                                            * spent long before the interesting
                                            * window (Phase-5J). */
 static int smc_t_sticky;                  /* Phase-4Z: last resolved T bit */
+/* Phase-5AO: the step at which `smc_t_sticky` was set.  The sticky state is
+ * evidence about ONE dispatch — the one that immediately follows the live
+ * decode that resolved it.  After that it is a guess, and a stale guess is
+ * worse than the structural rule in smc_state_from_stride() below. */
+static unsigned long long smc_t_sticky_step;
 /* Phase-5C: the processor state CARRIED by an interworking branch.  The T bit
  * is part of the ARM9 state, not of the PC: a Thumb `blx <imm>` branches to an
  * ARM-state target (ARM ARM A7.1.4: BLX always switches state), while `bl`
@@ -161,6 +166,47 @@ void nnk_smc_note_branch(uint32_t raw) { smc_branch_mode(raw); }
 #define NNK_SMC_MAP_H 1
 static inline int nnk_pc_is_thumb(uint32_t pc) { (void)pc; return 0; }
 #endif
+
+/* Phase-5AO: the LAST structural rule before falling back to the sticky guess.
+ *
+ * An unrooted PC (no compiled case, no register carrying it, no interworking
+ * branch note) that is reached by FALL-THROUGH belongs to the same instruction
+ * stream as the instruction that just ran, and the stride of that instruction
+ * names the state outright: in this image a 2-byte successor is Thumb and a
+ * 4-byte successor is ARM (that is exactly the rule tools/split_dispatch.py
+ * uses to build nnk_pc_is_thumb from the emitted fall-throughs, only applied
+ * locally instead of from the compiled case set).
+ *
+ * Measured (Phase-5AO): arm9 0x0202A8F4 `bxcs lr` (compiled, ARM) falls
+ * through to 0x0202A8F8, which has NO compiled case.  smc_state_from_regs()
+ * found no register carrying 0x0202A8F8, so the ladder used `smc_t_sticky` —
+ * the state of the last LIVE decode, 190k steps and thousands of compiled
+ * ARM instructions earlier, which happened to be Thumb.  The handler
+ * (`ldrh r2,[r0,#2]; ldr r0,[r0,#4]; tst r2,#1; ...; bx lr`) was then decoded
+ * as Thumb garbage, whose fabricated branches walked 0x0202A8FA -> 0x0202AC9E
+ * -> 0x0202AEAE -> 0x0202B1B2 -> 0x0202B4F6 and then fell into the compiled
+ * ARM cases 0x0202B4F8..0x0202B50C with a Thumb-clobbered frame, so the
+ * epilogue `pop {r4,r5,r6,pc}` at 0x0202B50C popped 0x0213D114 (a pointer
+ * into ov17's read-only data tail) and executed the string "/data/Event/
+ * Demo/" as ARM until it halted on 0xEF746E65 at 0x0213D2AC.
+ *
+ * The sticky state is therefore only consulted when it is FRESH, i.e. when
+ * the instruction that just ran was itself live-decoded (same one-dispatch
+ * contract as smc_t_pc/smc_t_step above).  Returns -1 when nothing is known.
+ * `prev_pc` is the predecessor: last_pc still holds it when the dispatch
+ * ladder runs, but both callers must snapshot it BEFORE trace_pc(pc). */
+static int smc_state_from_stride(uint32_t pc, uint32_t prev_pc)
+{
+    if (smc_t_sticky_step && steps == smc_t_sticky_step + 1ull)
+        return smc_t_sticky;                       /* fresh live decode */
+    if (pc == prev_pc + 2u) return 1;              /* 2-byte (Thumb) stride */
+    if (pc == prev_pc + 4u)                        /* 4-byte stride: ARM,
+                                                    * unless the predecessor
+                                                    * is a known Thumb case
+                                                    * (a 32-bit Thumb-2 insn) */
+        return nnk_pc_is_thumb(prev_pc) ? 1 : 0;
+    return -1;                                     /* not a fall-through */
+}
 
 /* Phase-4Z: recover the processor state for a PC the map cannot classify.
  * nnk_pc_is_thumb() is built from the COMPILED cases whose emitter-written
@@ -1214,6 +1260,7 @@ static int smc_exec_thumb(uint32_t pc, uint32_t *npc, uint32_t *costp) {
  * the loop counts the step and skips the band switch. */
 int nnk_smc_try(uint32_t *pcp) {
     uint32_t pc = *pcp, o, w, iw, npc, cost;
+    uint32_t prev_pc = last_pc;                    /* Phase-5AO: predecessor */
     int thumb, rc;
 
     if (!smc_armed) return 0;
@@ -1256,6 +1303,7 @@ int nnk_smc_try(uint32_t *pcp) {
          * here as one ARM `ldrsh` (word 0xBDF81C20) instead of two Thumb ops,
          * which turned sp into 0x02E7FFF0 at the next ARM `andcs sp,r1,r1`. */
         int m = smc_state_from_regs(pc);
+        if (m < 0) m = smc_state_from_stride(pc, prev_pc);   /* Phase-5AO */
         if (m < 0) m = smc_t_sticky;
         thumb = (m > 0);
       } }
@@ -1278,6 +1326,7 @@ int nnk_smc_try(uint32_t *pcp) {
     }
     card_tick(cost);
     smc_t_sticky = thumb;                 /* Phase-5J: this pc's resolved state */
+    smc_t_sticky_step = steps;            /* Phase-5AO: fresh for one dispatch */
     if (smc_trace_left > 0 && steps >= smc_trace_from) {
         smc_trace_left--;
         fprintf(stderr, "smc: redecoded step=%llu pc=0x%08X img=0x%08X word=0x%08X "
@@ -1792,6 +1841,7 @@ static void p5u_track(uint32_t pc) {
 
 int nnk_smc_exec_any(uint32_t *pcp) {
     uint32_t pc = *pcp, o, w, npc = 0, cost = 0;
+    uint32_t prev_pc = last_pc;                    /* Phase-5AO: predecessor */
     int thumb, rc;
 
 
@@ -1825,6 +1875,7 @@ int nnk_smc_exec_any(uint32_t *pcp) {
     { int st; if (smc_carried_thumb(pc, &st)) { thumb = st; goto smc_mode_done; } }
     if (!thumb) {
         int m = smc_state_from_regs(pc);
+        if (m < 0) m = smc_state_from_stride(pc, prev_pc);   /* Phase-5AO */
         if (m < 0) m = smc_t_sticky;
         thumb = (m > 0);
     }
@@ -1848,6 +1899,7 @@ int nnk_smc_exec_any(uint32_t *pcp) {
         return 0;
     }
     smc_t_sticky = thumb;                 /* Phase-4Z: the T bit this pc resolved to */
+    smc_t_sticky_step = steps;            /* Phase-5AO: fresh for one dispatch */
     smc_ninsn++;
     card_tick(cost);
     if (smc_trace_left > 0 && steps >= smc_trace_from) {
