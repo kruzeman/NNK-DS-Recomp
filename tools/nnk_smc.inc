@@ -447,8 +447,21 @@ static inline void smc_note(uint32_t a, uint32_t n) {
 }
 
 /* ---- decode helpers ----------------------------------------------------- */
+/* Phase-5AM: a Thumb R15 read is (pc + 4) with bit0 clear and NOTHING else
+ * masked.  GCC's Thumb switch idiom is
+ *     add  r3, pc        @ r3 = table base = (address of add) + 4
+ *     ldrh r3, [r3, #6]
+ *     add  pc, r3        @ pc = (address of add pc) + 4 + entry
+ * and the table sits immediately after `add pc`, so the base is often 2 mod 4
+ * (measured: 0x020DDE9E -> entries at 0x020DDEA4).  The old `& ~3u` moved the
+ * base two bytes down, so the table load returned the `add pc, r3` instruction
+ * word itself (0x449F at 0x020DDEA2) and the guest jumped to 0x020E2344 — an
+ * unrelated ov17 constructor — instead of case 0 (0x020DDEAC).  melonDS is the
+ * reference: its Thumb interpreter reads R[15] as (instruction address + 4)
+ * with no alignment mask.  Formats 6 (LDR literal) and 12 (ADR) keep their
+ * explicit `(pc + 4u) & ~3u` below. */
 static inline uint32_t smc_reg(uint32_t idx, uint32_t pc, int thumb) {
-    if (idx == 15u) return thumb ? ((pc + 4u) & ~3u) : (pc + 8u);
+    if (idx == 15u) return thumb ? (pc + 4u) : (pc + 8u);
     return r[idx];
 }
 
@@ -937,7 +950,8 @@ static int smc_exec_thumb(uint32_t pc, uint32_t *npc, uint32_t *costp) {
         switch ((hw >> 8) & 3u) {
         case 0:
             /* Phase-5I: BOTH operands go through smc_reg, so `add rd, pc`
-             * reads the PC (Thumb: (pc+4) & ~3) instead of the stale
+             * reads the PC (Thumb: (pc+4), unaligned — Phase-5AM) instead of
+             * the stale
              * register slot r[15].  Measured at 0x020D24E0
              * (`add r0, pc`, 0x4478): the old code used r[rs] = r[15] = 0,
              * so the jump-table base became r[0]'s old value; the table
