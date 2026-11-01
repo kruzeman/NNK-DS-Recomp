@@ -1799,3 +1799,155 @@ fn movie_hle_requires_a_readable_source() {
         "regression: the per-stream open failure stopped being reported"
     );
 }
+
+/// Phase-5AD, class 41: the movie session ends on a **skip key edge**, not on a
+/// starved ring — and the measured band defects of Phase-5AC came from the
+/// input script, not from the renderer or the HLE.
+///
+/// Measured (Phase-5AD, same shadow-fixed binary, same canonical pair):
+///   * with `tools/nnk_operator_session.nnk` the decode driver 0x0207B1D0 is
+///     first called at step 323,391,401 (display frame 578) and presents
+///     exactly 7 frames per stream; the last present is at step 326,421,022,
+///     and the player's frame loop 0x0207D124..0x0207D2E8 then leaves at step
+///     327,550,216 through `bne 0x0207D2EC` with `r1 = 8` (Start) —
+///     `NNK_DEBUG_AT_PC=0x0207D248`;
+///   * at that moment `player+0x0C` = 0x525 = 1317 (MODS frame total) while
+///     `player+0x98` = 7 (frames decoded) and `player+0x9C` = 1 <= `+0xA0` = 7,
+///     so neither the "finished" return at 0x0207AFC4 (`[0x98] == [0x0C]`) nor
+///     the ring-full early return at 0x0207B1DC (`[0x9C] > [0xA0]`) can be the
+///     exit;
+///   * the only other exit of the loop 0x0207D124..0x0207D2E8 is the A/Start
+///     edge (`and r1, r0, #9` at 0x0207D230, `bne 0x0207D2EC` at 0x0207D248) —
+///     and the operator script presses Start every 36 display frames from
+///     frame 13 on;
+///   * the control run with the schedule cut after frame 555 presents the
+///     identical 14 lines (n=1..7, same steps to the step) and then continues:
+///     n=8 at step 327,673,343 — removing one later press extends the session,
+///     so the ring was never the limit.
+///
+/// Locked here: (a) the script's press cadence, so a future band measurement
+/// cannot silently keep a script that skips the movie; (b) the two exonerated
+/// guards arithmetically; (c) the witness line this phase added, so a later
+/// phase cannot drop the instrument that made the measurement possible.
+#[test]
+fn movie_session_ends_on_the_skip_key_edge_not_a_starved_ring() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+
+    // (a) the operator session is a continuous Start mash, and it has a press
+    //     in the movie window (frame 589) as well as one before it (553).
+    let script = std::fs::read_to_string(root.join("tools/nnk_operator_session.nnk"))
+        .expect("cannot read tools/nnk_operator_session.nnk");
+    let mut keys: Vec<(u32, u32)> = Vec::new();
+    for line in script.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut it = line.split_whitespace();
+        let (f, m) = match (it.next(), it.next()) {
+            (Some(f), Some(m)) => (f, m),
+            _ => continue,
+        };
+        let frame: u32 = f.parse().expect("frame index");
+        let mask = u32::from_str_radix(m.trim_start_matches("0x"), 16).expect("mask");
+        keys.push((frame, mask));
+    }
+    assert!(keys.len() >= 100, "regression: the operator session shrank to {} entries", keys.len());
+    const START: u32 = 0x3F7;
+    const IDLE: u32 = 0x3FF;
+    let start_frames: Vec<u32> = keys.iter().filter(|k| k.1 == START).map(|k| k.0).collect();
+    assert!(start_frames.len() >= 30, "regression: the Start cadence is gone ({} presses)", start_frames.len());
+    assert_eq!(start_frames[0], 13, "fixture: the first Start press is at frame 13");
+    for w in start_frames.windows(2) {
+        let d = w[1] - w[0];
+        assert!(
+            d == 36 || (d == 72 && w[0] == 877),
+            "fixture: Start cadence changed at frame {} (gap {}) — the 72-frame gap is the \
+             operator's A press at frame 917 replacing one Start",
+            w[0], d
+        );
+    }
+    assert!(start_frames.contains(&589), "regression: the press that ends the movie session (frame 589) left the script");
+    assert!(start_frames.contains(&553), "fixture: the last press before the session starts is at frame 553");
+    assert!(keys.iter().any(|k| k.0 == 917 && k.1 == 0x3FE),
+        "fixture: the operator's A press at frame 917 (the movie skip) is gone");
+    assert_eq!(keys.last().map(|k| k.1), Some(IDLE), "fixture: the session must end idle (no stuck key)");
+
+    // (b) the two guards the card suspected, arithmetically exonerated with the
+    //     measured words at the stop.
+    let total_frames = 0x525u32;             // player+0x0C at the stop
+    let decoded = 7u32;                       // player+0x98
+    let presented = 7u32;                     // player+0xA0
+    let ring_other = 1u32;                    // player+0x9C
+    assert_eq!(total_frames, 1317, "fixture: op_u carries 1317 frames (MODS header)");
+    assert_ne!(decoded, total_frames, "the 'movie finished' return at 0x0207AFC4 must not fire at the stop");
+    assert!(ring_other <= presented, "the ring-full early return at 0x0207B1DC must not fire at the stop");
+    assert_eq!(decoded, presented, "one present per decode step (measured: 7 and 7)");
+    // The measured ordering that pins the exit to the skip edge: the last
+    // present, then the taken `bne` at 0x0207D248, then — in the control where
+    // that press is removed — the 8th present.
+    let last_present: u64 = 326_421_022;
+    let skip_exit: u64 = 327_550_216;
+    let control_present8: u64 = 327_673_343;
+    assert!(last_present < skip_exit && skip_exit < control_present8,
+        "fixture: the skip edge must sit between the last present and the control's 8th present");
+    assert_eq!(0x0207_D248u32 - 0x0207_D230u32, 6 * 4,
+        "fixture: `and r1, r0, #9` is the 6th instruction before the `bne`");
+
+    // A re-implementation of the loop's exit decision from the disassembly: the
+    // session ends only on (i) finished, (ii) ring full, (iii) an A/Start edge.
+    let skip_mask = |k: &[(u32, u32)], frame: u32| -> u32 {
+        let mut v = IDLE;
+        for (f, m) in k {
+            if *f <= frame {
+                v = *m;
+            }
+        }
+        !v & 0x9                          // active-low: A = bit 0, Start = bit 3
+    };
+    assert_eq!(skip_mask(&keys, 553), 0x8, "fixture: frame 553 is a Start press");
+    assert_eq!(skip_mask(&keys, 588), 0, "fixture: Start is released again at frame 555");
+    assert_eq!(skip_mask(&keys, 589), 0x8, "fixture: frame 589 is the Start press that ends the session");
+    let mut session_frames = 0u32;
+    let mut ended_by_skip = false;
+    for frame in 578u32..=700 {
+        // The two non-key exits are evaluated with the measured stop words: the
+        // "finished" test needs [0x98] to have reached 1317 (it is 7), the
+        // ring-full test is false at the stop (checked above).
+        if decoded >= total_frames || ring_other > presented {
+            break;
+        }
+        if skip_mask(&keys, frame) != 0 {
+            ended_by_skip = true;
+            break;
+        }
+        session_frames += 1;
+    }
+    assert!(ended_by_skip, "regression: the scripted session must end on a skip edge");
+    assert!(session_frames > 7 && session_frames < total_frames,
+        "fixture: the scripted session dies inside the movie ({} frames)", session_frames);
+    // The control: cut the schedule after frame 555 and there is no skip edge
+    // left in the same window, so the loop must keep going (measured: the 8th
+    // present appears at step 327,673,343 instead of never).
+    let control: Vec<(u32, u32)> = keys.iter().cloned().filter(|k| k.0 <= 555).collect();
+    assert_eq!(skip_mask(&control, 589), 0,
+        "regression: the frame-555 control must leave no skip edge at frame 589");
+    assert_eq!(skip_mask(&control, 700), 0, "fixture: the control has no press after frame 555");
+
+    // (c) the witness line that made this measurable must survive.
+    let inc = std::fs::read_to_string(root.join("tools/nnk_smc.inc"))
+        .expect("cannot read tools/nnk_smc.inc");
+    for needle in [
+        "pA[98]=%08X [9C]=%08X [A0]=%08X [A8]=%08X [AC]=%08X [B0]=%08X",
+        "hd[00]=%08X [04]=%08X [08]=%08X [0C]=%08X",
+        "clk[0C]=%08X [10]=%08X [14]=%08X",
+        "ld32(p + 0x9Cu), ld32(p + 0xA0u)",
+        "ld32(p + 0x0Cu), ld32(p + 0x10u), ld32(p + 0x14u)",
+    ] {
+        assert!(inc.contains(needle), "regression: the Phase-5AD witness field is gone: {needle}");
+    }
+    // The added fields are reads only: no guest-visible store in the block.
+    let sample = inc.find("pA[98]=%08X").expect("witness line");
+    let block = &inc[sample..(sample + 4000).min(inc.len())];
+    assert!(!block.contains("st32(p"), "regression: the p5u sample must not write guest state");
+}

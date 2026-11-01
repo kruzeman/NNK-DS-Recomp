@@ -360,3 +360,33 @@ first poll, while melonDS schedules `ROMTransfer_ReceiveData` after
 0x02016B30 polls **909** times in melonDS before data appears. Cart transfer
 latency, not cart data — still open.
 
+## 12. Movies: the canonical configuration (Phase-5AD)
+
+The intro movies are raw 256x192 yuv420p files, **paths, not flags**:
+
+```
+export NNK_MOVIE_YUV=<op_u.yuv>      # top screen  (codec 0x0227834C)
+export NNK_MOVIE_YUV2=<op_d.yuv>     # bottom screen (codec 0x022E8B74)
+```
+
+* `NNK_MOVIE_YUV=1` (or any non-file) is **HLE OFF** and says so on stderr: the
+  guest's own decoder runs instead (Phase-5AC, class 40).
+* The HLE presents one host frame per decode step into the current codec's six
+  Y ring slots; the guest's own YCoCg converter/compositor then puts it on
+  screen.  Nothing in the renderer needs a knob.
+* **`tools/nnk_operator_session.nnk` skips the intro.**  It presses Start every
+  36 display frames from frame 13, and the movie player leaves its frame loop
+  on an A/Start edge (0x0207D22C..0x0207D248, overlay 13): measured, the
+  scripted session starts at display frame 578, presents 7 frames, and ends at
+  step 326,421,022 when the frame-589 press arrives.  A band measurement at
+  `f4000 .. f4300` therefore must be **unscripted** (or use a schedule with no
+  presses after the movie window); see PHASE5AD.md.
+* Film-frame pacing is the guest's (~1 decoded frame per 5.6 display frames),
+  not one per display frame — it matches melonDS's ring at the same window.
+
+Audit a capture directory (per-frame luma correlation against a stream, plus
+side-by-side PNGs):
+
+```
+python3 tools/p5ad_band.py <shot-dir> <op_u.yuv> <png-out> 4000 4300 p5ad 600
+```
