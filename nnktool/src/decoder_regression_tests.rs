@@ -2089,3 +2089,110 @@ fn phase_5ae_per_step_caches_are_bit_exact() {
         "regression: the timer tick divides on every step again"
     );
 }
+
+// ---------------------------------------------------------------------------
+// class 43 (Phase-5AF): the overlay map is the ROM's table, not a per-load dump
+// ---------------------------------------------------------------------------
+/// Overlay arenas produced several "untranslated pc" barriers, and the runtime
+/// knew about them only through per-load RAM dumps (Phase-4G) -- and the frozen
+/// image the acceptance runs are built from carried no overlay knowledge at
+/// all.  Phase-5AF makes the map table-driven: the ROM's 21-entry ARM9 overlay
+/// table (OVT) supplies base / code size / bss / static-constructor range for
+/// every overlay, the runtime reports an untranslated PC against it, and the
+/// build splices the identical canonical block into the frozen image.
+///
+/// Locked here (no game bytes needed -- the tool's --self-test parses a
+/// synthetic ROM built inside the test process):
+///   1. the measured OVT field offsets (id@+0, ram@+4, size@+8, bss@+0xC,
+///      ctor@+0x10/+0x14, file_id@+0x18, flags|stored@+0x1C) and the
+///      code/bss/ctor classification agree between tools/ovl_table.py's
+///      self-test and the runtime's parser;
+///   2. the emitter's registry block assigns every one of those fields;
+///   3. the untranslated-PC path reports through the table instead of halting
+///      with a bare address, and the dump hooks exist;
+///   4. tools/build_split.sh splices that block into a frozen image, and the
+///      splice copies the canonical text rather than a second copy of it.
+#[test]
+fn phase_5af_overlay_map_is_table_driven() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+
+    // (1) the tool's parser: offsets + classification, exercised on a synthetic
+    // 4-overlay ROM (two overlays in one arena = the aliasing case).
+    let out = std::process::Command::new("python3")
+        .arg(root.join("tools/ovl_table.py"))
+        .arg("--self-test")
+        .output()
+        .expect("cannot run tools/ovl_table.py --self-test");
+    assert!(
+        out.status.success(),
+        "tools/ovl_table.py --self-test failed:\n{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let tool = std::fs::read_to_string(root.join("tools/ovl_table.py"))
+        .expect("cannot read tools/ovl_table.py");
+    for needle in [
+        "F_ID, F_RAM, F_SIZE, F_BSS, F_CTOR_LO, F_CTOR_HI, F_FILE, F_FLAGS = range(0, 8)",
+        "id=w[F_ID], base=w[F_RAM], size=w[F_SIZE], bss=w[F_BSS],",
+        "ctor_lo=w[F_CTOR_LO], ctor_hi=w[F_CTOR_HI], file_id=file_id,",
+        "flags & 0x01000000",
+        "kind = 'ctor'",
+    ] {
+        assert!(tool.contains(needle), "regression: ovl_table.py lost {needle:?}");
+    }
+
+    // (2) the emitter's canonical block carries the whole table.
+    let rs = std::fs::read_to_string(root.join("nnktool/src/recompile.rs"))
+        .expect("cannot read nnktool/src/recompile.rs");
+    let begin = rs.find("BEGIN_NNK_OVL_BLOCK").expect("overlay block markers missing");
+    let end = rs.find("END_NNK_OVL_BLOCK").expect("overlay block markers missing");
+    let block = &rs[begin..end];
+    for needle in [
+        "ovl_tab[ovl_n].id = ovl_rd32(o);",
+        "ovl_tab[ovl_n].ram = ovl_rd32(o + 4u);",
+        "ovl_tab[ovl_n].ram_size = ovl_rd32(o + 8u);",
+        "ovl_tab[ovl_n].bss = ovl_rd32(o + 12u);",
+        "ovl_tab[ovl_n].ctor_lo = ovl_rd32(o + 16u);",
+        "ovl_tab[ovl_n].ctor_hi = ovl_rd32(o + 20u);",
+        "static void io_ovl_table_dump(const char *path)",
+        "static void io_ovl_pc_report(uint32_t pc)",
+        "kind = \"ctor\"",
+        "static void io_ovl_dump_tick(uint32_t pc)",
+        "static void io_ovl_dump_exit(void)",
+    ] {
+        assert!(block.contains(needle), "regression: overlay block lost {needle:?}");
+    }
+
+    // (3) the untranslated-PC path must classify through the table first.
+    let default_arm = r#"            io_ovl_pc_report(pc);   /* Phase-5AF */\n            halt_reason(\"dispatch to untranslated pc\");"#;
+    assert!(
+        rs.contains(default_arm),
+        "regression: an untranslated PC halts without the table-driven overlay report"
+    );
+    let run_hook = r#"        io_ovl_dump_tick(pc);   /* Phase-5AF */\n        switch (pc) {"#;
+    assert!(rs.contains(run_hook), "regression: the arena dump hook left the dispatch loop");
+
+    // (4) the build must splice it into a frozen image, from the SAME text.
+    let build = std::fs::read_to_string(root.join("tools/build_split.sh"))
+        .expect("cannot read tools/build_split.sh");
+    assert!(
+        build.contains("p5af_ovl_table_splice.py") && build.contains("io_ovl_pc_report"),
+        "regression: the frozen image would be built without the overlay table"
+    );
+    let splice = std::fs::read_to_string(root.join("tools/p5af_ovl_table_splice.py"))
+        .expect("cannot read tools/p5af_ovl_table_splice.py");
+    assert!(
+        splice.contains("BEGIN_NNK_OVL_BLOCK") && splice.contains("nnktool', 'src', 'recompile.rs'"),
+        "regression: the splice kept its own copy of the block instead of the canonical one"
+    );
+    for hook in [
+        "static void io_load_rom(void) {",
+        "    fclose(f); rom_loaded = 1;\\n",
+        "    card_op = card_cmd[0];\\n",
+        "static void run(void) {",
+        "        switch (pc) {\\n",
+        "            halt_reason(\"dispatch to untranslated pc\");\\n",
+    ] {
+        assert!(splice.contains(hook), "regression: splice lost the anchor {hook:?}");
+    }
+}

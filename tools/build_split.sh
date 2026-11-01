@@ -126,6 +126,18 @@ if [[ -f "$IMAGE" ]] && ! grep -q 'nnk_probe_mask' "$IMAGE"; then
   python3 tools/p5ae_runtime_splice.py "$IMAGE" "$SPLICED_IMAGE2"
   IMAGE=$SPLICED_IMAGE2
 fi
+# Phase-5AF: the frozen image carries no overlay knowledge at all (it predates
+# the Phase-4G registry), so the table-driven overlay map -- the ROM's 21-entry
+# OVT with base/size/bss/ctor, the load-event registry, the arena dumps and the
+# untranslated-pc classification -- is spliced in from the canonical block in
+# nnktool/src/recompile.rs.  Same policy: no-op when it is already there.
+if [[ -f "$IMAGE" ]] && ! grep -q 'io_ovl_pc_report' "$IMAGE"; then
+  SPLICED_IMAGE3="$(dirname "$SPLIT")/$(basename "$IMAGE" .c).p5af.c"
+  mkdir -p "$(dirname "$SPLICED_IMAGE3")"
+  echo "== prelude splice (Phase-5AF): table-driven overlay registry -> $SPLICED_IMAGE3 =="
+  python3 tools/p5af_ovl_table_splice.py "$IMAGE" "$SPLICED_IMAGE3"
+  IMAGE=$SPLICED_IMAGE3
+fi
 
 if [[ "$GX" == "1" ]]; then
   [[ -f "$GXDIR/Makefile" ]] || { echo "NNK_GX=1 but $GXDIR/Makefile missing" >&2; exit 2; }

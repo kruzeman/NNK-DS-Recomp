@@ -1347,13 +1347,13 @@ pub fn recompile_all(
     ));
     src.push_str(RUNTIME_ALL);
     src.push_str(
-        "static void run(void) {\n    uint32_t pc = ENTRY_CONST;\n    for (;;) {\n        if (++steps > step_limit) { halt_reason(\"step budget exhausted\"); return; }\n        arm7_evt_tick();\n        irq_tick();\n        if (irq_active && pc >= BIOS_IRQ_LO) { bios_irq_return(&pc); }\n        else if (!irq_active\n                 && (irq_trig_n >= IRQ_TRIG_N || steps > irq_trig_log[irq_trig_n])\n                 && ime && (ie & iflags) && !(cpsr_ctl & 0x80u)) {\n            irq_trig_n++;\n            irq_enter(&pc);\n        }\n        switch (pc) {\n",
+        "static void run(void) {\n    uint32_t pc = ENTRY_CONST;\n    for (;;) {\n        if (++steps > step_limit) { halt_reason(\"step budget exhausted\"); return; }\n        arm7_evt_tick();\n        irq_tick();\n        if (irq_active && pc >= BIOS_IRQ_LO) { bios_irq_return(&pc); }\n        else if (!irq_active\n                 && (irq_trig_n >= IRQ_TRIG_N || steps > irq_trig_log[irq_trig_n])\n                 && ime && (ie & iflags) && !(cpsr_ctl & 0x80u)) {\n            irq_trig_n++;\n            irq_enter(&pc);\n        }\n        io_ovl_dump_tick(pc);   /* Phase-5AF */\n        switch (pc) {\n",
     );
     for (case, _) in cases.values() {
         src.push_str(case);
     }
     src.push_str(
-        "        default:\n            fprintf(stderr, \"untranslated pc=0x%08x\\n\", pc);\n            halt_reason(\"dispatch to untranslated pc\");\n            return;\n        }\n    }\n}\n\n",
+        "        default:\n            fprintf(stderr, \"untranslated pc=0x%08x\\n\", pc);\n            io_ovl_pc_report(pc);   /* Phase-5AF */\n            halt_reason(\"dispatch to untranslated pc\");\n            return;\n        }\n    }\n}\n\n",
     );
     src.push_str(RUNTIME_ALL_MAIN);
 
@@ -2002,30 +2002,84 @@ static void io_load_rom(void) {
     io_ovl_init();
 }
 
-/* ---- overlay-slot registry + per-load overlay dumps (Phase-4G) -----------
+/* ---- overlay-slot registry + table-driven overlay map (Phase-4G, 5AF) ----
  * The dispatch image has ONE case per PC, but a NITRO overlay ARENA holds a
  * different module per load (overlays 0..13 all load at 0x02079F80, 14..16 at
  * 0x020C18E0, 17..18 at 0x020D0A00, 19..20 at 0x02159FE0), and the guest
  * decrypts + initialises pages of the resident module at run time.  This
  * registry is the one place that answers "which overlay is resident in which
- * arena, in which load generation", derived from the card transfers the guest
- * actually performs (a 0xB7 read whose address is the first byte of an ARM9
- * overlay's FAT range IS that overlay's load) plus the ROM's overlay table.
+ * arena, in which load generation, and does this PC belong to it" -- derived
+ * from the ROM's own overlay table + the card transfers the guest performs.
  *
- *   NNK_OVL_TRACE=<path>  write one `ovl_load ...` line per load; this is the
- *                         build-time input of tools/ovl_registry.py --trace
+ * Phase-5AF: the registry now carries the WHOLE table the ROM publishes --
+ * base, code size, bss size and the static-constructor (sinit) range of every
+ * overlay, cross-checked field for field against the dsd extract in
+ * DSD_OVERLAYS.md -- so a dispatch halt in overlay space is answered from
+ * data: `ovl_pc` names the candidate modules by arena offset, says whether the
+ * address is code / bss / a ctor slot, and which module is resident there.
+ *
+ *   NNK_OVL_TRACE=<path>  one `ovl_load ...` line per load (build-time input
+ *                         of tools/ovl_registry.py --trace)
+ *   NNK_OVL_TABLE=<path>  dump the parsed table (id, base, size, bss, ctor
+ *                         range, ROM range) -- the number the doc quotes
+ *   NNK_OVL_DUMP=<dir>    write the resident arena's live bytes to
+ *                         arena_<base>_ov<id>_first_gen<g>.bin at the first
+ *                         dispatch into the module after each load, and
+ *                         ..._exit_gen<g>.bin for the resident module at halt
+ *                         (the "memory image after the load" the cross-check
+ *                         against the extracted overlay files compares)
  */
-static struct { uint32_t file_id, rom_off, rom_end, ram, ram_size; } ovl_tab[32];
+/* BEGIN_NNK_OVL_BLOCK (tools/p5af_ovl_table_splice.py copies this text into a
+ * frozen dispatch image verbatim, so the canonical source and the shipped build
+ * cannot drift) */
+static struct {
+    uint32_t id;                 /* OVT +0x00 overlay id */
+    uint32_t file_id;            /* OVT +0x18 FAT index */
+    uint32_t rom_off, rom_end;   /* FAT entry of file_id */
+    uint32_t ram;                /* OVT +0x04 load base */
+    uint32_t ram_size;           /* OVT +0x08 code size the loader copies */
+    uint32_t bss;                /* OVT +0x0C bss size it zero-fills */
+    uint32_t ctor_lo, ctor_hi;   /* OVT +0x10/+0x14 static-ctor array */
+    int mid_noted;               /* first-mid-stream-read note emitted */
+} ovl_tab[32];
 static int ovl_n;
 static struct { uint32_t arena; int id; int gen; } ovl_arena[8];
 static int ovl_arena_n;
 static FILE *ovl_fp;
 static int ovl_init_done, ovl_load_seq;
+static int ovl_dump_on;
+static char ovl_dump_dir[512];
+static int ovl_dump_gen[8];
+static int ovl_dump_gen_init;
 
 static uint32_t ovl_rd32(size_t o) {
     if (!rom || o + 4u > rom_len) return 0;
     return (uint32_t)rom[o] | ((uint32_t)rom[o + 1u] << 8) |
            ((uint32_t)rom[o + 2u] << 16) | ((uint32_t)rom[o + 3u] << 24);
+}
+static void io_ovl_dump_arena(int j, const char *tag, uint32_t pc);
+static inline uint32_t ld16(uint32_t a);   /* defined later in the prelude */
+
+/* id -> table index (-1 when the table has no such id) */
+static int io_ovl_index(uint32_t id) {
+    int i;
+    for (i = 0; i < ovl_n; i++) if (ovl_tab[i].id == id) return i;
+    return -1;
+}
+static void io_ovl_table_dump(const char *path) {
+    FILE *f = fopen(path, "w");
+    int i;
+    if (!f) { fprintf(stderr, "io: NNK_OVL_TABLE: cannot open %s\n", path); return; }
+    fprintf(f, "# ARM9 overlay table parsed from NNK_ROM_PATH (%d entries)\n", ovl_n);
+    fprintf(f, "# id\tbase\tsize\tbss\tend\tctor_lo\tctor_hi\trom_off\tstored\tfile_id\n");
+    for (i = 0; i < ovl_n; i++)
+        fprintf(f, "%u\t0x%08X\t0x%X\t0x%X\t0x%08X\t0x%08X\t0x%08X\t0x%08X\t0x%X\t%u\n",
+                ovl_tab[i].id, ovl_tab[i].ram, ovl_tab[i].ram_size, ovl_tab[i].bss,
+                ovl_tab[i].ram + ovl_tab[i].ram_size + ovl_tab[i].bss,
+                ovl_tab[i].ctor_lo, ovl_tab[i].ctor_hi, ovl_tab[i].rom_off,
+                ovl_tab[i].rom_end - ovl_tab[i].rom_off, ovl_tab[i].file_id);
+    fclose(f);
+    fprintf(stderr, "io: overlay table (%d overlays) -> %s\n", ovl_n, path);
 }
 static void io_ovl_init(void) {
     const char *p;
@@ -2040,11 +2094,16 @@ static void io_ovl_init(void) {
             size_t o = (size_t)ovt_off + 32u * (size_t)i;
             uint32_t file_id = ovl_rd32(o + 24u);
             if ((size_t)fat_off + 8u * (size_t)file_id + 8u > rom_len) continue;
+            ovl_tab[ovl_n].id = ovl_rd32(o);        /* this ROM's OVT carries the id */
             ovl_tab[ovl_n].file_id = file_id;
             ovl_tab[ovl_n].rom_off = ovl_rd32((size_t)fat_off + 8u * (size_t)file_id);
             ovl_tab[ovl_n].rom_end = ovl_rd32((size_t)fat_off + 8u * (size_t)file_id + 4u);
             ovl_tab[ovl_n].ram = ovl_rd32(o + 4u);
             ovl_tab[ovl_n].ram_size = ovl_rd32(o + 8u);
+            ovl_tab[ovl_n].bss = ovl_rd32(o + 12u);
+            ovl_tab[ovl_n].ctor_lo = ovl_rd32(o + 16u);
+            ovl_tab[ovl_n].ctor_hi = ovl_rd32(o + 20u);
+            ovl_tab[ovl_n].mid_noted = 0;
             ovl_n++;
         }
     }
@@ -2053,15 +2112,109 @@ static void io_ovl_init(void) {
         ovl_fp = fopen(p, "w");
         if (ovl_fp) setvbuf(ovl_fp, NULL, _IOLBF, 0);
     }
+    p = getenv("NNK_OVL_DUMP");
+    if (p && p[0]) { ovl_dump_on = 1; snprintf(ovl_dump_dir, sizeof ovl_dump_dir, "%s", p); }
     if (ovl_n)
-        fprintf(stderr, "io: overlay registry: %d ARM9 overlays from the ROM overlay table\\n", ovl_n);
+        fprintf(stderr, "io: overlay registry: %d ARM9 overlays from the ROM overlay table\n", ovl_n);
+    p = getenv("NNK_OVL_TABLE");
+    if (p && p[0]) io_ovl_table_dump(p);
+}
+/* Write one arena's live bytes (the resident module's code_size window, i.e.
+ * what the guest is actually running after the load) to ovl_dump_dir. */
+static void io_ovl_dump_arena(int j, const char *tag, uint32_t pc) {
+    int k = ovl_arena[j].id;
+    char path[640];
+    FILE *f;
+    uint32_t i, base, n;
+    if (!ovl_dump_on || k < 0 || k >= ovl_n) return;
+    base = ovl_tab[k].ram; n = ovl_tab[k].ram_size;
+    snprintf(path, sizeof path, "%s/arena_%08X_ov%02u_%s_gen%d.bin",
+             ovl_dump_dir, ovl_arena[j].arena, ovl_tab[k].id, tag, ovl_arena[j].gen);
+    f = fopen(path, "wb");
+    if (!f) { fprintf(stderr, "io: cannot write %s\n", path); return; }
+    for (i = 0; i < n; i++) fputc((int)(ld16(base + i) & 0xFFu), f);
+    fclose(f);
+    fprintf(stderr, "ovl: dump %s base=0x%08X size=0x%X pc=0x%08X step=%llu\n",
+            path, base, n, pc, (unsigned long long)steps);
+}
+/* Per-dispatch hook (cheap: one flag test unless NNK_OVL_DUMP is set): the
+ * first PC executed inside the resident module after a load is the moment the
+ * loader has finished writing it, which is the image the cross-check wants. */
+static void io_ovl_dump_tick(uint32_t pc) {
+    int j;
+    if (!ovl_dump_on) return;
+    if (!ovl_init_done) io_ovl_init();
+    if (!ovl_dump_gen_init) {
+        ovl_dump_gen_init = 1;
+        for (j = 0; j < 8; j++) ovl_dump_gen[j] = -1;
+    }
+    for (j = 0; j < ovl_arena_n; j++) {
+        int k = ovl_arena[j].id;
+        if (k < 0 || k >= ovl_n) continue;
+        if (ovl_dump_gen[j] == ovl_arena[j].gen) continue;
+        if (pc < ovl_tab[k].ram || pc >= ovl_tab[k].ram + ovl_tab[k].ram_size) continue;
+        ovl_dump_gen[j] = ovl_arena[j].gen;
+        io_ovl_dump_arena(j, "first", pc);
+    }
+}
+static void io_ovl_dump_exit(void) {
+    int j;
+    if (!ovl_dump_on) return;
+    for (j = 0; j < ovl_arena_n; j++) io_ovl_dump_arena(j, "exit", last_pc);
+}
+/* Table-driven classification of an untranslated PC.  This is the Phase-5AF
+ * answer to the "untranslated pc" class: instead of a bare halt the run says
+ * which overlay arena the address falls in, which modules could own it, at
+ * what offset, whether that offset is code / bss / a ctor slot, and which
+ * module was actually resident there.  A ctor hit is the C++-constructor
+ * class; a hit at a module code offset is an overlay the image never
+ * translated (or a load we never saw). */
+static void io_ovl_pc_report(uint32_t pc) {
+    int i, j, hits = 0;
+    if (!ovl_init_done) io_ovl_init();
+    for (i = 0; i < ovl_n; i++) {
+        uint32_t end = ovl_tab[i].ram + ovl_tab[i].ram_size + ovl_tab[i].bss;
+        const char *kind;
+        int resident = -1, rgen = 0;
+        uint32_t roff = 0;
+        if (pc < ovl_tab[i].ram || pc >= end) continue;
+        if (pc >= ovl_tab[i].ram + ovl_tab[i].ram_size)
+            kind = ovl_tab[i].bss ? "bss" : "past-code";
+        else
+            kind = "code";
+        if (ovl_tab[i].ctor_lo <= pc && pc < ovl_tab[i].ctor_hi) kind = "ctor";
+        for (j = 0; j < ovl_arena_n; j++)
+            if (ovl_arena[j].arena == ovl_tab[i].ram) {
+                resident = ovl_arena[j].id; rgen = ovl_arena[j].gen;
+                if (resident >= 0 && resident < ovl_n) roff = pc - ovl_tab[resident].ram;
+            }
+        fprintf(stderr,
+                "ovl_pc pc=0x%08X arena=0x%08X off=0x%X ov=%u kind=%s"
+                " resident=%s gen=%d resident_off=0x%X\n",
+                pc, ovl_tab[i].ram, pc - ovl_tab[i].ram, ovl_tab[i].id, kind,
+                resident >= 0 ? "ov" : "none", rgen, roff);
+        hits++;
+    }
+    if (!hits)
+        fprintf(stderr, "ovl_pc pc=0x%08X not in overlay space (static image / data)\n", pc);
 }
 static void io_ovl_note(uint32_t addr) {
     int i;
     if (!ovl_init_done) io_ovl_init();
     for (i = 0; i < ovl_n; i++) {
         int g = 0, j;
-        if (addr != ovl_tab[i].rom_off) continue;
+        if (addr < ovl_tab[i].rom_off || addr >= ovl_tab[i].rom_end) continue;
+        if (addr != ovl_tab[i].rom_off) {
+            /* a read in the middle of an overlay's FAT range: the load started
+             * before this read (a split/misaligned first read).  Note it once
+             * per overlay; the generation is only bumped on the real start. */
+            if (!ovl_tab[i].mid_noted) {
+                ovl_tab[i].mid_noted = 1;
+                fprintf(stderr, "ovl: read inside ov%u at +0x%X (load start not seen)\n",
+                        ovl_tab[i].id, addr - ovl_tab[i].rom_off);
+            }
+            return;
+        }
         for (j = 0; j < ovl_arena_n; j++)
             if (ovl_arena[j].arena == ovl_tab[i].ram) {
                 ovl_arena[j].id = i; ovl_arena[j].gen++; g = ovl_arena[j].gen; break;
@@ -2075,16 +2228,20 @@ static void io_ovl_note(uint32_t addr) {
         }
         ovl_load_seq++;
         if (ovl_fp)
-            fprintf(ovl_fp, "ovl_load seq=%d id=%d rom=0x%08X size=0x%X dest=0x%08X ram_size=0x%X gen=%d\\n",
-                    ovl_load_seq, i, ovl_tab[i].rom_off,
+            fprintf(ovl_fp, "ovl_load seq=%d id=%u rom=0x%08X size=0x%X dest=0x%08X ram_size=0x%X gen=%d\n",
+                    ovl_load_seq, ovl_tab[i].id, ovl_tab[i].rom_off,
                     ovl_tab[i].rom_end - ovl_tab[i].rom_off,
                     ovl_tab[i].ram, ovl_tab[i].ram_size, g);
-        fprintf(stderr, "ovl: load id=%d rom=0x%08X size=0x%X dest=0x%08X gen=%d\\n",
-                i, ovl_tab[i].rom_off, ovl_tab[i].rom_end - ovl_tab[i].rom_off,
-                ovl_tab[i].ram, g);
+        fprintf(stderr, "ovl: load id=%u rom=0x%08X size=0x%X dest=0x%08X gen=%d"
+                        " code=0x%X bss=0x%X end=0x%08X ctor=0x%08X..0x%08X\n",
+                ovl_tab[i].id, ovl_tab[i].rom_off, ovl_tab[i].rom_end - ovl_tab[i].rom_off,
+                ovl_tab[i].ram, g, ovl_tab[i].ram_size, ovl_tab[i].bss,
+                ovl_tab[i].ram + ovl_tab[i].ram_size + ovl_tab[i].bss,
+                ovl_tab[i].ctor_lo, ovl_tab[i].ctor_hi);
         return;
     }
 }
+/* END_NNK_OVL_BLOCK */
 
 /* ---- BIOS boot state (Phase-4C2) -----------------------------------------
  * The runtime starts at the ARM9 entry, so everything the DS BIOS had written
@@ -3839,6 +3996,7 @@ const RUNTIME_ALL_MAIN: &str = r##"int main(int argc, char **argv) {
           if (df) { fwrite(gmem, 1, GSIZE, df); fclose(df);
                     fprintf(stderr, "dumped guest window (%u bytes) to %s\n", GSIZE, dump); }
           else fprintf(stderr, "NNK_DUMP_MEM: cannot open %s\n", dump); } }
+    io_ovl_dump_exit();   /* Phase-5AF */
     printf("done steps=%llu traced=%llu distinct_pcs=%llu hle_hits=%llu halt_pc=0x%08X halt=%s\n",
            (unsigned long long)steps, (unsigned long long)traced,
            (unsigned long long)distinct_pcs, (unsigned long long)hle_hits,
