@@ -1882,13 +1882,39 @@ static uint32_t vramcnt[9]; static uint32_t wramcnt_map = 0;
  * tools/nnk_vramcnt.inc carries the same model, plus write tracing and a
  * bank-map report, for the already-generated image. */
 static int vrc_in(uint32_t a) { return a >= 0x04000240u && a <= 0x0400024Bu; }
+/* Phase-5Y: 0x04000240..0x04000246 = VRAMCNT_A..G, 0x04000247 = WRAMCNT
+ * (NOT a VRAM bank), 0x04000248 = VRAMCNT_H, 0x04000249 = VRAMCNT_I
+ * (melonDS NDS.cpp ARM9Write8/16/32).  A flat `a - 0x04000240` table put H on
+ * 0x247 and I on 0x248, so the guest's WRAMCNT store (0x03) became VRAMCNT_H,
+ * the real H store (0x82) landed on I and the real I store (0x83, "VRAM_I =
+ * engine-B BG extended palette") was dropped: the first screen's BG layer then
+ * read a zero extended palette and the panel/figure/caption rendered black. */
+static int vrc_slot(uint32_t a) {
+    switch (a) {
+    case 0x04000240: return 0; case 0x04000241: return 1;
+    case 0x04000242: return 2; case 0x04000243: return 3;
+    case 0x04000244: return 4; case 0x04000245: return 5;
+    case 0x04000246: return 6;
+    case 0x04000248: return 7; case 0x04000249: return 8;
+    default: return -1;                 /* 0x247 WRAMCNT, 0x24A/0x24B unused */
+    }
+}
 static void vrc_write(uint32_t a, uint32_t v, int width) {
-    int bank = (int)(a - 0x04000240u), i;
-    for (i = 0; i < width && bank + i < 9; i++) vramcnt[bank + i] = (v >> (8 * i)) & 0xFFu;
+    int i;
+    for (i = 0; i < width; i++) {
+        int b = vrc_slot(a + (uint32_t)i);
+        if (b >= 0) vramcnt[b] = (v >> (8 * i)) & 0xFFu;
+        else if (a + (uint32_t)i == 0x04000247u) wramcnt_map = (v >> (8 * i)) & 0xFFu;
+    }
 }
 static uint32_t vrc_read(uint32_t a, int width) {
-    int bank = (int)(a - 0x04000240u), i; uint32_t r = 0;
-    for (i = 0; i < width && bank + i < 9; i++) r |= (vramcnt[bank + i] & 0xFFu) << (8 * i);
+    int i; uint32_t r = 0;
+    for (i = 0; i < width; i++) {
+        uint32_t b = 0; int s = vrc_slot(a + (uint32_t)i);
+        if (s >= 0) b = vramcnt[s] & 0xFFu;
+        else if (a + (uint32_t)i == 0x04000247u) b = wramcnt_map & 0xFFu;
+        r |= b << (8 * i);
+    }
     return r;
 }
 /* VRAMSTAT (0x0400024E): bit0 = VRAM_C mapped to ARM7, bit1 = VRAM_D. */

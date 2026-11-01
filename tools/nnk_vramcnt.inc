@@ -50,9 +50,38 @@ static unsigned long long nnk_vrc_win_first[3], nnk_vrc_win_last[3];
 static uint32_t nnk_vrc_dispcnt[2];    /* last DISPCNT seen (engine A, B) */
 static int nnk_vrc_trace = -1;
 
-/* 0x04000240..0x0400024B are the nine VRAMCNT bytes plus padding;
- * 0x0400024C/4D are unused, 0x0400024E is VRAMSTAT (read-only). */
+/* 0x04000240..0x0400024B are the VRAMCNT bytes, WRAMCNT, and padding;
+ * 0x0400024C/4D are unused, 0x0400024E is VRAMSTAT (read-only).
+ *
+ * Phase-5Y: the layout is NOT a flat 0x240+bank table.  melonDS
+ * NDS.cpp ARM9Write8 (case list at 0x04000240): the nine banks are
+ *   0x04000240..0x04000246 -> VRAMCNT_A..G
+ *   0x04000247             -> WRAMCNT   (NOT a VRAM bank)
+ *   0x04000248             -> VRAMCNT_H
+ *   0x04000249             -> VRAMCNT_I
+ * The old flat model put H at 0x247 and I at 0x248, so the guest's WRAMCNT
+ * store (0x03) overwrote VRAMCNT_H, the real H store (0x82) landed on I, and
+ * the real I store (0x83, "VRAM_I = engine-B BG extended palette") was dropped.
+ * That left the engine-B BG layer reading a zero extended palette: the first
+ * screen's panel/figure/caption rendered black while the OBJ prompt survived. */
 static int nnk_vrc_in(uint32_t a) { return a >= 0x04000240u && a <= 0x0400024Bu; }
+
+/* register byte -> VRAM bank index, or -1 for WRAMCNT / padding */
+static int nnk_vrc_slot(uint32_t a)
+{
+    switch (a) {
+    case 0x04000240: return 0;
+    case 0x04000241: return 1;
+    case 0x04000242: return 2;
+    case 0x04000243: return 3;
+    case 0x04000244: return 4;
+    case 0x04000245: return 5;
+    case 0x04000246: return 6;
+    case 0x04000248: return 7;
+    case 0x04000249: return 8;
+    default:         return -1;     /* 0x247 WRAMCNT, 0x24A/0x24B unused */
+    }
+}
 
 static void nnk_vrc_trace_init(void)
 {
@@ -63,15 +92,22 @@ static void nnk_vrc_trace_init(void)
 }
 
 /* Store `width` bytes of `v` (little-endian, as the guest wrote them) into the
- * VRAMCNT register file.  melonDS keeps one byte per bank and a wider store
- * simply covers the following banks (GPU::Write8 case 0x04000240+offs). */
+ * VRAMCNT/WRAMCNT register file.  melonDS decodes wide stores by ADDRESS -
+ * ARM9Write16 0x04000240 -> A,B; 0x04000242 -> C,D; 0x04000244 -> E,F;
+ * 0x04000246 -> G,WRAMCNT; 0x04000248 -> H,I; ARM9Write32 0x04000240 -> A..D,
+ * 0x04000244 -> E,F,G,WRAMCNT, 0x04000248 -> H,I - so each byte is routed
+ * through the same slot table (a byte that lands on WRAMCNT stays out of the
+ * VRAM bank file). */
 static void nnk_vrc_write(uint32_t a, uint32_t v, int width)
 {
-    int bank = (int)(a - 0x04000240u), i;
+    int i;
     nnk_vrc_trace_init();
     nnk_vrc_writes++;
-    for (i = 0; i < width && bank + i < 9; i++)
-        vramcnt[bank + i] = (v >> (8 * i)) & 0xFFu;
+    for (i = 0; i < width; i++) {
+        int b = nnk_vrc_slot(a + (uint32_t)i);
+        if (b >= 0) vramcnt[b] = (v >> (8 * i)) & 0xFFu;
+        else if (a + (uint32_t)i == 0x04000247u) wramcnt_map = (uint8_t)((v >> (8 * i)) & 0xFFu);
+    }
     if (nnk_vrc_trace) {
         fprintf(stderr, "vrc: W%d 0x%08X=0x%08X A..I=", width, a, v);
         for (i = 0; i < 9; i++) fprintf(stderr, "%02X", (unsigned)vramcnt[i]);
@@ -79,14 +115,21 @@ static void nnk_vrc_write(uint32_t a, uint32_t v, int width)
     }
 }
 
-/* Register readback: the written bytes, little-endian, zero-extended. */
+/* Register readback: melonDS ARM9Read8/16/32 serve the same slots, so a byte
+ * read of 0x04000247 returns WRAMCNT and a 16-bit read of 0x04000248 returns
+ * VRAMCNT_H | VRAMCNT_I<<8. */
 static uint32_t nnk_vrc_read(uint32_t a, int width)
 {
-    int bank = (int)(a - 0x04000240u), i;
+    int i;
     uint32_t r = 0;
     nnk_vrc_reads++;
-    for (i = 0; i < width && bank + i < 9; i++)
-        r |= (vramcnt[bank + i] & 0xFFu) << (8 * i);
+    for (i = 0; i < width; i++) {
+        uint32_t v = 0;
+        int b = nnk_vrc_slot(a + (uint32_t)i);
+        if (b >= 0) v = vramcnt[b] & 0xFFu;
+        else if (a + (uint32_t)i == 0x04000247u) v = wramcnt_map & 0xFFu;
+        r |= v << (8 * i);
+    }
     return r;
 }
 

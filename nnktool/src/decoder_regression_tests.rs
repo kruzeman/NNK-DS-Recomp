@@ -1248,3 +1248,90 @@ fn cpsr_i_transitions_are_observable_through_the_single_ctl_funnel() {
     assert_eq!(0x02008D28u32 & 3, 0, "fixture: OS_DisableInterrupts' msr is ARM-aligned");
     assert_eq!(0x02008D40u32 & 3, 0, "fixture: OS_RestoreInterrupts' msr is ARM-aligned");
 }
+
+// --------------------------------------------------------------- class 21 ---
+// VRAMCNT_H / VRAMCNT_I live at 0x04000248 / 0x04000249, and 0x04000247 is
+// WRAMCNT — not a VRAM bank (Phase-5Y, the first-screen render).
+//
+// Measured (`PHASE5Y.md` §2): the guest programs the banks with byte stores
+//   W8 0x04000247 = 0x03   (WRAMCNT: 0x3000000 switched to ARM7)
+//   W8 0x04000248 = 0x82   (VRAMCNT_H = enabled, mst 2)
+//   W8 0x04000249 = 0x83   (VRAMCNT_I = enabled, mst 3 = engine-B BG ext pal)
+// and melonDS's own state dump at the notice frame reads back
+// H=0x82, I=0x83.  Both our runtime model (`tools/nnk_vramcnt.inc`, carried by
+// the frozen dispatch image, and the same code emitted by `recompile.rs`) and
+// `gxrender`'s VRAMCNT decode used a flat `addr - 0x04000240` bank table, which
+// put H at 0x247 and I at 0x248: the WRAMCNT store became VRAMCNT_H, the real H
+// store landed on I and the real I store was dropped.  Bank I then stopped
+// serving "engine-B BG extended palette", DISPCNT_B bit30 (BG ext pal enable)
+// made BG1 read that empty palette, and the notice panel + pirate figure +
+// "We do not condone piracy" caption rendered black — only the OBJ "Tap to"
+// prompt (B-OBJ palette, 4 colours) survived.  After the fix the same frame
+// matches melonDS on BG1's flat VRAM, the BG palette *and* the BG ext palette.
+const VRCY_MEASURED: [(u32, u32); 3] = [
+    (0x0400_0247, 0x03), // WRAMCNT
+    (0x0400_0248, 0x82), // VRAMCNT_H
+    (0x0400_0249, 0x83), // VRAMCNT_I
+];
+
+/// The slot table both the C models and the melonDS reference use.
+fn vrcy_slot(a: u32) -> Option<usize> {
+    match a {
+        0x0400_0240..=0x0400_0246 => Some((a - 0x0400_0240) as usize),
+        0x0400_0248 => Some(7),
+        0x0400_0249 => Some(8),
+        _ => None, // 0x04000247 WRAMCNT, 0x0400024A/B unused
+    }
+}
+
+#[test]
+fn vramcnt_h_and_i_are_at_0x248_and_0x249_with_wramcnt_at_0x247() {
+    // (a) the measured guest sequence reproduces melonDS's bank file.
+    let mut banks = [0u8; 9];
+    let mut wramcnt = 0u8;
+    for (a, v) in VRCY_MEASURED {
+        match vrcy_slot(a) {
+            Some(b) => banks[b] = v as u8,
+            None => wramcnt = v as u8,
+        }
+    }
+    assert_eq!(banks[7], 0x82, "VRAMCNT_H must hold the 0x04000248 store");
+    assert_eq!(banks[8], 0x83, "VRAMCNT_I must hold the 0x04000249 store");
+    assert_eq!(wramcnt, 0x03, "0x04000247 is WRAMCNT, not a VRAM bank");
+    assert_eq!(
+        banks[8] & 7,
+        3,
+        "VRAMCNT_I = 0x83 selects mst 3 = engine-B BG extended palette"
+    );
+    // (b) NEGATIVE neighbour: 16-bit programming pairs (melonDS ARM9Write16).
+    assert_eq!(vrcy_slot(0x0400_0246), Some(6), "0x246 is VRAMCNT_G");
+    assert_eq!(vrcy_slot(0x0400_0247), None, "0x247 must never be a VRAM bank");
+
+    // (c) all three implementations carry the same table.
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let inc = std::fs::read_to_string(root.join("tools/nnk_vramcnt.inc"))
+        .expect("cannot read tools/nnk_vramcnt.inc");
+    let re = std::fs::read_to_string(root.join("nnktool/src/recompile.rs"))
+        .expect("cannot read nnktool/src/recompile.rs");
+    let gxd = std::fs::read_to_string(root.join("gxrender/src/gx_display.c"))
+        .expect("cannot read gxrender/src/gx_display.c");
+    for (name, src) in [("nnk_vramcnt.inc", &inc), ("recompile.rs", &re)] {
+        assert!(
+            src.contains("case 0x04000248: return 7;"),
+            "regression: {name} no longer maps 0x04000248 to VRAMCNT_H"
+        );
+        assert!(
+            src.contains("case 0x04000249: return 8;"),
+            "regression: {name} no longer maps 0x04000249 to VRAMCNT_I"
+        );
+        assert!(
+            !src.contains("int bank = (int)(a - 0x04000240u)"),
+            "regression: {name} is back on the flat 0x240+bank table"
+        );
+    }
+    assert!(
+        gxd.contains("case 0x04000248: case 0x04000249: {")
+            && gxd.contains("static const int slot[10] = { 0, 1, 2, 3, 4, 5, 6, -1, 7, 8 };"),
+        "regression: gx_display's VRAMCNT decode no longer routes 0x248/0x249"
+    );
+}
