@@ -1248,3 +1248,90 @@ fn cpsr_i_transitions_are_observable_through_the_single_ctl_funnel() {
     assert_eq!(0x02008D28u32 & 3, 0, "fixture: OS_DisableInterrupts' msr is ARM-aligned");
     assert_eq!(0x02008D40u32 & 3, 0, "fixture: OS_RestoreInterrupts' msr is ARM-aligned");
 }
+
+#[test]
+fn thumb_pic_base_register_is_not_an_interworking_target() {
+    // Phase-5X, class 35: the post-skip halt at 0x020DDF08.
+    //
+    // Measured (operator skip path reproduced headlessly with periodic key
+    // presses, halt step 331,706,950): the live re-decoder executed
+    //     0x020DDE9A  hw 0x447B   add r3, pc        (Thumb format 5 case 0)
+    // which writes Align(pc+4,4) = Align(0x020DDE9E,4) = 0x020DDE9C into r3.
+    // The very next dispatch was 0x020DDE9C, i.e. r3 == pc.  The unclassified
+    // PC fell through to smc_state_from_regs(), which reads "a register whose
+    // value & ~1 equals pc" as a carried interworking target: even value ->
+    // ARM state.  The ARM reading of the Thumb jump-table prologue
+    // (0x88DB 0x041B 0x141B 0x449F 0x0006 ...) stepped 4 bytes at a time down
+    // the halfword table until 0x020DDF08 — Thumb-2 `f753 e838` — decoded as
+    // an ARM load whose target was pc=0, i.e. `untranslated pc=0x00000000`
+    // with r13=r14=0 (a DESTROYED register file: the symptom, not the cause).
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let p = root.join("tools/nnk_smc.inc");
+    let src = std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("cannot read {}: {}", p.display(), e));
+
+    // (a) the tag exists, is one-step scoped, and is consulted by the state scan.
+    assert!(
+        src.contains("static int smc_is_pcbase(int k) {") &&
+        src.contains("return smc_pcbase_reg == k && steps == smc_pcbase_step + 1ull;"),
+        "regression: the PIC-base tag lost its one-dispatch lifetime"
+    );
+    assert!(
+        src.contains("if (smc_is_pcbase(k)) continue;"),
+        "regression: smc_state_from_regs reads an `add rd, pc` PIC base as an ARM target again"
+    );
+    // (b) both PC-relative register forms produce the tag, and only for rd != pc
+    //     (a PC write is a branch, handled by the carry path instead).
+    assert_eq!(
+        src.matches("if (rs == 15u) smc_note_pcbase((int)rd);").count(), 2,
+        "regression: `add rd, pc` / `mov rd, pc` no longer tag the register they fill"
+    );
+    // (c) the Thumb register-indirect branch carries its state (BX -> bit0,
+    //     BLX Rm -> always ARM; ARM ARM A7.1.4).  It used to strip bit0 and
+    //     note nothing, leaving the target on the stale sticky value.
+    assert!(
+        src.contains("smc_branch_mode((hw & 0x0080u) ? (*npc) : tv);"),
+        "regression: the Thumb BX/BLX rM arm drops the interworking state again"
+    );
+
+    // (d) the geometry that made this possible: the Thumb `add rd, pc` base is
+    //     the ALIGNED pc+4, so it coincides with the following instruction
+    //     address whenever (pc+4) is not already word aligned.
+    let pc: u32 = 0x020DDE9A;
+    let base = (pc + 4) & !3u32;
+    assert_eq!(base, 0x020DDE9Cu32, "fixture: add r3,pc base");
+    assert_eq!(pc + 2, 0x020DDE9Cu32, "fixture: the coincident next instruction");
+}
+
+#[test]
+fn input_file_is_frame_timed_and_masks_the_key_space() {
+    // Phase-5X, operator request: `NNK_INPUT_FILE` — the DQ8 `DQ8_INPUT_FILE`
+    // analogue (DQ8 src/native_hid.c:native_hid_pump re-reads the file every
+    // HID pump and publishes the mask).  Step-timed NNK_INPUT_INJECT cannot
+    // express "press when the prompt appears", which is why the operator's
+    // frame-timed taps did not reproduce from a fixed-step injection.
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let p = root.join("tools/nnk_input.inc");
+    let src = std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("cannot read {}: {}", p.display(), e));
+    for needle in [
+        "if (!p || !p[0]) return;",
+        "if (gxd_frames == nnk_file_frame) return;",   // once per DISPLAY FRAME
+        "strtoul(buf, NULL, 0) & 0xFFFu",              // 10 keys + DS X/Y
+        "if ((uint32_t)v == nnk_mask) return;",        // edge-driven, no churn
+        "gxd_set_keymask(gxd, nnk_mask);",             // same path a key event takes
+        "nnk_input_file_tick();",                      // ticked from nnk_input_tick
+        "file mask=0x%03X EXTKEYIN=0x%02X frame=%u",   // visible under NNK_INPUT_TRACE
+    ] {
+        assert!(src.contains(needle), "regression: NNK_INPUT_FILE lost: {needle}");
+    }
+    // A missing file must HOLD the last mask (the host may write it only on
+    // transitions): the only early returns before the read are the unset-env
+    // and same-frame guards, and a failed fopen returns without touching state.
+    let tick = &src[src.find("static void nnk_input_file_tick(void)").expect("tick missing")..];
+    let body = &tick[..tick.find("\n}\n").expect("tick end missing")];
+    assert_eq!(body.matches("return;").count(), 5, "fixture: file tick early-outs changed");
+    assert!(!body.contains("nnk_mask = 0xFFFu"), "regression: a missing file clears the keys");
+    // KEYINPUT is active-low: idle 0x3FF, B = bit1, A = bit0, Start = bit3.
+    assert_eq!(0x3FFu32 & !(1u32 << 1), 0x3FDu32, "fixture: B mask");
+    assert_eq!(0x3FFu32 & !(1u32 << 0), 0x3FEu32, "fixture: A mask");
+    assert_eq!(0x3FFu32 & !(1u32 << 3), 0x3F7u32, "fixture: Start mask");
+}

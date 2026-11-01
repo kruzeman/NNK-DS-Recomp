@@ -91,6 +91,31 @@ static int smc_carried_thumb(uint32_t pc, int *state) {
     return 1;
 }
 
+/* Phase-5X: the PIC-base register.  A Thumb `add rd, pc` (format 5 case 0)
+ * writes Align(pc+4,4) into rd.  That value is EVEN and can be exactly the
+ * address of a later instruction group, so `smc_state_from_regs` below read it
+ * as an ARM-state interworking target and re-decoded a pure Thumb stream in
+ * ARM state.
+ *   Measured (Phase-5X): 0x020DDE9A `add r3, pc` (hw 0x447B) set
+ *   r3 = Align(0x020DDE9E,4) = 0x020DDE9C; the very next dispatch was
+ *   0x020DDE9C, smc_state_from_regs found r3 == pc -> "ARM", and the ARM
+ *   reading of the Thumb jump-table prologue walked 4-byte steps down the
+ *   halfword table (0x88DB, 0x041B, 0x141B, 0x449F, 0x0006, ...) until the ARM
+ *   decode of 0x020DDF08 (Thumb-2 `f753 e838`) branched to pc=0 — the
+ *   `untranslated pc=0x00000000` halt with r13=r14=0 at step 331,706,950.
+ * The tag is honoured for exactly one dispatch (same contract as
+ * smc_t_pc/smc_t_step): the value only ever exists as a target on the very
+ * next instruction, because the following PC-relative load consumes it. */
+static int smc_pcbase_reg = -1;
+static unsigned long long smc_pcbase_step;
+static void smc_note_pcbase(int rd) {
+    smc_pcbase_reg = rd;
+    smc_pcbase_step = steps;
+}
+static int smc_is_pcbase(int k) {
+    return smc_pcbase_reg == k && steps == smc_pcbase_step + 1ull;
+}
+
 /* Phase-5J: the compiled image records the state of an INTERWORKING transfer.
  * The recompiler's emitted `pop {..,pc}` / `ldm ..,{..,pc}` sets
  *     pc = _t & ~1u;
@@ -140,6 +165,11 @@ static int smc_state_from_regs(uint32_t pc)
     int k;
     for (k = 0; k < 15; k++) {
         uint32_t v = r[k];
+        /* Phase-5X: a register that the PREVIOUS instruction filled from the
+         * PC (`add rd, pc` PIC base) is not a branch target — its value is
+         * Align(pc+4,4), which can equal this very pc and would otherwise
+         * force an ARM decode of Thumb code. */
+        if (smc_is_pcbase(k)) continue;
         if ((v & ~1u) == pc) return (int)(v & 1u);
     }
     return -1;                            /* no register carries this pc */
@@ -824,16 +854,26 @@ static int smc_exec_thumb(uint32_t pc, uint32_t *npc, uint32_t *costp) {
              * (0x020D24E8) fell through into the table, walking straight
              * into the 0x020D3250 halt stub. */
             tv = smc_reg(rd, pc, 1) + smc_reg(rs, pc, 1);
-            if (rd == 15u) { *npc = tv & ~1u; return 1; }
+            /* Phase-5X: `add rd, pc` / `add rd, pc`-style PIC base — tag rd so
+             * smc_state_from_regs cannot read the aligned PC as a target. */
+            if (rs == 15u) smc_note_pcbase((int)rd);
+            if (rd == 15u) { *npc = tv & ~1u; smc_branch_mode(*npc | 1u); return 1; }
             r[rd] = tv;
             return 1;
         case 1: (void)smc_dp(10, smc_reg(rd, pc, 1), smc_reg(rs, pc, 1), 1); return 1;
         case 2: tv = smc_reg(rs, pc, 1);
-                if (rd == 15u) *npc = tv & ~1u; else r[rd] = tv;
+                if (rd == 15u) { *npc = tv & ~1u; smc_branch_mode(*npc | 1u); }
+                else { if (rs == 15u) smc_note_pcbase((int)rd); r[rd] = tv; }
                 return 1;
         default: tv = smc_reg(rs, pc, 1);
                  if (hw & 0x0080u) r[14] = (pc + 2u) | 1u;
-                 *npc = tv & ~1u; *costp = 3; return 1;
+                 *npc = tv & ~1u;
+                 /* Phase-5X: BX rM interworks on tv's bit0; BLX rM (bit7) is
+                  * always ARM state (ARM ARM A7.1.4) — the live decoder used
+                  * to strip bit0 with no carry at all, so the target's state
+                  * fell back to the stale sticky value. */
+                 smc_branch_mode((hw & 0x0080u) ? (*npc) : tv);
+                 *costp = 3; return 1;
         }
     }
     if ((hw & 0xF800u) == 0x4800u) {                 /* format 6: LDR literal */

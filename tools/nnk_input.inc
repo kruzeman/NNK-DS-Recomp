@@ -213,9 +213,52 @@ static void nnk_input_init(void)
              "Return=Start RShift/Backspace=Select");
 }
 
+/* ---- frame-timed mask file (NNK_INPUT_FILE) ------------------------------
+ * The DQ8 analogue (`DQ8_INPUT_FILE`, DQ8 src/native_hid.c:native_hid_pump):
+ * a small text file the host writes; its first line is the desired active-low
+ * key mask, re-read once per DISPLAY FRAME and published through the same
+ * gxd_set_keymask path a real key event takes.
+ *   Step-timed NNK_INPUT_INJECT cannot express "press when the prompt
+ * appears": the operator's real taps are frame-timed (he presses when he SEES
+ * the screen), which is exactly why a fixed-step injection at 380 M/390 M did
+ * not reproduce his session while periodic presses did.  This file is the
+ * reproducible form of a human session, and it is what a live operator can be
+ * driven by as well.
+ * Format: line 1 = strtoul(base 0) mask, low 12 bits =
+ *   bit 0-9  KEYINPUT (active low; 0x3FF = nothing pressed)
+ *   bit 10   DS X (EXTKEYIN bit0)   bit 11 = DS Y (EXTKEYIN bit1)
+ * So B = 0x3FD, A = 0x3FE, Start = 0x3F7, idle = 0x3FF.
+ * A missing/unreadable/short file HOLDS the last mask (the host may rewrite it
+ * only on transitions); re-reading one short line per frame is cheap. */
+static unsigned nnk_file_frame = 0xFFFFFFFFu;
+static void nnk_input_file_tick(void)
+{
+    const char *p = getenv("NNK_INPUT_FILE");
+    char buf[64];
+    FILE *f;
+    unsigned long v;
+    if (!p || !p[0]) return;
+    if (gxd_frames == nnk_file_frame) return;       /* one read per frame */
+    nnk_file_frame = gxd_frames;
+    f = fopen(p, "r");
+    if (!f) return;
+    if (!fgets(buf, sizeof buf, f)) { fclose(f); return; }
+    fclose(f);
+    v = (unsigned long)strtoul(buf, NULL, 0) & 0xFFFu;
+    if ((uint32_t)v == nnk_mask) return;            /* no edge: no state change */
+    nnk_mask = (uint32_t)v;
+    nnk_extkey = 0x7Fu;
+    if (!(nnk_mask & (1u << 10))) nnk_extkey &= ~1u;
+    if (!(nnk_mask & (1u << 11))) nnk_extkey &= ~2u;
+    if (gxd) gxd_set_keymask(gxd, nnk_mask);
+    nnk_ilog("file mask=0x%03X EXTKEYIN=0x%02X frame=%u",
+             nnk_mask, nnk_extkey, gxd_frames);
+}
+
 static void nnk_input_tick(void)
 {
     if (!nnk_inited) nnk_input_init();
+    nnk_input_file_tick();
     while (nnk_inj_next < nnk_inj_n && steps >= nnk_inj[nnk_inj_next].step) {
         SDL_Event ev;
         int down = nnk_inj[nnk_inj_next].down;
