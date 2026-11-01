@@ -168,6 +168,25 @@ if [[ -f "$IMAGE" ]] && ! grep -q 'io_ovl_pc_report' "$IMAGE"; then
                        5af_overlay_table_dump)
   fi
 fi
+# Phase-5AJ: the card image is the only input.  The frozen image loads its
+# guest image from argv[1] with fopen/fread and only fills the card model from
+# NNK_ROM_PATH, so a clean directory holding ONLY the runner and the ROM cannot
+# boot ("cannot open guest image arm9_stored_padded.bin").  The canonical
+# prelude derives every image from argv[1] via tools/nnk_rom.inc; splice that
+# into the frozen one.  Runs LAST: it wraps io_load_rom's body, whose tail the
+# 5AF splice above has already rewritten with the io_ovl_init() call.
+if [[ -f "$IMAGE" ]] && ! grep -q 'nnk_rom_image_load' "$IMAGE"; then
+  if splice_disabled 5aj_rom_only_input; then
+    echo "== prelude splice DISABLED by NNK_PRELUDE_DISABLE_SPLICE: Phase-5AJ ROM-only input (negative control) =="
+  else
+    SPLICED_IMAGE4="$(dirname "$SPLIT")/$(basename "$IMAGE" .c).p5aj.c"
+    mkdir -p "$(dirname "$SPLICED_IMAGE4")"
+    echo "== prelude splice (Phase-5AJ): ROM-only input (argv .nds) -> $SPLICED_IMAGE4 =="
+    python3 tools/p5aj_rom_splice.py "$IMAGE" "$SPLICED_IMAGE4"
+    IMAGE=$SPLICED_IMAGE4
+    SPLICED_FEATURES+=(5aj_rom_only_input 5aj_rom_derived_image 5aj_rom_smc_segments)
+  fi
+fi
 
 if [[ "$GX" == "1" ]]; then
   [[ -f "$GXDIR/Makefile" ]] || { echo "NNK_GX=1 but $GXDIR/Makefile missing" >&2; exit 2; }
@@ -252,7 +271,7 @@ done
 
 # Everything that must invalidate a cached .o is captured once here.
 CC_ID=$("$CC" --version | head -1)
-HDR_HASH=$(cat "$SPLIT/nnk_rt.h" "$SPLIT"/nnk_smc_map.h "$SPLIT"/nnk_smc.inc "$SPLIT"/nnk_boot.inc "$SPLIT"/nnk_dma.inc "$SPLIT"/nnk_vramcnt.inc "$SPLIT"/nnk_input.inc "$SPLIT"/nnk_mobiclip.inc "$SPLIT"/nnk_mobiclip_dec.inc 2>/dev/null | sha256sum | cut -d' ' -f1)
+HDR_HASH=$(cat "$SPLIT/nnk_rt.h" "$SPLIT"/nnk_smc_map.h "$SPLIT"/nnk_smc.inc "$SPLIT"/nnk_boot.inc "$SPLIT"/nnk_dma.inc "$SPLIT"/nnk_vramcnt.inc "$SPLIT"/nnk_input.inc "$SPLIT"/nnk_mobiclip.inc "$SPLIT"/nnk_mobiclip_dec.inc "$SPLIT"/nnk_rom.inc 2>/dev/null | sha256sum | cut -d' ' -f1)
 
 # compile_cached <source.c> <target.o> <flag-array-name>
 # Reuse <target.o> when its sidecar stamp still matches the current content

@@ -71,6 +71,10 @@ cp tools/nnk_boot.inc $W/ 2>/dev/null || true
 # Phase-5AH: nnk_smc.inc now includes the in-process Mobiclip decoder; the
 # generated TU must see those fragments too (the split build copies them).
 cp tools/nnk_mobiclip.inc tools/nnk_mobiclip_dec.inc $W/ 2>/dev/null || true
+# Phase-5AJ: nnk_smc.inc derives its generation-0 snapshot from the card image
+# through tools/nnk_rom.inc (which it #includes), so that fragment must be next
+# to the generated TU as well.
+cp tools/nnk_rom.inc $W/ 2>/dev/null || true
 [ -f $W/nnk_smc_map.h ] || cp out/split/c/nnk_smc_map.h $W/ 2>/dev/null || true
 # -O0 keeps this acceptance run fast (cc is the bottleneck on a 17 MB file:
 # -O0 ~2 min, -O1 minutes, -O2 ~15 min).  Optimization level does not change

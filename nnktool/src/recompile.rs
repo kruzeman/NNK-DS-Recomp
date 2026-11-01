@@ -1991,6 +1991,16 @@ static void io_sqrt_do(void) {
 
 static void io_ovl_init(void);   /* Phase-4G overlay-slot registry (defined below) */
 static void io_load_rom(void) {
+    /* Phase-5AJ: the card image came in as argv[1] and is already mapped as
+     * `rom`/`rom_len` (tools/nnk_rom.inc).  NNK_ROM_PATH stays as a debug
+     * override for the raw-image path; nothing is required. */
+    if (rom && rom_len) {
+        rom_loaded = 1;
+        fprintf(stderr, "io: card rom %zu bytes attached from argv (Phase-5AJ)\\n", rom_len);
+        io_ovl_init();
+        return;
+    }
+    {
     const char *p = getenv("NNK_ROM_PATH");
     if (!p || !p[0]) { fprintf(stderr, "io: NNK_ROM_PATH unset; card reads return 0\\n"); return; }
     FILE *f = fopen(p, "rb");
@@ -2000,6 +2010,7 @@ static void io_load_rom(void) {
     fclose(f); rom_loaded = 1;
     fprintf(stderr, "io: card rom %zu bytes from %s\\n", rom_len, p);
     io_ovl_init();
+    }
 }
 
 /* ---- overlay-slot registry + table-driven overlay map (Phase-4G, 5AF) ----
@@ -3953,12 +3964,19 @@ static void guest_init(void) { memset(r, 0, sizeof r); n = z = c = v = 0; cp15_u
 "##;
 
 const RUNTIME_ALL_MAIN: &str = r##"int main(int argc, char **argv) {
-    const char *path = argc > 1 ? argv[1] : "arm9_image.bin";
-    FILE *fp = fopen(path, "rb");
-    if (!fp) { fprintf(stderr, "cannot open guest image %s\n", path); return 2; }
-    size_t got = fread(gmem, 1, IMAGE_LEN, fp);
-    fclose(fp);
-    if (got != IMAGE_LEN) { fprintf(stderr, "short read: got %zu, want %u\n", got, IMAGE_LEN); return 2; }
+    /* Phase-5AJ: the card image is the ONLY input.  argv[1] is the .nds; the
+     * guest image the dispatch loop boots, the decompressed ARM9 and the
+     * overlay arena window are all derived from it in memory at start-up
+     * (tools/nnk_rom.inc).  A raw guest image still loads for A/B work. */
+    const char *path = argc > 1 ? argv[1] : NULL;
+    if (!path || !path[0]) {
+        fprintf(stderr, "usage: %s <game.nds>\n", argv[0]);
+        fprintf(stderr, "  the card image is the only input; every guest image is\n"
+                        "  derived from it at start-up (Phase-5AJ).\n");
+        return 2;
+    }
+    if (nnk_rom_image_load(path, gmem, IMAGE_LEN) != 0) return 2;
+    size_t got = nnk_rom_guest_len;
     smc_arm();          /* Phase-4J: snapshot the compiled generation */
     guest_init();
     nnk_display_open();
