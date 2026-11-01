@@ -36,7 +36,6 @@ fn body_of(o: &super::EmitOutcome) -> String {
 
 const W_LDRSB_R8_SL_R7: u32 = 0xE19A_80D7; // ldrsb r8, [sl, r7]  (measured 0x0200C7C8)
 const W_LDRD_R8_SL: u32 = 0xE1CA_80D0; //     ldrd  r8, [sl]      (L=0, the real doubleword)
-
 #[test]
 fn ldrsb_register_offset_decodes_as_signed_byte() {
     let insn = decode_arm(W_LDRSB_R8_SL_R7, 0x0200_C7C8);
@@ -49,7 +48,6 @@ fn ldrsb_register_offset_decodes_as_signed_byte() {
         other => panic!("E19A80D7 must be Kind::Hw Ldrsb, got {:?}", other),
     }
 }
-
 #[test]
 fn ldrsb_is_not_ldrd_but_real_ldrd_still_decodes() {
     // NEGATIVE guard: the old decoder's regression signature was
@@ -88,7 +86,6 @@ const W_UMLAL_R1_R0: u32 = 0xE0A0_1298; // umlal r1, r0, r8, r2
 const W_SMULL_R1_R0: u32 = 0xE0C0_1298; // smull r1, r0, r8, r2
 const W_SMLAL_R1_R0: u32 = 0xE0E0_1298; // smlal r1, r0, r8, r2
 const W_UMULL_R0_R1: u32 = 0xE081_0094; // umull r0, r1, r4, r0  (measured at 0x0215B100)
-
 #[test]
 fn long_multiply_maps_rdlo_to_low_destination() {
     let cases = [
@@ -120,7 +117,6 @@ fn long_multiply_maps_rdlo_to_low_destination() {
         }
     }
 }
-
 #[test]
 fn measured_divide_loop_word_keeps_its_pair() {
     // 0x0215B100 `umull r0, r1, r4, r0`: RdLo=r0, RdHi=r1.  Phase-4K measured
@@ -130,7 +126,6 @@ fn measured_divide_loop_word_keeps_its_pair() {
         other => panic!("E0810094 must be umull r0(lo), r1(hi), got {:?}", other),
     }
 }
-
 #[test]
 fn long_multiply_codegen_writes_low_then_high_to_the_right_registers() {
     // End-to-end guard: decode -> emit.  The bug lived in the decode field
@@ -169,7 +164,6 @@ fn long_multiply_codegen_writes_low_then_high_to_the_right_registers() {
 const T_BLX_R3: u16 = 0x4798; // blx r3   (objdump: 4798 blx r3)
 const T_BX_R3: u16 = 0x4718; //  bx r3    (objdump: 4718 bx  r3)
 const A_BLX_R12: u32 = 0xE12F_FF3C; // blx ip (r12) — the Phase-4K site 0x0215B700
-
 #[test]
 fn thumb_blx_rm_links_the_next_thumb_instruction() {
     let mut out: Vec<String> = Vec::new();
@@ -191,7 +185,6 @@ fn thumb_blx_rm_links_the_next_thumb_instruction() {
         body
     );
 }
-
 #[test]
 fn arm_blx_rm_still_links_addr_plus_4() {
     // POSITIVE contrast — the ARM form must NOT be "fixed" to +2.
@@ -206,7 +199,6 @@ fn arm_blx_rm_still_links_addr_plus_4() {
         body
     );
 }
-
 #[test]
 fn thumb_bx_rm_without_link_does_not_touch_lr() {
     // Guard against a "+2 for every Bx" over-fix: plain BX must not write LR.
@@ -229,7 +221,6 @@ fn thumb_bx_rm_without_link_does_not_touch_lr() {
 // run fell through 0x0215B700 (E12FFF3C `blx r12`) instead of calling the
 // decrypt helper at 0x0215B528 — first divergence vs melonDS at step
 // 13,142,583.
-
 #[test]
 fn bx_and_blx_register_are_dispatched_before_data_processing() {
     // 0xE12FFF1E `bx lr` — every ARM return.
@@ -247,7 +238,6 @@ fn bx_and_blx_register_are_dispatched_before_data_processing() {
         other => panic!("E12FFF3C must be Kind::Bx rm=12 link=true, got {:?}", other),
     }
 }
-
 #[test]
 fn bx_register_never_decodes_as_data_processing() {
     // NEGATIVE guard: the old SMC fall-through produced a data-processing
@@ -269,7 +259,6 @@ fn bx_register_never_decodes_as_data_processing() {
         );
     }
 }
-
 #[test]
 fn runtime_smc_redecoder_keeps_its_bx_case_before_the_dp_catchall() {
     // tools/nnk_smc.inc has no C test harness (it is a generated-runtime
@@ -335,7 +324,6 @@ fn runtime_smc_redecoder_keeps_its_bx_case_before_the_dp_catchall() {
 
 const T_PUSH_R4_R5_R6_LR: u16 = 0xB570; // push {r4, r5, r6, lr}  (0x020D19B8)
 const T_POP_R4_R5_R6_PC: u16 = 0xBD70; //  pop  {r4, r5, r6, pc}  (0x020D1A1E)
-
 #[test]
 fn thumb_push_and_pop_split_on_the_l_bit() {
     let push = decode_thumb(T_PUSH_R4_R5_R6_LR, 0, 0x020D_19B8, 2);
@@ -352,7 +340,6 @@ fn thumb_push_and_pop_split_on_the_l_bit() {
         other => panic!("BD70 must be pop {{r4,r5,r6,pc}} from sp (list 0x8070), got {:?}", other),
     }
 }
-
 #[test]
 fn thumb_pop_never_decodes_as_push() {
     // NEGATIVE guard on the exact field that the old 0xF600 mask hid: with
@@ -373,7 +360,6 @@ fn thumb_pop_never_decodes_as_push() {
         other => panic!("BD70 must stay Kind::LdmStm, got {:?}", other),
     }
 }
-
 #[test]
 fn runtime_smc_redecoder_masks_the_form13_rbit() {
     // Source-level lock for the C half (same honest option as class 4 — the
@@ -430,7 +416,6 @@ const T_BLX_IMM_H2: u16 = 0xEAA6; // blx suffix: 11101 (bit12 = 0)
 const T_BL_IMM_H2: u16 = 0xFAA6; //  bl  suffix: 11111 (bit12 = 1)
 const BLXI_SITE: u32 = 0x020D_2418;
 const BLXI_TARGET: u32 = 0x020E_7968;
-
 #[test]
 fn thumb_blx_immediate_target_is_arm_state() {
     let insn = decode_thumb(T_BLX_IMM_H1, T_BLX_IMM_H2, BLXI_SITE, 4);
@@ -452,7 +437,6 @@ fn thumb_blx_immediate_target_is_arm_state() {
         other => panic!("F015 EAA6 must be Flow::Call, got {:?}", other),
     }
 }
-
 #[test]
 fn thumb_bl_immediate_stays_in_thumb_state() {
     // NEGATIVE neighbour of the same encoding pair: only bit 12 of the suffix
@@ -469,7 +453,6 @@ fn thumb_bl_immediate_stays_in_thumb_state() {
     assert_eq!(T_BLX_IMM_H2 & 0x1000, 0x0000, "blx suffix: bit12 = 0");
     assert_eq!(T_BL_IMM_H2 & 0x1000, 0x1000, "bl suffix: bit12 = 1");
 }
-
 #[test]
 fn runtime_smc_redecoder_carries_the_blx_state() {
     // Source-level lock for the C half (same honest option as classes 4/5 —
@@ -500,7 +483,6 @@ fn runtime_smc_redecoder_carries_the_blx_state() {
          revisiting the same target would inherit a stale state"
     );
 }
-
 #[test]
 fn runtime_smc_redecoder_interworks_on_ldm_pc_and_links_arm_blx_even() {
     // Phase-5D, class 7: the ARM9's *data-dependent* interworking.  Ground
@@ -582,7 +564,6 @@ fn thumb_blx_immediate_aligns_the_pc_base() {
         other => panic!("expected Thumb BLX immediate, got {:?}", other),
     }
 }
-
 #[test]
 fn thumb_bl_immediate_keeps_the_unaligned_pc_base() {
     // F7FF FF8D at 0x020D136E = `bl 0x020D128C` (binutils).  The aligned base
@@ -597,7 +578,6 @@ fn thumb_bl_immediate_keeps_the_unaligned_pc_base() {
         other => panic!("expected Thumb BL immediate, got {:?}", other),
     }
 }
-
 #[test]
 fn runtime_smc_redecoder_aligns_the_thumb_blx_base() {
     let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../tools/nnk_smc.inc");
@@ -704,7 +684,6 @@ fn runtime_smc_redecoder_splits_the_thumb_imm_halfword_form() {
         "regression: the Thumb immediate halfword arm no longer reads a 16-bit element (imm5 scaled by 2)"
     );
 }
-
 #[test]
 fn runtime_smc_redecoder_splits_add_sp_from_sub_sp() {
     // Phase-5J, class 12: Thumb `1011 0000 0 imm7` is ADD SP,#imm*4 and
@@ -730,7 +709,6 @@ fn runtime_smc_redecoder_splits_add_sp_from_sub_sp() {
     assert_eq!(0xB084 & 0x80, 0x80, "fixture sanity: 0xB084 has bit7 set (SUB)");
     assert_eq!(0xB019 & 0x80, 0x00, "fixture sanity: 0xB019 has bit7 clear (ADD)");
 }
-
 #[test]
 fn interworking_targets_carry_their_state_across_the_dispatch() {
     // Phase-5J, classes 13/14: the target of an interworking transfer carries
@@ -782,7 +760,6 @@ fn interworking_targets_carry_their_state_across_the_dispatch() {
         "regression: the ARM LDM arm no longer masks bit0 for a one-register list"
     );
 }
-
 #[test]
 fn compiled_bx_and_blx_rm_carry_the_target_state() {
     // Phase-5K, follow-up G: the Phase-5J class (13) fixed the LDM/`pop {..,pc}`
@@ -806,7 +783,6 @@ fn compiled_bx_and_blx_rm_carry_the_target_state() {
         "regression: the register-indirect branch no longer notes the state it transfers to"
     );
 }
-
 #[test]
 fn frozen_image_patch_decides_the_ldm_form_from_the_compiled_word() {
     // Phase-5K, barrier F: tools/p5j_note_branch.py spliced
@@ -840,7 +816,6 @@ fn frozen_image_patch_decides_the_ldm_form_from_the_compiled_word() {
     assert_eq!(0xE8BD8000u32 & 0x00100000, 0x00100000, "fixture sanity: A_LDM load bit");
     assert_eq!(0xE8BD8000u32 & 0x00008000, 0x00008000, "fixture sanity: pc in the list");
 }
-
 #[test]
 fn case_labels_carry_the_exact_state_marker() {
     // Phase-5K, follow-up H: nnk_pc_is_thumb() was built from the addr+2
@@ -1062,7 +1037,6 @@ const T_BLX_I3_H1: u16 = 0xF75D; // blx 0x02054144 — measured at 0x020F6ED6
 const T_BLX_I3_H2: u16 = 0xE936; // suffix 11101 = BLX (switches to ARM)
 const T_BLX_I3_SITE: u32 = 0x020F_6ED6;
 const T_BLX_I3_TARGET: u32 = 0x0205_4144;
-
 #[test]
 fn compiled_blx_immediate_carries_the_state_it_switches_to() {
     // (a) the encoding: Thumb BLX imm is Kind::BlxImm on the even target.
@@ -1248,7 +1222,6 @@ fn cpsr_i_transitions_are_observable_through_the_single_ctl_funnel() {
     assert_eq!(0x02008D28u32 & 3, 0, "fixture: OS_DisableInterrupts' msr is ARM-aligned");
     assert_eq!(0x02008D40u32 & 3, 0, "fixture: OS_RestoreInterrupts' msr is ARM-aligned");
 }
-
 #[test]
 fn thumb_pic_base_register_is_not_an_interworking_target() {
     // Phase-5X, class 35: the post-skip halt at 0x020DDF08.
@@ -1301,7 +1274,6 @@ fn thumb_pic_base_register_is_not_an_interworking_target() {
     assert_eq!(base, 0x020DDE9Cu32, "fixture: add r3,pc base");
     assert_eq!(pc + 2, 0x020DDE9Cu32, "fixture: the coincident next instruction");
 }
-
 #[test]
 fn input_file_is_frame_timed_and_masks_the_key_space() {
     // Phase-5X, operator request: `NNK_INPUT_FILE` — the DQ8 `DQ8_INPUT_FILE`
@@ -1457,7 +1429,6 @@ fn vrcy_slot(a: u32) -> Option<usize> {
         _ => None, // 0x04000247 WRAMCNT, 0x0400024A/B unused
     }
 }
-
 #[test]
 fn vramcnt_h_and_i_are_at_0x248_and_0x249_with_wramcnt_at_0x247() {
     // (a) the measured guest sequence reproduces melonDS's bank file.
@@ -2715,7 +2686,6 @@ fn runtime_ld16_mapped(addr: u32) -> bool {
     }
     (addr as u64) + 2 <= GBASE as u64 + GSIZE as u64
 }
-
 #[test]
 fn phase_5ak_stream_state_guard_terminates_on_the_unmapped_data_pointer() {
     const SIBLING_OBJ_124: u32 = 0x022C_C838; // [0x022CC714+0x124] = 0
@@ -2760,7 +2730,6 @@ fn phase_5ak_stream_state_guard_terminates_on_the_unmapped_data_pointer() {
         StreamGuard::Normal
     );
 }
-
 #[test]
 fn phase_5ak_audio_silence_fill_reaches_the_stream_object() {
     // The 0x80 fill's geometry, measured at the memset entry (0x02009C90,
@@ -2785,4 +2754,29 @@ fn phase_5ak_audio_silence_fill_reaches_the_stream_object() {
     const SIBLING_OBJ: u32 = 0x022C_C714;
     assert!(SIBLING_OBJ < last);
     assert!(SIBLING_OBJ + 0x1B8 == ABORTING_OBJ, "the measured 0x1B8 stride");
+}
+#[test]
+fn phase_5al_the_guard_is_benign_on_the_melonds_object_and_the_payload_is_0x1a8() {
+    // (0x25 << 4) - 0xA8 = the block the post-movie object loop asks the guest
+    // heap for; + 0x10 of allocator header = the measured 0x1B8 sibling stride.
+    let payload = (0x25u32 << 4) - 0xA8;
+    assert_eq!(payload, 0x1A8, "the measured allocation size at 0x020E1B6B");
+    assert_eq!(payload + 0x10, 0x1B8, "the measured object stride");
+
+    // The vendored window decoder: 0x80808080 is outside every mapped window,
+    // so the guard's `ldrh r0,[r0]` reads 0 (melonDS: NDS::ARM9Read16 has no
+    // case for 0x80xxxxxx and returns 0).
+    let ld16 = |_a: u32| 0u16;
+    // melonDS's object: 0x0505 latched, new state 0, NULL data pointer.
+    assert_eq!(
+        nns_stream_state_guard(0x0505, 0, 0, &ld16),
+        StreamGuard::Normal,
+        "melonDS reaches the guard with [obj+0x124] == 0 and returns normally"
+    );
+    // Our object: same call, but the field holds the 0x80 silence fill's words.
+    assert_eq!(
+        nns_stream_state_guard(0x0505, 0, 0x8080_8080, &ld16),
+        StreamGuard::Terminate,
+        "our object's uninitialised +0x124 is what parks the guest"
+    );
 }
