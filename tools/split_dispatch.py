@@ -457,6 +457,23 @@ def main():
     # ROM), so it must sit next to nnk_main.c like the fragments above.
     shutil.copyfile(os.path.join(here, "nnk_rom.inc"),
                     os.path.join(outdir, "nnk_rom.inc"))
+    # Phase-5AP: the ROM-derived `pc -> form` map (tools/gen_pcform.py).  It is
+    # a build artifact under work/ and never committed, so the build names it
+    # with NNK_PCFORM_MAP; without it an EMPTY map is written and the runtime
+    # falls back to its own inference exactly as before this phase.
+    map_src = os.environ.get("NNK_PCFORM_MAP", "")
+    map_dst = os.path.join(outdir, "nnk_pcform_map.h")
+    if map_src and os.path.isfile(map_src):
+        shutil.copyfile(map_src, map_dst)
+        sys.stderr.write("Phase-5AP: pcform map %s -> %s\n" % (map_src, map_dst))
+    else:
+        with open(map_dst, "w") as fh:
+            fh.write("/* Phase-5AP: EMPTY pc->form map (no NNK_PCFORM_MAP) */\n"
+                     "#ifndef NNK_PCFORM_MAP_H\n#define NNK_PCFORM_MAP_H\n"
+                     "#define NNK_PCFORM_THUMB_RUNS 0\n#define NNK_PCFORM_ARM_RUNS 0\n"
+                     "static inline int nnk_pcform_lookup(uint32_t pc)\n"
+                     "{\n    (void)pc;\n    return -1;\n}\n#endif\n")
+        sys.stderr.write("Phase-5AP: no pcform map (%r) -> EMPTY map\n" % map_src)
 
     # ---- Phase-4M: VRAMCNT_A..I model hooks -----------------------------
     # The generated image's IO model is store-only AND 8-bit-only for

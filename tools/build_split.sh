@@ -188,6 +188,26 @@ if [[ -f "$IMAGE" ]] && ! grep -q 'nnk_rom_image_load' "$IMAGE"; then
   fi
 fi
 
+# Phase-5AP: the frozen image masks bit0 in the interworking note of a
+# single-register ARM `ldmfd sp!,{pc}`.  For A_POP the loaded word IS the
+# hardware's target (a Thumb `blx` leaves LR = ret|1), so the mask made ov17's
+# Thumb callback body re-enter in ARM state, execute `stmiapl sl!` over its own
+# bytes and destroy sp (halt step 560,192,510).  Same policy as the splices
+# above: the canonical fix is in nnktool/src/recompile.rs, the frozen artifact
+# gets the identical transform; skip when the marker is already there.
+if [[ -f "$IMAGE" ]] && ! grep -q 'Phase-5AP pop-note splice applied' "$IMAGE"; then
+  if splice_disabled 5ap_pop_note_interwork; then
+    echo "== prelude splice DISABLED by NNK_PRELUDE_DISABLE_SPLICE: Phase-5AP pop-note (negative control) =="
+  else
+    SPLICED_IMAGE5="$(dirname "$SPLIT")/$(basename "$IMAGE" .c).p5ap.c"
+    mkdir -p "$(dirname "$SPLICED_IMAGE5")"
+    echo "== splice (Phase-5AP): ARM pop {{pc}} keeps bit0 -> $SPLICED_IMAGE5 =="
+    python3 tools/p5ap_pop_note_splice.py "$IMAGE" "$SPLICED_IMAGE5"
+    IMAGE=$SPLICED_IMAGE5
+    SPLICED_FEATURES+=(5ap_pop_note_interwork)
+  fi
+fi
+
 if [[ "$GX" == "1" ]]; then
   [[ -f "$GXDIR/Makefile" ]] || { echo "NNK_GX=1 but $GXDIR/Makefile missing" >&2; exit 2; }
   echo "== gxrender: building libgxrender.a + gx_display.o + gx_gl.o =="
@@ -214,6 +234,32 @@ if [[ -n "${NNK_MONO:-}" ]]; then
 fi
 
 # ---- split (or reuse the existing split output) ---------------------------
+# Phase-5AP: the ROM-derived pc->form map is a generated build artifact under
+# the gitignored work/ tree; tools/gen_pcform.py produces it.  Default to the
+# standard location so a build after generating it picks it up automatically.
+# An absent map is generated from the ROM; if that fails the build stops
+# (NNK_ALLOW_NO_PCFORM=1 opts into a deliberately degraded image).
+if [[ -z "${NNK_PCFORM_MAP:-}" && ! -f work/phase5ap/nnk_pcform_map.h && -f tools/gen_pcform.py ]]; then
+  # Phase-5AP: never build without the state authority by accident.  A missing
+  # map used to yield an EMPTY map (the pre-5AP behaviour) -- that is the same
+  # silent-degradation class as 5AB/5AG, so generate it from the ROM instead.
+  echo "== Phase-5AP: pcform map missing -- generating it from the ROM"
+  ROM_FOR_MAP="${NNK_ROM_PATH:-Ni No Kuni.nds}"
+  python3 tools/gen_pcform.py --rom "$ROM_FOR_MAP" --outdir work/phase5ap \
+      --tool nnktool/target/release/nnktool >/dev/null 2>&1 || true
+fi
+if [[ -z "${NNK_PCFORM_MAP:-}" && -f work/phase5ap/nnk_pcform_map.h ]]; then
+  NNK_PCFORM_MAP=$PWD/work/phase5ap/nnk_pcform_map.h
+fi
+if [[ -z "${NNK_PCFORM_MAP:-}" && "${NNK_ALLOW_NO_PCFORM:-0}" != "1" ]]; then
+  echo "ERROR: work/phase5ap/nnk_pcform_map.h is absent and could not be generated" >&2
+  echo "       (set NNK_ALLOW_NO_PCFORM=1 to build a degraded image deliberately)" >&2
+  exit 2
+fi
+export NNK_PCFORM_MAP="${NNK_PCFORM_MAP:-}"
+if [[ -n "$NNK_PCFORM_MAP" ]]; then
+  echo "== Phase-5AP: pcform map $NNK_PCFORM_MAP"
+fi
 if [[ -z "${NNK_SPLIT_SKIP_REGEN:-}" ]]; then
   [[ -f "$IMAGE" ]] || { echo "missing $IMAGE" >&2; exit 2; }
   echo "== split dispatch: $IMAGE -> $SPLIT =="
@@ -271,7 +317,7 @@ done
 
 # Everything that must invalidate a cached .o is captured once here.
 CC_ID=$("$CC" --version | head -1)
-HDR_HASH=$(cat "$SPLIT/nnk_rt.h" "$SPLIT"/nnk_smc_map.h "$SPLIT"/nnk_smc.inc "$SPLIT"/nnk_boot.inc "$SPLIT"/nnk_dma.inc "$SPLIT"/nnk_vramcnt.inc "$SPLIT"/nnk_input.inc "$SPLIT"/nnk_mobiclip.inc "$SPLIT"/nnk_mobiclip_dec.inc "$SPLIT"/nnk_rom.inc 2>/dev/null | sha256sum | cut -d' ' -f1)
+HDR_HASH=$(cat "$SPLIT/nnk_rt.h" "$SPLIT"/nnk_smc_map.h "$SPLIT"/nnk_smc.inc "$SPLIT"/nnk_boot.inc "$SPLIT"/nnk_dma.inc "$SPLIT"/nnk_vramcnt.inc "$SPLIT"/nnk_input.inc "$SPLIT"/nnk_mobiclip.inc "$SPLIT"/nnk_mobiclip_dec.inc "$SPLIT"/nnk_rom.inc "$SPLIT"/nnk_pcform_map.h 2>/dev/null | sha256sum | cut -d' ' -f1)
 
 # compile_cached <source.c> <target.o> <flag-array-name>
 # Reuse <target.o> when its sidecar stamp still matches the current content
