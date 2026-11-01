@@ -111,3 +111,17 @@ measured guest stores reproduce `H=0x82, I=0x83, WRAMCNT=0x03`; `0x246` is
 VRAMCNT_G and `0x247` is never a VRAM bank; all three implementations carry the
 slot table and the flat `a - 0x04000240` model is gone; `gx_display.c` routes
 0x248/0x249.
+
+## 5. Acceptance
+
+* `sh tools/verify_phase2a.sh` on this branch: every section (A, A2, B, C, C2,
+  D, E, F) ran to completion — recovered/Ghidra agreement 1942/2020 (96.1 %),
+  body coverage 96.5 % byte-weighted, mono recompile+`cc -O2`+run OK, and the
+  melonDS PC ground truth reproduced **1000 / 1000** (strict prefix, windowed
+  and post-resync).
+* `cargo test --release` in `nnktool`: **35 passed** (34 + class 21).
+* Native notice frame post-fix:
+  `shots/p5y_firstscreen_native_bot.png` (256x192) and the 2-up
+  `shots/p5y_firstscreen_nat_vs_mel.png` (native | melonDS `f00240.scr`).
+  Notice window in display frames: **205..255+** (fade ends at frame ~100;
+  the splash is far later, frame ~4000).
