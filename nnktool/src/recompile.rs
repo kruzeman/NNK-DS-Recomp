@@ -1588,7 +1588,25 @@ static uint8_t seen[(IMAGE_LEN / 2u + 7u) / 8u];
 #define CYCLES_PER_SCANLINE 2130u
 #define SCANLINES 263u
 static uint64_t cycles;
-static uint32_t vcount(void) { return (uint32_t)((cycles / CYCLES_PER_SCANLINE) % SCANLINES); }
+/* Phase-5AE: vcount() is called up to four times per dispatched guest
+ * instruction (the VBlank-IF producer, the DMA tick, the gx display tick and
+ * trace_pc), and each call was a 64-bit division by 2130 plus a modulo — ~40
+ * cycles a time on the measured host.  `cycles` only ever moves forward, so
+ * cache the scanline for the 2130-cycle window that contains it and answer the
+ * common case with two compares.  The returned value is bit-identical to
+ * `(cycles / CYCLES_PER_SCANLINE) % SCANLINES` for every input; a jump outside
+ * the cached window (a card stall advancing `cycles`, or a fresh start)
+ * recomputes it. */
+static unsigned long long vc_win_lo, vc_win_hi;
+static uint32_t vc_win_val;
+static uint32_t vcount(void) {
+    if (cycles >= vc_win_lo && cycles < vc_win_hi) return vc_win_val;
+    { unsigned long long q = cycles / CYCLES_PER_SCANLINE;
+      vc_win_lo = q * CYCLES_PER_SCANLINE;
+      vc_win_hi = vc_win_lo + CYCLES_PER_SCANLINE;
+      vc_win_val = (uint32_t)(q % SCANLINES); }
+    return vc_win_val;
+}
 
 /* ---- live display bridge (Phase-4E) --------------------------------------
  * gx_display (gxrender) owns the 2D/3D graphics and keypad/touch state; the
@@ -1654,6 +1672,12 @@ static int nnk_display_tick(void) {
     uint32_t vc;
     if (!gxd) return 0;
     vc = vcount();
+    /* Phase-5AE: inside one scanline there is nothing to do, and the tail call
+     * into libgxrender (gxd_should_quit) was made on EVERY dispatched guest
+     * instruction.  Poll once per scanline instead: the frame edge tested below
+     * is the only state this function has, so presentation is unchanged and the
+     * window-close latency becomes <2130 instructions. */
+    if (vc == (uint32_t)gxd_last_vc) return 0;
     if (gxd_last_vc < 192u && vc >= 192u) {
         gxd_frame(gxd);
         gxd_frames++;

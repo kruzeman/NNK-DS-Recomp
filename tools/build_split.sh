@@ -115,6 +115,17 @@ if [[ -f "$IMAGE" ]] && ! grep -q 'gxd_sh_rd' "$IMAGE"; then
   python3 tools/p5x_runtime_splice.py "$IMAGE" "$SPLICED_IMAGE"
   IMAGE=$SPLICED_IMAGE
 fi
+# Phase-5AE: the frozen image predates the per-step speed-ups in the prelude
+# (cached vcount()).  Same policy as the Phase-5X splice above: the canonical
+# change is in nnktool/src/recompile.rs, and the frozen artifact gets the
+# identical transform so the guest parts stay byte-identical to previous phases.
+if [[ -f "$IMAGE" ]] && ! grep -q 'nnk_probe_mask' "$IMAGE"; then
+  SPLICED_IMAGE2="$(dirname "$SPLIT")/$(basename "$IMAGE" .c).p5ae.c"
+  mkdir -p "$(dirname "$SPLICED_IMAGE2")"
+  echo "== prelude splice (Phase-5AE): cached vcount() -> $SPLICED_IMAGE2 =="
+  python3 tools/p5ae_runtime_splice.py "$IMAGE" "$SPLICED_IMAGE2"
+  IMAGE=$SPLICED_IMAGE2
+fi
 
 if [[ "$GX" == "1" ]]; then
   [[ -f "$GXDIR/Makefile" ]] || { echo "NNK_GX=1 but $GXDIR/Makefile missing" >&2; exit 2; }

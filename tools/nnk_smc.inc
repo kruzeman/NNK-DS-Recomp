@@ -50,6 +50,19 @@ static int smc_f8log = -1;                /* NNK_F8LOG: live Thumb format-8 log 
 static uint8_t smc_dirty[SMC_BAND_N + 2]; /* band has seen a guest store */
 static uint32_t smc_gen[SMC_BAND_N + 2];  /* per-band store generation */
 static uint32_t smc_icnt[SMC_BAND_N + 2]; /* re-decoded instructions per band */
+/* Phase-5AE: 256-byte dirty blocks for the dispatch probe.  The 32 KiB band
+ * granularity is what the GEN counters need (one counter per re-decodable
+ * window), but it is far too coarse for the PROBE: one guest store anywhere in
+ * a 32 KiB band makes every PC in it probe the live word on every dispatch.
+ * Measured on the notice-screen loop: 146,601,293 probes for 150,000,000
+ * dispatched instructions (i.e. ~98% of steps re-read the live word) while only
+ * 130,972 of them were actually stale.  The dirty test is a pure FILTER — the
+ * decision is still `w == iw` — so narrowing it changes no behaviour, only how
+ * many probes reach the compare. */
+static uint8_t smc_dblk[GSIZE >> 8];
+static signed char smc_band_seg[SMC_BAND_N + 2]; /* band -> generation-0 segment
+                                          * (-1: no compiled word, -2: partial
+                                          *  coverage -> slow path) */
 static unsigned long long smc_ntry;       /* probes that landed in a dirty band */
 static unsigned long long smc_nhit;       /* compiled generation found stale */
 static unsigned long long smc_ninsn;      /* instructions re-decoded */
@@ -187,6 +200,26 @@ static struct { uint32_t addr; uint32_t len; uint8_t *data; } smc_seg[SMC_SEG_N]
 static int smc_seg_n;
 
 /* ---- generation-0 snapshot ---------------------------------------------- */
+/* Phase-5AE: resolve every 32 KiB band to the generation-0 segment that fully
+ * covers it, once at start-up, so the per-dispatch probe does not re-walk the
+ * segment table (that loop was ~2 range tests + 8 byte loads per probe).  A
+ * band that only PARTIALLY overlaps a segment keeps the slow path, so the
+ * classification is exactly the per-word one smc_img_word() performs. */
+static void smc_build_band_map(void) {
+    int i, s;
+    for (i = 0; i < (int)SMC_BAND_N; i++) {
+        uint32_t lo = GBASE + ((uint32_t)i << SMC_BAND_SHIFT);
+        uint32_t hi = lo + (1u << SMC_BAND_SHIFT);
+        smc_band_seg[i] = -1;
+        for (s = 0; s < smc_seg_n; s++) {
+            uint32_t sa = smc_seg[s].addr;
+            uint32_t se = sa + smc_seg[s].len;
+            if (lo >= sa && hi <= se) { smc_band_seg[i] = (signed char)s; break; }
+            if (lo < se && hi > sa) { smc_band_seg[i] = -2; break; }
+        }
+    }
+}
+
 static void smc_arm(void) {
     const char *p = getenv("NNK_SMC");
     const char *img;
@@ -230,6 +263,7 @@ static void smc_arm(void) {
         smc_seg_n++;
     }
     if (!smc_seg_n) return;
+    smc_build_band_map();
     smc_armed = 1;
     p = getenv("NNK_SMC_TRACE");
     if (p && p[0]) smc_trace_left = atoi(p);
@@ -353,6 +387,10 @@ static inline void smc_note(uint32_t a, uint32_t n) {
         smc_dirty[b] = 1;
         smc_gen[b]++;
     }
+    /* Phase-5AE: 256-byte dirty blocks — the granularity the dispatch probe
+     * tests (see smc_dblk). */
+    { uint32_t q;
+      for (q = o >> 8; q <= (e >> 8); q++) smc_dblk[q] = 1; }
 }
 
 /* ---- decode helpers ----------------------------------------------------- */
@@ -1101,11 +1139,21 @@ int nnk_smc_try(uint32_t *pcp) {
     if ((pc & 0xFF000000u) != GBASE) return 0;      /* main-RAM code window only */
     o = pc & 0x3FFFFFu;
     if (o >= GSIZE) return 0;
-    if (!smc_dirty[o >> SMC_BAND_SHIFT]) return 0;
+    /* Phase-5AE: 256-byte dirty test (a pure filter: a clean block cannot hold
+     * a different word than the compiled generation), then the pre-resolved
+     * generation-0 segment for this band. */
+    if (!smc_dblk[o >> 8]) return 0;
+    { int sg = smc_band_seg[o >> SMC_BAND_SHIFT];
+      if (sg == -1) return 0;                       /* no compiled word here */
+      if (sg >= 0) {
+          const uint8_t *b = smc_seg[sg].data + (pc - smc_seg[sg].addr);
+          iw = (uint32_t)b[0] | ((uint32_t)b[1] << 8) |
+               ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
+      } else if (!smc_img_word(pc, &iw, NULL)) return 0;  /* partial band */
+    }
     smc_ntry++;
     w = (uint32_t)gmem[o] | ((uint32_t)gmem[o + 1u] << 8) |
         ((uint32_t)gmem[o + 2u] << 16) | ((uint32_t)gmem[o + 3u] << 24);
-    if (!smc_img_word(pc, &iw, NULL)) return 0;     /* no compiled word here */
     if (w == iw) return 0;                          /* compiled generation current */
     smc_nhit++;
     smc_icnt[o >> SMC_BAND_SHIFT]++;
@@ -1476,6 +1524,13 @@ static void p5u_report(void) {
 static void p5u_init(void) {
     const char *s = getenv("NNK_P5U");
     p5u_state = 1;                             /* off unless enabled */
+#ifdef NNK_P5U_GATE
+    /* Phase-5AE: tell trace_pc's per-step gate (see tools/p5ae_runtime_splice.py
+     * / the canonical prelude) that this probe is off, so the per-instruction
+     * call disappears.  Identical behaviour: p5u_hook() returned at its next
+     * line when p5u_state != 2. */
+    nnk_p5u_on = 0;
+#endif
     if (!s || !s[0] || s[0] == '0') return;
     s = getenv("NNK_P5U_FROM");
     if (s && s[0]) p5u_from = (uint64_t)strtoull(s, NULL, 0);
@@ -1486,6 +1541,9 @@ static void p5u_init(void) {
     if (p5u_every == 0) p5u_every = 1;
     p5u_next = p5u_from;
     p5u_state = 2;
+#ifdef NNK_P5U_GATE
+    nnk_p5u_on = 1;
+#endif
     atexit(p5u_report);
     fprintf(stderr, "p5u: on from=%llu every=%llu\n",
             (unsigned long long)p5u_from, (unsigned long long)p5u_every);
