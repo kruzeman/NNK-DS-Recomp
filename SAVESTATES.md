@@ -185,9 +185,13 @@ state: REFUSED <path>: <the failing field>
 
 and the process **keeps running**: at boot `NNK_SAVESTATE=` falls back to
 replaying the boot (`state: boot from '…' failed — replaying the boot`), and
-an F9 refusal leaves the current run untouched. Nothing is applied
-partially: the payload is read and all region CRCs verified before the first
-region is touched.
+an F9 refusal leaves the current run untouched. The loader verifies every
+region's name, offset, bounds, length and CRC **before the first region is
+touched**, so a refusal cannot leave a half-applied machine. The one
+state-sized region is `moviestreams`: a state recorded inside a movie names
+streams the fresh process has not opened yet, so the loader rebuilds them
+from the saved codecs (`p5t_stream()` re-opens the same container from the
+same card image) and then applies the cursors.
 
 Measured refusal cases (header byte flipped in a copy):
 
@@ -197,25 +201,52 @@ version 1 -> 2            state: REFUSED … format version 2, this build writes
 rom_hdr_crc byte flipped  state: REFUSED … header CRC mismatch (corrupt or from another format)
 ```
 
+Each case then replayed the boot and ran its 2,000,000-step budget
+(`done steps=2000001 … halt=step budget exhausted`), i.e. it kept running
+instead of crashing or restoring silently.
+
 ## 8. Determinism: what a restore guarantees, and what it does not
 
 The emulator has **no wall-clock reads** (no `SDL_GetTicks`, no `time()`, no
 sleep): guest time is `cycles`/`steps`, and presentation is driven by the
 emulated VBlank. A headless run is therefore reproducible and a restore is
-exact — measured: a state saved at step 30,000,000 and continued to
-32,000,000 gives the same state hash as a run booted from that state, and the
-`<base>.<frame>.top/bot.ppm` frames are byte-identical (`cmp`).
+exact. Measured on the merged build:
+
+| run | save | compare | result |
+|---|---|---|---|
+| pre-movie | step 30,000,000 → 32,000,000 | `state hash` | identical (fnv `0x16418EE6`, crc `0xDA68B041`) |
+| pre-movie | same | frames 60 | byte-identical (`cmp`, 2/2 screens) |
+| mid-movie | step 400,000,000 → 420,000,000 | `state hash` | identical (fnv `0xD79EC5F7`, crc `0x9E22B18E`) |
+| mid-movie | same | frames 725/750 | byte-identical |
+| in the intro film | step 2,300,000,000 → 2,450,000,000 | frames 4125…4375 (11 frames × 2 screens) | **22/22 byte-identical**, same halt (`pc=0x02016B50`, `distinct_pcs=22884`) |
+
+The last one is the interesting one: the state was recorded while the Mobiclip
+movie was playing, so it also proves the per-stream cursors and the
+`gxblob` VRAM/compositor snapshot. On load the stream table is rebuilt from
+the saved codecs and the decoder is re-opened and replayed sequentially from
+frame 0 (`nnks_movie_resync`). Rewinding an existing decoder with
+`mobiclip_flush()` instead left the lower half of the picture corrupt
+(measured in a window F9: rows 102..191 differed), which is why the resync
+re-opens it now.
+
+Window F5/F9 (xvfb + xdotool, `tools/nnks_win_f5f9.sh`): with `NNK_GX=window`
+the run was booted from the in-film state, F5 saved at frame 4124, the guest
+presented on to frame 4150 (the picture moved on), F9 restored, and the frame
+4125 capture written by the restored run was byte-identical to the one the
+continued run had written (`cmp`); the frame-4150 capture differs. Window
+captures of the same three moments are the PNG evidence.
 
 The one thing that is *not* part of the machine is **real keyboard input in
 the window**. SDL key events arrive at host wall-clock times while the
 emulator runs as fast as the host can (there is no real-time pacing), so the
 same physical press spans a different number of emulated frames from run to
 run. That is the source of "same binary, same presses, different result" in
-interactive sessions — not a clock inside the emulator. For reproducible
-window sessions drive the game with `NNK_INPUT_FILE` (frame-indexed script)
-and use F5/F9 only as discrete, frame-synchronous events. A state restore is
-also independent of that: the effective key mask is part of the `input`
-region.
+interactive sessions — not a clock inside the emulator: the headless and
+window paths both produced byte-identical frames for the same machine state.
+For reproducible window sessions drive the game with `NNK_INPUT_FILE`
+(frame-indexed script) and use F5/F9 only as discrete, frame-synchronous
+events. A state restore is also independent of that: the effective key mask
+is part of the `input` region.
 
 ## 9. Tools and checks
 
