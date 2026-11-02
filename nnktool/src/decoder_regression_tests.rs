@@ -3653,3 +3653,86 @@ fn phase_5aw_live_decoder_sign_extends_a_thumb_backward_branch() {
     );
     assert!(smc.contains("o = (o << 7) >> 7;"), "the BL/BLX pair keeps its 25-bit extension");
 }
+
+// ===========================================================================
+// Phase-5AZ, class: the state of a pc reached by a NON-interworking transfer.
+//
+// Measured on the cold boot (master 9e0429e + the 5AW decode fixes), step
+// 39,238,544: the compiled ov17 ARM routine at 0x020FBEAC ends with
+//     0x020FBEAC  ebfc1d43  bl 0x020033C0
+// and 0x020033C0 is a case the compiled image does NOT carry, so the dispatch
+// falls through to the live decoder.  0x020033C0 is also a HOLE in the
+// ROM-derived pcform map (tools/gen_pcform.py's descent never reached it), the
+// `bl` sets pc directly (no `nnk_smc_note_branch`, correctly: an ARM `bl` is
+// not an interworking transfer), and the ov17 arena's band is guest-loaded so
+// smc_map_live_ok() is false there.  Every authority was therefore silent and
+// the decode fell back to `smc_t_sticky`, the state of some unrelated earlier
+// live decode — Thumb.  The Thumb reading of the ARM veneer runs
+//     0x020033C0  0x1008  (2 bytes)              <- ldr r1,[pc,#8] as Thumb
+//     0x020033C2  0xE59F  b.n 0x02002F04
+// and 0x02002F04 is two bytes INTO the ARM epilogue 0x02002EE0..0x02002F28
+// (`cmp r5,#0 / addeq sp,sp,#0x30 / popeq {r3,r4,r5,pc}`), which popped the
+// garbage 0x020D23E2 and wandered into the SDK idle loop 0x02007134/0x02007138.
+//
+// ARMv5T: a direct B/BL preserves the processor state; only interworking
+// transfers (BX/BLX/pop{pc}/LDM{pc}) and exception returns change it, and all
+// of those already carry the successor's bit0/T state into the decoder.
+#[test]
+fn phase_5az_a_direct_branch_inherits_the_predecessor_state() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+
+    // 1. The two readings of the same bytes.  0xE59F1008 is ARM `ldr r1,[pc,#8]`
+    //    (4 bytes, next pc 0x020033C4); its HIGH half 0xE59F read as Thumb is an
+    //    unconditional `b.n` whose target lands mid-epilogue.  This is why the
+    //    state, not the decoding, is the bug: both decodes succeed.
+    let arm_word = 0xE59F_1008u32;
+    assert_eq!(arm_word & 0xFFFF, 0x1008, "ARM ldr's low half is not the Thumb half");
+    let insn = decode_thumb(0xE59F, 0, 0x0200_33C2, 2);
+    match insn.kind {
+        Kind::B { link: false, cond: 14, target } => assert_eq!(
+            target, 0x0200_2F04,
+            "the Thumb reading of 0xE59F must land at the measured mid-epilogue pc"
+        ),
+        other => panic!("0xE59F must decode as an unconditional b.n, got {:?}", other),
+    }
+    // -1218 = -(0x4C2): the displacement that turns the ARM word's second half
+    // into a jump into the middle of the neighbouring ARM function.
+    let bo: i32 = ((0xE59Fu32 & 0x7FFu32) << 1) as i32;
+    assert_eq!((bo << 20) >> 20, -0x4C2);
+    assert_eq!(0x0200_33C6u32.wrapping_sub(0x4C2), 0x0200_2F04);
+
+    // 2. The runtime rule.  A non-interworking transfer (the only pc changes
+    //    left after the carried-state and fall-through cases) inherits the
+    //    predecessor's state; the stale sticky guess is now the LAST resort.
+    let smc = std::fs::read_to_string(root.join("../tools/nnk_smc.inc")).expect("nnk_smc.inc");
+    assert!(
+        smc.contains("static int smc_state_from_branch(uint32_t pc, uint32_t prev_pc)"),
+        "regression: the decoder lost the direct-branch state rule"
+    );
+    assert!(
+        smc.contains("if (pc == prev_pc + 2u || pc == prev_pc + 4u) return -1;"),
+        "a fall-through (pc+2/pc+4) cannot change the state and must not be treated as a branch"
+    );
+    assert!(
+        smc.contains("return nnk_pc_is_thumb(prev_pc) ? 1 : 0;"),
+        "the compiled image's own form map must answer when the ROM map is silent \
+         (the overlay arenas are guest-loaded, so smc_map_live_ok() is false there)"
+    );
+    assert!(
+        smc.contains("*src = \"branch-predecessor\";"),
+        "the new inference source must be named in the stateconf diagnostics"
+    );
+
+    // 3. Order of authority: a register that carries the tagged target wins, then
+    //    a fresh live decode / fall-through stride, then the direct-branch rule,
+    //    then sticky.  A rule that ran before the stride check would mis-grade
+    //    every ordinary sequential instruction.
+    let i_regs = smc.find("smc_state_from_regs(pc)").expect("branch-register rule");
+    let i_stride = smc.find("smc_state_from_stride(pc, prev_pc)").expect("stride rule");
+    let i_branch = smc.find("smc_state_from_branch(pc, prev_pc)").expect("branch rule");
+    let i_sticky = smc.find("*form = smc_t_sticky;").expect("sticky fallback");
+    assert!(
+        i_regs < i_stride && i_stride < i_branch && i_branch < i_sticky,
+        "state inference order changed: register < stride < branch < sticky"
+    );
+}
