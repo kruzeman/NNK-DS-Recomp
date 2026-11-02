@@ -3460,3 +3460,131 @@ fn phase_5at_mode_override_corrects_a_wrong_mode_seed() {
         assert!(s.contains("case 0x02063338u:"), "unrelated cases must survive");
     }
 }
+
+// --------------------------------------------------------------- class 58 ---
+// Phase-5AW: an ARM exception return must hand the restored SPSR's T bit to
+// the NEXT dispatch.  The target is a dynamic `lr-4`, so the compiled map, the
+// ROM-derived pcform map and the register/stride/sticky ladder all have no
+// answer for it.
+//
+// Measured at the dialog prompt (savestate step 1,106,894,724 + A at frames
+// 1990..1996): 0x0200729C `subs pc, lr, #4` (word E25EF004) restored a thread
+// context whose SPSR is 0x2000001F (T=0 -> ARM) and resumed at lr-4 =
+// 0x01FFC684.  That pc is ITCM, live-decoded, and its previous live decode had
+// been a Thumb stream, so the stale sticky guess decoded the ARM blit code as
+// Thumb:
+//     0x01FFC684  ARM: e089314a  add r3, r9, sl, asr #2
+//                 Thumb: 314a    adds r1, #0x4A
+//                        e089    b.n  0x01FFC79C
+//     0x01FFC79C  Thumb 7087     strb r7, [r0, #2]
+//     0x01FFC79E  Thumb e040     b.n  0x01FFC822  -> 0x01FFC4EC
+// The ARM epilogue at 0x01FFC4EC then ran without its `push {lr}` prologue, so
+// `pop {pc}` at 0x01FFC548 popped the codec/data pointer 0x022C9F38; the run
+// executed that data table as ARM and halted with `dispatch to untranslated pc`
+// at 0x022CA20C (data word 0xFFFFFFD3, step 1,112,592,480).
+#[test]
+fn phase_5aw_exception_return_carries_the_spsr_instruction_state() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+
+    // 1. The emitter: the S-form pc write in a privileged mode must call the
+    //    carrier with the computed target and the restored SPSR.
+    let insn = decode_arm(0xE25E_F004, 0x0200_729C); // subs pc, lr, #4
+    assert_eq!(insn.text, "subs pc, lr, #4");
+    match insn.kind {
+        Kind::Dp { op: 2, s: true, rd: 15, rn: 14, .. } => {}
+        other => panic!("E25EF004 must be subs pc, lr, #4, got {:?}", other),
+    }
+    let mut out = Vec::new();
+    let e = super::emit_insn(&insn, 0x0200_729C, false, false, String::new(), &mut out, true);
+    let body = e.body.join("\n");
+    assert!(
+        body.contains("cpsr_set_ctl(_spsr & 0xFFu)"),
+        "the exception return must still restore the mode byte: {}",
+        body
+    );
+    assert!(
+        body.contains("nnk_smc_note_exc_return(pc, _spsr)"),
+        "the exception return must carry the SPSR T bit to the resumed pc: {}",
+        body
+    );
+    assert!(
+        !body.contains("nnk_smc_note_branch(pc)"),
+        "the carrier needs the SPSR (a masked branch note drops T): {}",
+        body
+    );
+
+    // 2. The runtime half: the hook keys the carrier on SPSR bit 5 (the ARM
+    //    CPSR T bit), and the live decoder's own exception return does the
+    //    same, so compiled and live code cannot disagree.
+    let smc = std::fs::read_to_string(root.join("../tools/nnk_smc.inc")).expect("nnk_smc.inc");
+    assert!(
+        smc.contains("void nnk_smc_note_exc_return(uint32_t target, uint32_t spsr)"),
+        "the exception-return carrier hook is gone"
+    );
+    assert!(
+        smc.contains("smc_branch_mode((target & ~1u) | ((spsr >> 5) & 1u));"),
+        "the carrier must take the target's state from SPSR bit 5 (CPSR T)"
+    );
+    assert!(
+        smc.contains("smc_branch_mode(*npc | ((spsr >> 5) & 1u));"),
+        "smc_exec_arm's exception return must carry the state too"
+    );
+    let sd = std::fs::read_to_string(root.join("../tools/split_dispatch.py")).expect("split_dispatch.py");
+    assert!(
+        sd.contains("void nnk_smc_note_exc_return(uint32_t target, uint32_t spsr);"),
+        "the band TUs call the hook, so nnk_rt.h must declare it"
+    );
+
+    // 3. The frozen image: the splice rewrites every exception-return block and
+    //    stamps the marker the manifest row quotes.
+    let splice = std::fs::read_to_string(root.join("../tools/p5aw_exc_return_splice.py"))
+        .expect("tools/p5aw_exc_return_splice.py");
+    assert!(splice.contains("Phase-5AW exception-return state splice applied"));
+    let tmp = std::env::temp_dir().join("nnk_p5aw_splice_test");
+    let _ = std::fs::create_dir_all(&tmp);
+    let frozen = tmp.join("frozen.c");
+    std::fs::write(
+        &frozen,
+        "        case 0x0200729Cu:\n\
+        \x20   if (mode_priv()) { uint32_t _spsr = spsr_bank[mode_cur]; cpsr_set_ctl(_spsr & 0xFFu); \
+n = (_spsr >> 31) & 1; z = (_spsr >> 30) & 1; c = (_spsr >> 29) & 1; v = (_spsr >> 28) & 1; }\n\
+        \x20   break;\n",
+    )
+    .unwrap();
+    let spliced = tmp.join("spliced.c");
+    let r = std::process::Command::new("python3")
+        .arg(root.join("../tools/p5aw_exc_return_splice.py"))
+        .arg(&frozen)
+        .arg(&spliced)
+        .output()
+        .expect("python3");
+    assert!(
+        r.status.success(),
+        "splice failed:\n{}\n{}",
+        String::from_utf8_lossy(&r.stdout),
+        String::from_utf8_lossy(&r.stderr)
+    );
+    let s = std::fs::read_to_string(&spliced).unwrap();
+    assert!(
+        s.starts_with("/* Phase-5AW exception-return state splice applied */"),
+        "the marker must be the first line, where the audit reads it"
+    );
+    assert!(
+        s.contains("v = (_spsr >> 28) & 1; nnk_smc_note_exc_return(pc, _spsr); }"),
+        "the block must keep the flags and append the carrier: {}",
+        s
+    );
+
+    // 4. The toolchain wiring: build_split gates on the marker and registers
+    //    the feature, and the manifest row quotes the splice's own marker.
+    let bs = std::fs::read_to_string(root.join("../tools/build_split.sh")).expect("build_split.sh");
+    assert!(bs.contains("Phase-5AW exception-return state splice applied"), "the marker gate is gone");
+    assert!(bs.contains("tools/p5aw_exc_return_splice.py"), "the splice is not wired into the build");
+    assert!(bs.contains("SPLICED_FEATURES+=(5aw_exc_return_state)"), "the audit is not told about it");
+    let man = std::fs::read_to_string(root.join("../tools/nnk_prelude_manifest.txt")).expect("manifest");
+    assert!(
+        man.lines().any(|l| l.starts_with(
+            "5aw_exc_return_state\trequired\tPhase-5AW exception-return state splice applied\t")),
+        "the manifest row for the splice is missing or does not quote the splice marker"
+    );
+}
