@@ -3320,3 +3320,143 @@ fn phase_5as_state_carrier_wins_over_a_wrong_form_compiled_case() {
     let st = std::fs::read_to_string(dir.join("../tools/nnk_state.inc")).expect("nnk_state.inc");
     assert!(st.contains("NNK_SAVESTATE_IGNORE_BUILD"));
 }
+
+// Phase-5AT: a WRONG-MODE seed row must be correctable by the committed, audited
+// override table, and the shipped frozen image must get the same body.
+//
+// Measured (Phase-5AS): ov17's Thumb function 0x020FEB94 calls 0x02062C44 with
+// `bl` at 0x020FEBB2 (LR = 0x020FEBB7, odd = Thumb), the bytes are
+//     0x02062C44  b510        push {r4,lr}
+//     0x02062C46  1c04        adds r4,r0,#0
+//     0x02062C48  f000 f94a   bl   0x02062EE0
+// and the Ghidra seed row carries insn_len = -1, which `load_seeds` defaulted
+// to ARM.  The image therefore emitted the ARM `cdpne` reading at 0x02062C44
+// and halted at 0x02062C48 (`undefined instruction 0xF94AF000`, cold-boot step
+// 508,793,671).  This test pins: the file, the grammar, the recovery-time
+// authority, and that build_split.sh + the prelude manifest carry the splice.
+#[test]
+fn phase_5at_mode_override_corrects_a_wrong_mode_seed() {
+    use crate::recover::{self, FuncKey, Mode};
+
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let path = root.join("../tools/nnk_mode_overrides.txt");
+    let text = std::fs::read_to_string(&path).expect("tools/nnk_mode_overrides.txt");
+    let ovs = crate::modeov::parse(&text, "nnk_mode_overrides.txt").expect("the committed table must parse");
+    assert!(
+        ovs.iter().any(|o| o.addr == 0x0206_2C44 && o.mode == Mode::Thumb && o.reason.contains("0x020FEBB2")),
+        "0x02062C44 thumb must be the first entry, with the caller measurement as its reason"
+    );
+
+    // 1. The grammar is enforced: no silent rows.
+    assert!(
+        crate::modeov::parse("0x02062C44 thumb\n", "t").is_err(),
+        "a row without a reason is not auditable and must be rejected"
+    );
+    assert!(crate::modeov::parse("0x02062C44 fast x\n", "t").is_err(), "mode must be arm|thumb");
+    assert!(
+        crate::modeov::parse("0x02062C45 thumb x\n", "t").is_err(),
+        "bit0 set means a call target, not an entry"
+    );
+    assert!(
+        crate::modeov::parse("0x02062C44 thumb one\n0x02062C44 arm two\n", "t").is_err(),
+        "a duplicate address is an error, not last-one-wins"
+    );
+
+    // 2. Seeds: the Ghidra row decodes as ARM (`insn_len = -1`), the table flips
+    //    exactly that row and nothing else.
+    let mut seeds = vec![
+        FuncKey { addr: 0x0206_2C44, mode: Mode::Arm },
+        FuncKey { addr: 0x0200_0800, mode: Mode::Arm },
+    ];
+    assert_eq!(crate::modeov::apply_to_seeds(&mut seeds, &ovs), 1);
+    assert_eq!(seeds[0].mode, Mode::Thumb);
+    assert_eq!(seeds[1].mode, Mode::Arm, "an unrelated seed must not move");
+
+    // 3. The same bytes, recovered in both states: ARM is the trap the run hit,
+    //    Thumb is `push`/`adds`/`bl`.  Recovery consults the installed table, so
+    //    a seed that says ARM still comes out Thumb.
+    let mut img = vec![0u8; 0x6_3000];
+    let body: [u8; 12] = [
+        0x10, 0xB5, // push {r4,lr}
+        0x04, 0x1C, // adds r4,r0,#0
+        0x00, 0xF0, 0x4A, 0xF9, // bl 0x02062EE0
+        0x20, 0x1C, // adds r0,r4,#0
+        0x10, 0xBD, // pop {r4,pc}
+    ];
+    img[0x6_2C44..0x6_2C44 + body.len()].copy_from_slice(&body);
+    let text_end = 0x0200_0000u32 + img.len() as u32;
+
+    let arm = recover::recover_seeds(&img, 0x0200_0000, text_end,
+                                     &[FuncKey { addr: 0x0206_2C44, mode: Mode::Arm }], 64, 4);
+    let arm_f = arm.funcs.get(&FuncKey { addr: 0x0206_2C44, mode: Mode::Arm }).expect("ARM body");
+    assert!(arm_f.hit_undef, "the ARM reading of these bytes hits an undefined instruction");
+    assert!(arm_f.lines[&0x0206_2C44].1.contains("cdp"), "the ARM reading is the measured `cdpne`");
+
+    recover::set_mode_overrides(vec![(0x0206_2C44, Mode::Thumb)]);
+    let thumb = recover::recover_seeds(&img, 0x0200_0000, text_end,
+                                       &[FuncKey { addr: 0x0206_2C44, mode: Mode::Arm }], 64, 4);
+    let tf = thumb.funcs.get(&FuncKey { addr: 0x0206_2C44, mode: Mode::Thumb })
+        .expect("the override must turn the ARM seed into a Thumb body");
+    assert!(tf.lines[&0x0206_2C44].1.contains("push"), "0xB510 is `push {{r4,lr}}`");
+    assert!(tf.lines[&0x0206_2C48].1.contains("bl"), "0xF000 0xF94A is `bl 0x02062EE0`");
+    assert!(!tf.hit_undef, "the Thumb body decodes cleanly");
+    assert!(tf.calls.iter().any(|k| k.addr == 0x0206_2EE0 && k.mode == Mode::Thumb),
+            "a Thumb `bl` callee stays Thumb");
+    assert_eq!(recover::mode_override(0x0206_2C45), Some(Mode::Thumb), "bit0 is normalised away");
+    assert_eq!(recover::mode_override(0x0200_0800), None);
+
+    // 4. The toolchain: nnktool exposes the table and the single-function
+    //    emitter, build_split.sh splices it behind the marker, and the manifest
+    //    row for the splice quotes the marker the splice actually writes.
+    let main_rs = std::fs::read_to_string(root.join("src/main.rs")).expect("main.rs");
+    assert!(main_rs.contains("\"--mode-overrides\""), "the CLI flag is gone");
+    assert!(main_rs.contains("\"recompile-cases\""), "the single-function emitter is gone");
+    let bs = std::fs::read_to_string(root.join("../tools/build_split.sh")).expect("build_split.sh");
+    assert!(bs.contains("Phase-5AT mode-override splice applied"), "the marker gate is gone");
+    assert!(bs.contains("tools/p5at_mode_splice.py"), "the splice is not wired into the build");
+    assert!(bs.contains("SPLICED_FEATURES+=(5at_mode_override)"), "the audit is not told about it");
+    let splice = std::fs::read_to_string(root.join("../tools/p5at_mode_splice.py")).expect("p5at_mode_splice.py");
+    assert!(splice.contains("Phase-5AT mode-override splice applied"),
+            "the manifest row quotes this marker; it must be what the tool writes");
+    assert!(splice.contains("nnk_mode_overrides.txt"), "the splice must read the committed table");
+    let man = std::fs::read_to_string(root.join("../tools/nnk_prelude_manifest.txt")).expect("manifest");
+    assert!(
+        man.lines().any(|l| l.starts_with("5at_mode_override\trequired\tPhase-5AT mode-override splice applied\t")),
+        "the manifest row for the splice is missing or does not quote the splice marker"
+    );
+
+    // 5. End to end when the release binary is present (the normal case: the
+    //    build itself needs it): the splice drops the frozen ARM cases and
+    //    inserts the recompiler's Thumb ones, under the audit marker.
+    let nnktool = root.join("target/release/nnktool");
+    if nnktool.is_file() {
+        let tmp = std::env::temp_dir().join("nnk_p5at_splice_test");
+        let _ = std::fs::create_dir_all(&tmp);
+        let guest = tmp.join("guest.bin");
+        std::fs::write(&guest, &img).unwrap();
+        let frozen = tmp.join("frozen.c");
+        std::fs::write(&frozen, format!(
+            "static void run(void) {{\n    for (;;) {{\n        switch (pc) {{\n\
+             \x20       case 0x02062C44u:\n            pc = 0x02062C48u; break;\n\
+             \x20       case 0x02062C48u:\n            halt_reason(\"undefined instruction 0xF94AF000\"); return;\n\
+             \x20       case 0x02063338u:\n            pc = 0x02063338u; break;\n\
+             \x20       default:\n            halt_reason(\"dispatch to untranslated pc\"); return;\n        }}\n    }}\n}}\n")).unwrap();
+        let out = tmp.join("spliced.c");
+        let r = std::process::Command::new("python3")
+            .arg(root.join("../tools/p5at_mode_splice.py"))
+            .arg(&frozen).arg(&out)
+            .arg("--nnktool").arg(&nnktool)
+            .arg("--image").arg(&guest)
+            .output()
+            .expect("python3");
+        assert!(r.status.success(), "splice failed:\n{}\n{}",
+                String::from_utf8_lossy(&r.stdout), String::from_utf8_lossy(&r.stderr));
+        let s = std::fs::read_to_string(&out).unwrap();
+        assert!(s.starts_with("/* Phase-5AT mode-override splice applied: 0x02062C44 thumb"),
+                "the marker must be the first line, where the audit reads it");
+        assert!(s.contains("case 0x02062C44u: /* nnk_state=thumb */"), "the Thumb body is missing");
+        assert!(s.contains("case 0x02062C46u:"), "the 16-bit address the ARM walk never produced is missing");
+        assert!(!s.contains("undefined instruction 0xF94AF000"), "the trap case must be gone");
+        assert!(s.contains("case 0x02063338u:"), "unrelated cases must survive");
+    }
+}

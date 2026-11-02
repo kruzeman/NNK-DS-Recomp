@@ -149,6 +149,30 @@ addresses, `NNK_GX_SHOT_EVERY`, …) and the default state path.
 table order. Two runs that reach the same step with the same machine state
 print the same hash; that is the round-trip test.
 
+## 5b. The dynamic state carrier is EXPERIMENTAL (opt-in: `NNK_STATE_CARRIER=1`)
+
+The compiled dispatch is static: the ARM/Thumb state a guest PC runs in comes
+from the image's mode table, not from the branch that reached it. Phase-5AS
+added an opt-in *state carrier* (`tools/nnk_smc.inc`,
+`nnk_smc_carry_override()`, enabled by `NNK_STATE_CARRIER=1`) that lets the
+dynamic branch form overrule a compiled case, and logged the disagreements
+(`NNK_STATE_CONFLICTS`).
+
+**It is not the default and remains experimental.** Measured with
+`NNK_STATE_CARRIER=1`: the cold-boot reproducer diverges at step **18,395,574**
+near `0x027FF800` (stack region), i.e. carrying the state changes guest-visible
+memory beyond the point the compiled image was validated against. That defect
+is untouched by Phase-5AT.
+
+Phase-5AT removed the *reason* the carrier was needed for the 0x02062C48 crash:
+that was a wrong **mode table** row (`0x02062C44` is Thumb — ov17's Thumb
+`0x020FEB94` calls it with `bl` at `0x020FEBB2` — but Ghidra's seed carried
+`insn_len = -1`, so it defaulted to ARM), not a lost state. The committed
+`tools/nnk_mode_overrides.txt` corrects the row and the shipped image now
+carries the Thumb body (see PHASE5AT.md), so **both reproducers run to their
+step budget with the carrier off**. Do not flip `NNK_STATE_CARRIER` on until
+the 18,395,574 divergence is root-caused.
+
 ## 6. F5 / F9 in the window
 
 With `NNK_GX=window` the SDL event filter in `tools/nnk_input.inc` consumes

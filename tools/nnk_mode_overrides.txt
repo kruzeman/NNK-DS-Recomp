@@ -1,0 +1,33 @@
+# Ni no Kuni DS (B2KJ) — FUNCTION-MODE OVERRIDES                      Phase-5AT
+#
+# A recovered function's ARM/Thumb state normally comes from the seed (Ghidra's
+# instruction-length column) or from the interworking bit of a direct call.
+# When BOTH are wrong/absent the compiled body is the wrong decoding of the
+# bytes, and the run halts on an "undefined instruction" that is really a
+# decoder mismatch.  This file is the supported, auditable correction: every
+# consumer of the recovered set (`nnktool recompile-all`, `decompile`,
+# `recompile-cases` and `tools/p5at_mode_splice.py`, which build_split.sh runs
+# for the frozen dispatch image) applies it before decoding.
+#
+# Format:  <address> <arm|thumb> <reason>
+#   - the address is the entry, bit0 clear (never the Thumb call target);
+#   - the reason is mandatory and must name the measurement, not the symptom;
+#   - a duplicate address is an error (silent last-one-wins is not auditable).
+#
+# Adding a row is a claim about the guest: prove it with the caller (branch
+# form) or the bytes, and add the same case to
+# nnktool/src/decoder_regression_tests.rs.
+# ---------------------------------------------------------------------------
+
+# ov17's Thumb function 0x020FEB94 calls 0x02062C44 with `bl 0x02062C44` at
+# 0x020FEBB2.  A Thumb `bl` links LR = (next|1) = 0x020FEBB7 and stays in
+# Thumb, so the callee is Thumb code: the bytes are `b510 1c04` = `push
+# {r4,lr}` / `adds r4,r0,#0` (arm9_dec image, bytes 0x02062C44..0x02062C5C),
+# ending `pop {r4,pc}` at 0x02062C5E.  Ghidra's seed row carries insn_len = -1
+# (unknown), which load_seeds defaults to ARM, so the frozen image emitted the
+# ARM `cdpne 5,0,cr4,cr11,cr0,{0}` reading and halted at 0x02062C48 with
+# `undefined instruction 0xF94AF000` (Phase-5AS root cause, cold-boot step
+# 508,793,671).  No pc->form run reaches the function (the map has a hole) and
+# no literal pointer to it exists in any of the 22 images, so the branch form
+# is the only authority -- and it says Thumb.
+0x02062C44 thumb ov17 Thumb 0x020FEB94 calls it with `bl` at 0x020FEBB2 (LR=0x020FEBB7); bytes are `push {r4,lr}`/`adds r4,r0,#0`; the Ghidra seed has insn_len=-1 so the table defaulted to arm and the emitted body was the ARM `cdpne` reading + a trap at 0x02062C48

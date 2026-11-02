@@ -1386,6 +1386,94 @@ pub fn recompile_all(
     Ok(stats)
 }
 
+/// Phase-5AT: emit the dispatch case blocks for ONE function in an EXPLICIT
+/// mode (`nnktool recompile-cases`).
+///
+/// This is the generator behind `tools/p5at_mode_splice.py`: the frozen
+/// dispatch image carries a wrong-mode body for a function named in
+/// `tools/nnk_mode_overrides.txt`, and the corrected body has to be the
+/// recompiler's output, not a hand-written case.  It reuses the exact
+/// per-instruction emitter and `case_string` that `recompile-all` uses, so the
+/// spliced bytes are the ones a regeneration would produce.
+///
+/// The emitted labels carry the `nnk_state` marker the current emitter writes
+/// (and `tools/split_dispatch.py` accepts, so `nnk_smc_map.h` classifies these
+/// PCs by the marker instead of by the fall-through heuristic).
+pub fn recompile_cases(
+    image: &[u8],
+    base: u32,
+    entry: u32,
+    mode: Mode,
+    out_c: &Path,
+    limit: usize,
+) -> Result<CaseStats, String> {
+    set_image(image, base);
+    let text_end = base.wrapping_add(image.len() as u32);
+    let key = FuncKey { addr: entry & !1, mode };
+    let func = trace_function(image, base, text_end, key, limit);
+    if func.lines.is_empty() {
+        return Err(format!("no {} instructions recovered at 0x{:08X}", mode.name(), entry));
+    }
+
+    let mut stats = CaseStats { cases: 0, mode: mode.name(), first: u32::MAX, past_end: 0, undef: 0, calls: Vec::new() };
+    let mut cases_src = String::new();
+    for (&addr, (words, text)) in &func.lines {
+        let w = words[0];
+        let size = if mode == Mode::Thumb {
+            if w > 0xFFFF { 4u32 } else { 2 }
+        } else {
+            (words.len() * 4) as u32
+        };
+        let next = addr.wrapping_add(size);
+        let mut scratch: Vec<String> = Vec::new();
+        let oc = emit_line(mode, words, addr, &mut scratch, true);
+        stats.cases += 1;
+        stats.first = stats.first.min(addr);
+        stats.past_end = stats.past_end.max(next);
+        if oc.halts {
+            stats.undef += 1;
+        }
+        cases_src.push_str(&case_string(addr, next, text, &oc));
+    }
+    let mut calls: Vec<u32> = func.calls.iter().map(|k| k.addr | (if k.mode == Mode::Thumb { 1 } else { 0 })).collect();
+    calls.sort_unstable();
+    calls.dedup();
+    stats.calls = calls.clone();
+    // The call list is part of the HEADER, never a trailing comment after the
+    // last case: the splitter requires every case block to end in break/return.
+    let mut src = String::new();
+    src.push_str(&format!(
+        "/* nnktool recompile-cases: function 0x{:08X} in {} state ({:?}).\n\
+         * Emitted by `nnktool recompile-cases` for tools/p5at_mode_splice.py.\n\
+         * Case labels are the frozen image's dialect: `case 0xADDRu:` with no\n\
+         * `nnk_state` marker (tools/split_dispatch.py's CASE_RE).\n\
+         * calls: {} */\n",
+        entry & !1,
+        mode.name(),
+        mode,
+        calls.iter().map(|a| format!("0x{:08X}", a)).collect::<Vec<_>>().join(" ")
+    ));
+    src.push_str(&cases_src);
+
+    if let Some(parent) = out_c.parent().filter(|p| !p.as_os_str().is_empty()) {
+        fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {}", parent.display(), e))?;
+    }
+    fs::write(out_c, &src).map_err(|e| format!("write {}: {}", out_c.display(), e))?;
+    Ok(stats)
+}
+
+/// Phase-5AT: what `recompile_cases` produced (one line of machine-readable
+/// summary so the splice tool can report the body it inserted).
+#[derive(Default, Debug)]
+pub struct CaseStats {
+    pub cases: usize,
+    pub mode: &'static str,
+    pub first: u32,
+    pub past_end: u32,
+    pub undef: usize,
+    pub calls: Vec<u32>,
+}
+
 /// Runtime for the image-wide dispatch loop: guest state, flat memory window,
 /// per-execution PC trace, and SWI/BIOS HLE.  Emitted before `run()`.
 const RUNTIME_ALL: &str = r##"#include <stdint.h>
