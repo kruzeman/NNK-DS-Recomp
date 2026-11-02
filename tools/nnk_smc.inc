@@ -185,6 +185,23 @@ static int smc_is_pcbase(int k) {
  * epilogue popped 0 into pc. */
 void nnk_smc_note_branch(uint32_t raw) { smc_branch_mode(raw); smc_t_live = 0; }
 
+/* Phase-5AW: the ARM exception return (`subs`/`movs pc, lr`) restores CPSR from
+ * the current mode's SPSR, and the T bit of that SPSR is the instruction state
+ * of the resumed PC.  The target is a dynamic `lr-4`, so no compiled case, no
+ * ROM-derived pcform run and no register/stride/sticky guess can classify it:
+ * the SPSR is the ONLY place the state exists.  (Measured: 0x0200729C
+ * `subs pc, lr, #4` under SPSR 0x2000001F resumed the ITCM font renderer at
+ * 0x01FFC684.  The previous live decode had been a Thumb stream, so the stale
+ * sticky guess ran the ARM blit code as Thumb -- 0x684 `adds r1,#0x4A`,
+ * `b.n 0x79C`, `b.n 0x822` -- and walked into the codec/data table at
+ * 0x022C9F38, halting with `dispatch to untranslated pc` on the data word
+ * 0xFFFFFFD3 at 0x022CA20C.)  The SPSR bit is hardware state, not a guess, so
+ * the carrier is marked live and may also overrule a compiled case. */
+void nnk_smc_note_exc_return(uint32_t target, uint32_t spsr) {
+    smc_branch_mode((target & ~1u) | ((spsr >> 5) & 1u));
+    smc_t_live = 1;
+}
+
 /* Emitted next to the dispatch image by tools/split_dispatch.py.  A mono
  * (recompile-all -> cc) build has no generated map, so fall back to ARM-only
  * when the header is absent — the mono path is the regression baseline. */
@@ -1107,6 +1124,10 @@ static int smc_exec_arm(uint32_t pc, uint32_t w, uint32_t *npc, uint32_t *costp)
                     cpsr_set_ctl(spsr & 0xFFu);
                     n = (spsr >> 31) & 1u; z = (spsr >> 30) & 1u;
                     c = (spsr >> 29) & 1u; v = (spsr >> 28) & 1u;
+                    /* Phase-5AW: the restored SPSR's T bit is the state of the
+                     * resumed instruction; carry it to the target exactly like
+                     * a `bx` (the target cannot be classified any other way). */
+                    smc_branch_mode(*npc | ((spsr >> 5) & 1u));
                 }
             } else {
                 r[rd] = tv;
@@ -1463,8 +1484,20 @@ static int smc_exec_thumb(uint32_t pc, uint32_t *npc, uint32_t *costp) {
         return 1;
     }
     if ((hw & 0xF800u) == 0xE000u) {                 /* format 17: B */
+        /* Phase-5AW: imm11 is SIGNED and then doubled, so the value to sign-
+         * extend has 12 bits, not 11: shift by 20, not by 21.  The old form
+         * shifted bo's bit 11 (the sign, which only appears
+         * after the doubling) out of the word, so EVERY backward `b.n`
+         * (imm11 bit10 set) became a small FORWARD branch.  Measured at
+         * 0x212B932 `e56d b.n 0x212B410` (offset -0x526): the live decoder
+         * landed at 0x212BC10, exactly target+0x800, i.e. inside the
+         * neighbouring function's body -- which then ran its shared return
+         * thunk and popped a frame its prologue had never pushed (halt at
+         * 0x0212CCF6 with pc=0 from the pop).  decode.rs (`(h&0x7FF)<<5 as
+         * i16 >> 4`) has always had the correct semantics, so only the ROM-
+         * derived live decoder was wrong. */
         int32_t bo = (int32_t)((hw & 0x7FFu) << 1);
-        *npc = pc + 4u + (uint32_t)((bo << 21) >> 21);
+        *npc = pc + 4u + (uint32_t)((bo << 20) >> 20);
         *costp = 3;
         return 1;
     }

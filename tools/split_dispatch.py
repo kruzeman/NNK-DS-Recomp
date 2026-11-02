@@ -622,6 +622,10 @@ def main():
         # (nnk_main.c's TU).  Always declared: the header is a cache key, so it
         # must not depend on which image is being built.
         fh.write("void nnk_smc_note_branch(uint32_t raw);\n")
+        # Phase-5AW: the exception-return carrier (SPSR T bit -> next pc's
+        # instruction state), implemented in tools/nnk_smc.inc.  Always
+        # declared for the same cache-key reason as the branch note above.
+        fh.write("void nnk_smc_note_exc_return(uint32_t target, uint32_t spsr);\n")
         fh.write("#endif\n")
 
     # ---- Phase-4N: cart transfer-done IRQ + rule-based delivery ----------

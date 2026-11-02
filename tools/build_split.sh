@@ -239,6 +239,31 @@ if [[ -f "$IMAGE" ]] && ! grep -q 'Phase-5AT mode-override splice applied' "$IMA
   fi
 fi
 
+# Phase-5AW: the frozen image's compiled ARM exception-return cases restore the
+# mode byte and NZCV from SPSR but drop the T bit, and the dispatcher has no
+# other way to classify the dynamic `lr-4` target.  Measured: 0x0200729C
+# `subs pc, lr, #4` (SPSR 0x2000001F) resumed the ITCM font renderer at
+# 0x01FFC684, whose previous live decode was Thumb, so the sticky Thumb guess
+# walked ARM blit code as Thumb into the codec data table at 0x022C9F38 and
+# halted at 0x022CA20C (`dispatch to untranslated pc`, word 0xFFFFFFD3).
+# The canonical fix is in nnktool/src/recompile.rs + tools/nnk_smc.inc; this
+# transform applies it to the frozen case bodies.  Same policy as the splices
+# above: no-op when the marker is already there, and
+# NNK_PRELUDE_DISABLE_SPLICE=5aw_exc_return_state is the negative control.
+if [[ -f "$IMAGE" ]] && ! grep -q 'Phase-5AW exception-return state splice applied' "$IMAGE"; then
+  if splice_disabled 5aw_exc_return_state; then
+    echo "== splice DISABLED by NNK_PRELUDE_DISABLE_SPLICE: Phase-5AW exception-return state (negative control) =="
+  else
+    SPLICED_IMAGE7="$(dirname "$SPLIT")/$(basename "$IMAGE" .c).p5aw.c"
+    mkdir -p "$(dirname "$SPLICED_IMAGE7")"
+    echo "== splice (Phase-5AW): exception return carries the SPSR T bit -> $SPLICED_IMAGE7 =="
+    python3 tools/p5aw_exc_return_splice.py "$IMAGE" "$SPLICED_IMAGE7" || {
+      echo "phase-5aw: exception-return splice failed" >&2; exit 2; }
+    IMAGE=$SPLICED_IMAGE7
+    SPLICED_FEATURES+=(5aw_exc_return_state)
+  fi
+fi
+
 if [[ "$GX" == "1" ]]; then
   [[ -f "$GXDIR/Makefile" ]] || { echo "NNK_GX=1 but $GXDIR/Makefile missing" >&2; exit 2; }
   echo "== gxrender: building libgxrender.a + gx_display.o + gx_gl.o =="
