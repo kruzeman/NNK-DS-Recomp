@@ -1,34 +1,41 @@
-# Phase-5AW — the prompt press, fix 1: an ARM exception return must carry SPSR's T bit
+# Phase-5AW — the prompt press: two defects, both fixed
 
 Follows Phase-5AT (merged `064ab93`).  Build:
 `NNK_SPLIT_CFLAGS="-std=c11 -O2 -g0 -w" NNK_GX=1 BUILD_JOBS=20
-NNK_IMAGE_C=work/phase3a/arm9_thumb_ovl_itcm_p5u.c bash tools/build_split.sh work/split/arm9_5aw`
-(prelude audit green, `cargo test`: **58 passed**).
+NNK_IMAGE_C=work/phase3a/arm9_thumb_ovl_itcm_p5u.c bash tools/build_split.sh work/split/arm9_5aw2`
+(prelude audit green, `cargo test`: **59 passed**).
 
 ## 1. Result
 
-The `0x022CA20C` halt — the one this card measured from the scripted
-reproducer — is **gone**: it was not a missing code range but a lost
-instruction state.  The press now runs the guest's real save path and stops at
-a **new, named barrier**, the operator's own halt frame:
+The card's reproducer **no longer halts**:
 
 ```
-done steps=1140846949 traced=1140846949 distinct_pcs=28476 hle_hits=8838
-     halt_pc=0x0212CCF6 halt=dispatch to untranslated pc
-untranslated pc=0x00000000
-halt state: r0=027E3A9D r1=00000000 r2=00000000 r3=00000000 r4=00000000
-            r5=00000000 r6=00000000 r7=00000000 r13=027E3C28 r14=0212CCDD nzcv=0010
+NNK_SAVESTATE=work/repro_5au/operator_dialog.nnks NNK_SAVESTATE_IGNORE_BUILD=1 \
+  NNK_INPUT_FILE=work/repro_5au/press_a_at_frame1990.nnk \
+  NNK_STEP_LIMIT=1240000000 NNK_GX=headless work/split/arm9_5aw2 ROM
+done steps=1240000001 traced=1240000001 distinct_pcs=26416 hle_hits=8907
+     halt_pc=0x0200AD78 halt=step budget exhausted
+gx: 2220 frames presented
 ```
 
-These are the operator's window numbers to the register (`halt_pc`,
-`r0=027E3A9D`, `r13=027E3C28`, `r14=0212CCDD`, `nzcv=0010`) — one run earlier
-this same script stopped at `0x022CA20C` with a different frame entirely.  The
-press is consumed: frame 2000 shows the (separately-known mis-rendered) prompt
-overlay, frame 2005 shows the same artwork with the overlay gone and the screen
-fading into the save path (§4).  The remaining halt is a **second, different
-defect**: the save worker's frame does not exist while its body runs.
+Two independent defects stood between the A press and the save path, and both
+are fixed in the runtime/recompiler (no halt masking, no address
+special-case):
 
-## 2. What the 0x022CA20C halt actually was
+| # | defect | where | how it showed |
+|---|---|---|---|
+| 1 | an ARM exception return dropped the restored **SPSR T bit**, so the resumed `lr-4` was decoded in the stale Thumb state | `recompile.rs` emitter + `nnk_smc.inc` carrier + a generated splice for the frozen image | halt `0x022CA20C` (my scripted measurement) |
+| 2 | the ROM-derived **live decoder sign-extended a Thumb `b` displacement from the wrong bit**, so every *backward* `b.n` landed `+0x800` too high | `nnk_smc.inc` format 17 | halt `0x0212CCF6` (the operator's measurement) |
+
+After the two fixes the press is consumed, the save path runs, and the guest
+parks in the pointer-list spin at `0x0200AD78` — the *existing* wait frontier
+Phase-5AT already named for a savestate run, not a decode or dispatch halt.
+The bottom screen fades to black on the way (only frame 2000 is non-blank in
+`work/phase5aw/verify/after2/`, the save transition), so this task's visual
+evidence is "the prompt overlay is gone and the guest enters the save path",
+not a new dialogue line.
+
+## 2. Defect 1 — the exception return carried no instruction state
 
 Trace (`NNK_TRACE_FROM` + `NNK_SMC_TRACE_FROM` around the last 3,000 steps):
 
@@ -37,146 +44,150 @@ Trace (`NNK_TRACE_FROM` + `NNK_SMC_TRACE_FROM` around the last 3,000 steps):
 0x01ffc684  (resumed pc = lr-4)
 ```
 
-* The thread context restored at `0x0200729C` has SPSR **`0x2000001F`**: mode
-  SYS, **T = 0**, so the resumed instruction at `lr-4 = 0x01FFC684` is **ARM**.
+* The SPSR is `0x2000001F`: mode SYS, **T = 0**, so the resumed instruction at
+  `lr-4 = 0x01FFC684` is **ARM**.
 * `0x01FFC684` is ITCM, live-decoded, and the previous live decode had been a
   Thumb stream.  The exception-return case restored the mode byte and NZCV but
-  **dropped the T bit**, so `smc_pick_state()` fell through to the stale sticky
-  guess (Thumb):
+  **dropped the T bit**, so `smc_pick_state()` fell through to the sticky guess:
 
   ```
   0x01FFC684  ARM   e089314a  add r3, r9, sl, asr #2
               Thumb 314a     adds r1, #0x4A       <- what ran
                     e089     b.n 0x01FFC79C
-  0x01FFC79C  Thumb 7087     strb r7, [r0, #2]
-  0x01FFC79E  Thumb e040     b.n 0x01FFC822  -> 0x01FFC4EC
   ```
 
 * The ARM epilogue at `0x01FFC4EC` (`pop {pc}` at `0x01FFC548`) then ran
-  **without its `push {lr}` prologue** and popped the codec/data pointer
-  `0x022C9F38` from the stack.  The run executed the movie codec's data table
-  as ARM (`0x02338408`, `0x00000100`, ...) until the data word `0xFFFFFFD3`
-  at `0x022CA20C` did not decode.
+  **without its `push {lr}` prologue**, popped the codec pointer `0x022C9F38`
+  and executed the movie data table as ARM until the word `0xFFFFFFD3` at
+  `0x022CA20C` did not decode.
 
-So the pc was not covered because it was **an instruction state, not a code
-range**: `lr-4` is a dynamic target that no compiled case, no ROM-derived
-pcform run and no register/stride guess can classify — the restored SPSR is
-the only authority (the same one-phase carrier `bx` and `ldmia {pc}` already
-use via `nnk_smc_note_branch`).
+The resumed pc is a dynamic `lr-4` that no compiled case, no ROM-derived
+pcform run and no register/stride guess can classify: the restored SPSR is the
+only authority.
 
-## 3. The fix (runtime + recompiler, no address special-case)
+## 3. The fix for defect 1
 
 * `nnktool/src/recompile.rs`: every emitted ARM exception-return block
-  (`subs`/`movs pc, lr` with S=1, rd=15, privileged mode) now calls
+  (`subs`/`movs pc, lr` with S=1, rd=15, privileged mode) calls
   `nnk_smc_note_exc_return(pc, _spsr)` after restoring the CPSR byte and NZCV.
-* `tools/nnk_smc.inc`: the hook records the carrier
-  `smc_branch_mode((target & ~1u) | ((spsr >> 5) & 1u))` and marks it live
-  (the SPSR bit is hardware state, so it may overrule a compiled case).  The
-  live decoder's own exception return (`smc_exec_arm`) calls
-  `smc_branch_mode(*npc | ((spsr >> 5) & 1u))`, so compiled and live code
-  cannot disagree.
-* `tools/split_dispatch.py` declares the hook in `nnk_rt.h`.
-* `tools/p5aw_exc_return_splice.py` applies the same call to the **frozen
-  image's** 13 exception-return case bodies (they predate the emitter change);
-  `tools/build_split.sh` runs it marker-gated
-  (`NNK_PRELUDE_DISABLE_SPLICE=5aw_exc_return_state` is the negative control)
-  and the manifest row quotes the splice's own marker string.
-* Class test 58 (`phase_5aw_exception_return_carries_the_spsr_instruction_state`)
-  pins the emitter call, both runtime call sites, the splice's rewrite and the
-  toolchain wiring.  Suite 57 → **58**.
+* `tools/nnk_smc.inc`: the hook records `smc_branch_mode((target & ~1u) |
+  ((spsr >> 5) & 1u))` and marks it live (hardware state may overrule a
+  compiled case).  The live decoder's own exception return does the same.
+* `tools/split_dispatch.py` declares the hook; `tools/p5aw_exc_return_splice.py`
+  applies it to the frozen image's 13 exception-return case bodies, run
+  marker-gated by `tools/build_split.sh` with a manifest row that quotes the
+  splice's own marker (`NNK_PRELUDE_DISABLE_SPLICE=5aw_exc_return_state` is the
+  negative control — verified: `AUDIT FAILED -- 5aw_exc_return_state MISSING`,
+  build refused).
 
-## 4. The new frontier (named): the save worker's body runs with no frame
+## 4. Defect 2 (the operator's `0x0212CCF6`) — a backward `b.n` at +0x800
 
-`0x0212CCF6` is the **shared return thunk** of the Thumb function entered at
-`0x0212B93C`, in ov17 mapped at `0x020D0A00` (`ov017.bin` + `0x5AF3C`; verified
-by disassembly, not by symbol):
+With defect 1 fixed the run reached the operator's exact halt frame
+(`0x0212CCF6`, `r0=027E3A9D`, `r13=027E3C28`, `r14=0212CCDD`, `nzcv=0010`).
+`0x0212CCF6` is the shared return thunk of the Thumb function entered at
+`0x0212B93C` (ov17 at `0x020D0A00`, i.e. `ov017.bin + 0x5AF3C`; that whole page
+range is **not** in the compiled image, so it runs in the live decoder):
 
 ```
 212b93c  b5f8  push {r3,r4,r5,r6,r7,lr}
 212b93e  b0ff  sub sp, #0x1FC
-212b940  b0a7  sub sp, #0x9C          ; frame 0x298 + 6 saved words = 0x2B0
-212b95e  f001 f9c8  bl 0x212ccf2       ; <- "return via thunk": Thumb-1 `b` is
-...                                   ;    only +-2 KB, so the epilogue is CALLED
-212bc2e  f001 f83c  bl 0x212ccaa       ;    (same thunk reached from 0x212cc90's
-...                                   ;    body and from 0x212ccaa's tail)
+212b940  b0a7  sub sp, #0x9C          ; frame 0x298 + 24 = 0x2B0
+212b95e  f001 f9c8  bl 0x212ccf2       ; "return via thunk": Thumb-1 `b` is only
+212bc2e  f001 f83c  bl 0x212ccaa       ;  +-2 KB, so the epilogue is CALLED
 212ccf2  b07f  add sp, #0x1FC
 212ccf4  b027  add sp, #0x9C
 212ccf6  bdf8  pop {r3,r4,r5,r6,r7,pc}
 ```
 
-Measured frame arithmetic (DC probes at the three points + the halt state):
-`sp = 0x027E3978` at `0x0212BC24` and `0x0212CCAA`, `0x027E3978 + 0x298 =
-0x027E3C10` before the pop, and the pop's six words live at
-`0x027E3C10..0x027E3C27` — so the prologue's save area is `0x027E3C28 - 24`.
-**All six popped zero, so `pc = 0` and the dispatcher reports an untranslated
-pc.**  What is *not* a working theory any more:
+The pop read `0x027E3C10..0x027E3C27` — the prologue's own save area for
+`P = 0x027E3C28` — and all six words were zero, so `pc = 0`.
+`NNK_STOREWATCH=0x027E3C10:0x027E3C28` (limit 200 000) logged **no store in the
+whole run**, while the same watch on `0x027E3800:0x027E3C40` is full — the
+prologue of that function never ran, and the body was being entered in the
+middle.
 
-* **The store never happened.**  `NNK_STOREWATCH=0x027E3C10:0x027E3C28` with
-  `NNK_STOREWATCH_N=200000` logs **no store in the whole 33.9 M-step run**,
-  while the same watch on `0x027E3800:0x027E3C40` fills 2,000 entries within
-  17 k steps — so the watch is live, and it fires *before* the TCM/bus routing
-  in `st32()`, i.e. a DTCM- or ITCM-banked store would have been logged too.
-  The 24 bytes are also zero in the operator's savestate at the raw address and
-  at its 4 MiB fold (`0x023E3C10`), and the whole `0x023E0000..0x023EFFFF`
-  block is zero in the halt memory dump (`NNK_DUMP_MEM`).
-* **This function is not compiled.**  `0x0212B93C` is not a case in the shipped
-  image: pages `0x0212A000..0x0212DFFF` have no case at all (only 55 of ov17's
-  pages have any), so the whole body runs in the live SMC decoder
-  (`on_demand=334,116,355`).  Its prologue would have gone through the same
-  `st32()` the watch sees.
-* **`0x020EA750` is not a scheduler resume** (correcting an earlier reading of
-  the same trace).  It is `bl 0x201f250` inside the live-decoded ARM helper
-  `0x020EA6D4`; the dc hit at `0x020EA770` is that helper's conditional
-  `popcc {r3,r4,r5,r6,r7,pc}`, and the token it returns — traced as
-  `0x0212BC24` — is the `blx 0x20ea6d4` at `0x212bc20`.  So the body was
-  already executing at `0x212bc20` before the traced window.
-* **It is not the SPSR carrier either.**  This epilogue is a plain
-  multi-register `pop {...,pc}` whose target is the *frame word itself*; no
-  exception return is involved.
+The entry is now measured.  `NNK_DC_PC` on the body's first instructions gives
+`pc=0x0212BC20 hit=1 step=1140779401 lr=0x0212B923`, and the trace around that
+step is the whole answer:
 
-**So the named frontier is: control is inside the `0x298`-frame body
-(`0x212bc20` today) while that frame has never existed — the body was entered
-mid-function.**  The only legal entry into this function is
-`bl 0x212b93c` at `0x212d250` (the sole external reference in the whole
-overlay), and the `push` at its prologue never wrote.  The next task should
-start from "who set pc into the middle of `0x212B93C` after the A press"
-(the resumed save-worker context: mode/`sp`/`pc` of the thread the game
-schedules to write the save), not from the pop.  Evidence to start with:
-`mode 3->0 step=1140783986 sp=0x027E3958 lr=0x020EA754` (USR bank restore),
-`sp=0x027E3978` inside the body, and the empty `0x023E0000..0x023EFFFF`.
+```
+0x020d3dd0              ; pop {r4,pc} of the compiled ARM helper 0x020D3DAC
+0x0212b922 .. 0x0212b932 ; F_prev's tail (ldr/adds/str/.../cmp/bge)
+0x0212b932  e56d        ; b.n 0x212b410   <- offset -0x526
+0x0212bc10  ...          ; ACTUAL: 0x212bc10 = 0x212b410 + 0x800
+```
 
-## 5. Measurements
+`0x212B932`'s branch is the bug.  Thumb format 18 is `11100 imm11`; the
+displacement is **signed 11 bits, then doubled**, so the value to sign-extend
+has 12 bits.  The live decoder had
+
+```c
+int32_t bo = (int32_t)((hw & 0x7FFu) << 1);
+*npc = pc + 4u + (uint32_t)((bo << 21) >> 21);
+```
+
+and `bo << 21` shifts `bo`'s bit 11 — the sign bit, which only exists *after*
+the doubling — out of the 32-bit word.  For `0xE56D`: `bo = 0xADA`, the correct
+displacement is `-0x526`, the old idiom produced `+0x2DA`, and the branch landed
+at `0x212B410 + 0x800 = 0x212BC10`, i.e. inside the neighbouring function's body.
+That function then ran its shared return thunk and popped a frame its prologue
+had never pushed: `pc = 0`, `dispatch to untranslated pc`.
+
+The compiled path never had this bug (`decode.rs`:
+`(((h & 0x7FF) << 5) as i16) >> 4`), which is why the defect only appeared in
+overlay pages the ROM-derived live decoder serves.
+
+## 5. The fix for defect 2
+
+```c
+int32_t bo = (int32_t)((hw & 0x7FFu) << 1);
+*npc = pc + 4u + (uint32_t)((bo << 20) >> 20);   /* sign-extend 12 bits */
+```
+
+One line, no address special-case, and it is the class fix: every backward
+Thumb `b.n` in every live-decoded page was affected.  Format 15 (conditional,
+doubled imm8 -> 9 bits, `<<23 >>23`) and the BL/BLX pair (sign at bit 24,
+`<<7 >>7`) were already correct and are pinned by the test.
+
+Class test 59 (`phase_5aw_live_decoder_sign_extends_a_thumb_backward_branch`)
+pins the semantics three ways: `decode_thumb(0xE56D, …0x0212B932)` must be
+`b.n 0x0212b410`; the arithmetic must give `-0x526` for the correct idiom and
+`+0x2DA` for the old one (so the old form cannot look equivalent again); and
+the live decoder source must carry `<<20 >>20` while still carrying the
+unaffected `<<23 >>23` / `<<7 >>7` forms.  Suite 58 → **59**.
+
+## 6. Measurements
 
 | check | result |
 |---|---|
-| scripted reproducer (`operator_dialog.nnks` + `press_a_at_frame1990.nnk`), fresh run | old: halt `0x022CA20C` @1,112,592,480 · new: passes it, halts at `0x0212CCF6` @1,140,846,949 with the operator's exact registers (§1) |
-| screen after the press | frame 2000: prompt overlay present (mis-rendered — separate card); frame 2005: overlay gone, artwork fading into the save path (`work/phase5aw/after_press.02005.bot.ppm.png`) |
-| `cargo test` | **58 passed** |
-| `tools/verify_phase2a.sh` | `rc=0`; decoder cross-check `RESULT: PASS`; melonDS-vs-native **1000/1000** strict prefix, 1000/1000 window-filtered, 1000/1000 in-order (`work/phase5aw/verify_phase2a.log`) |
-| prelude audit / splice marker | green, `5aw_exc_return_state` row present; the splice is marker-gated with `NNK_PRELUDE_DISABLE_SPLICE=5aw_exc_return_state` as the negative control |
-| savestate round trip 5M→6M | `fnv=0xA258DF1B crc=0x4341C3DE` — identical on save and on reload |
+| card reproducer, final build | **no halt**: `done steps=1240000001 … halt_pc=0x0200AD78 halt=step budget exhausted`, 2220 frames, 13/13 input events applied, 26,416 distinct PCs |
+| the same reproducer before the two fixes | halt `0x022CA20C` @1,112,592,480 (defect 1), then halt `0x0212CCF6` @1,140,846,949 with the operator's exact registers (defect 2) |
+| post-press screens | `work/phase5aw/verify/after2/s.0*.bot.ppm`: frame 2000 carries the (mis-rendered) prompt overlay, every later capture is black — the save transition; the guest is in the pointer-list spin |
+| `cargo test` | **59 passed** (57 before this card) |
+| `tools/verify_phase2a.sh` | `rc=0`; decoder cross-check `RESULT: PASS`; melonDS-vs-native **1000/1000** strict prefix, 1000/1000 window-filtered, 1000/1000 in-order |
+| prelude audit, negative control | `NNK_PRELUDE_DISABLE_SPLICE=5aw_exc_return_state` → `AUDIT FAILED -- 5aw_exc_return_state MISSING`, build refused |
+| savestate round trip 5M→6M | `fnv=0xA258DF1B crc=0x4341C3DE` — identical on save and reload (build `0x0768D9EB`) |
 | savestate round trip 30M→32M | `fnv=0xAC8F90B0 crc=0x6FFECEF1` — identical |
-| ROM-only runtime (clean dir: binary + card image, no `work/`) | 20,000,001 steps, 13,328 distinct PCs, `halt=step budget exhausted` |
+| ROM-only runtime (binary + card image, clean dir, no `work/`) | 20,000,001 steps, 13,328 distinct PCs, budget exhausted |
 | speed | 700 M steps in **66.9 s** (19.1 s / 200 M; 5AT baseline 30.8 s / 200 M) |
-| notice screen renders | fresh `notice.01100.bot.png` — the fan-translation text on the parchment background |
-| title screen via skip script | see §6 (unchanged pre-existing blocker) |
-| movie band corr | see §6 |
+| notice screen | fresh `work/phase5aw/verify/notice_01100_bot.png` — the fan-translation notice on the parchment background (29 non-blank) |
 
-## 6. Honest gaps of this task
+## 7. Honest gaps of this task
 
-* **melonDS ground truth could not be loaded here.**  `work/repro_5au/melonds_state.mln`
+* **melonDS ground truth is still not loadable here.**  `work/repro_5au/melonds_state.mln`
   is savestate format major **13** (`MELN`, version word `0x0d`); every melonDS
-  build in this environment is `SAVESTATE_MAJOR 14` (bumped at `ba317e2e`), and
-  the loader refuses a major mismatch.  Fetching an older melonDS is not
-  possible offline, so "what does melonDS do after the press" is still
-  unanswered — which is exactly the open half of §4 (guest path vs. our path).
-* **Title screen skip script was not run.**  The cold-boot path still parks in
-  the `0x020078F4` halfword spin (`ldrh/cmp/bne`) long before frame 4,300 — my
-  700 M-step speed run ends at `0x020078F8/0x020078FC`, the same loop Phase-5AT
-  reported, so the title is unreachable from a cold boot for the same
-  pre-existing reason.  `work/phase5at/skip_title.nnk` remains the script to
-  use once that wakeup is fixed.
-* **The movie band audit was not re-run.**  It needs a fresh intro capture
-  (~2.9 e9 steps plus per-frame shots) against `work/p5t/op_u.yuv`; it does not
-  fit this task's budget.  The change is one exception-return state note and its
-  splice — no movie, codec or YUV code moved.
+  build in this environment is `SAVESTATE_MAJOR 14` (bumped at `ba317e2e`) and
+  the loader refuses a major mismatch.  No offline source for an older build,
+  so the melonDS side of the comparison was answered by the ROM's own bytes
+  (disassembly + the measured branch) instead of by replay.
+* **The title-screen skip script was not run**: the cold-boot path still parks
+  in the `0x020078F4` halfword spin long before frame 4,300 (my 700 M-step run
+  ends at `0x020078F8/0x020078FC`), the same pre-existing wakeup blocker
+  Phase-5AT recorded.
+* **The movie band audit was not re-run** (needs a ~2.9 e9-step intro capture
+  plus per-frame shots against `work/p5t/op_u.yuv`).  No movie, codec or YUV
+  code moved; the two fixes are a state note at exception returns and one
+  sign-extension in the live branch decoder.
+* The new parking point (`0x0200AD78`, a pointer-list spin) is the *known*
+  Phase-5AT wait frontier, not part of this card's defect.  Whoever takes the
+  save path next starts there.

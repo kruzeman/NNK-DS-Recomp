@@ -1484,8 +1484,20 @@ static int smc_exec_thumb(uint32_t pc, uint32_t *npc, uint32_t *costp) {
         return 1;
     }
     if ((hw & 0xF800u) == 0xE000u) {                 /* format 17: B */
+        /* Phase-5AW: imm11 is SIGNED and then doubled, so the value to sign-
+         * extend has 12 bits, not 11: shift by 20, not by 21.  The old form
+         * shifted bo's bit 11 (the sign, which only appears
+         * after the doubling) out of the word, so EVERY backward `b.n`
+         * (imm11 bit10 set) became a small FORWARD branch.  Measured at
+         * 0x212B932 `e56d b.n 0x212B410` (offset -0x526): the live decoder
+         * landed at 0x212BC10, exactly target+0x800, i.e. inside the
+         * neighbouring function's body -- which then ran its shared return
+         * thunk and popped a frame its prologue had never pushed (halt at
+         * 0x0212CCF6 with pc=0 from the pop).  decode.rs (`(h&0x7FF)<<5 as
+         * i16 >> 4`) has always had the correct semantics, so only the ROM-
+         * derived live decoder was wrong. */
         int32_t bo = (int32_t)((hw & 0x7FFu) << 1);
-        *npc = pc + 4u + (uint32_t)((bo << 21) >> 21);
+        *npc = pc + 4u + (uint32_t)((bo << 20) >> 20);
         *costp = 3;
         return 1;
     }

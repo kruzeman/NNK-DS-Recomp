@@ -3588,3 +3588,68 @@ n = (_spsr >> 31) & 1; z = (_spsr >> 30) & 1; c = (_spsr >> 29) & 1; v = (_spsr 
         "the manifest row for the splice is missing or does not quote the splice marker"
     );
 }
+
+// --------------------------------------------------------------- class 59 ---
+// Phase-5AW: the ROM-derived LIVE decoder must sign-extend a Thumb
+// unconditional branch's displacement the same way the compiled path does.
+// imm11 is signed and THEN doubled, so the value to sign-extend has 12 bits.
+// `(bo << 21) >> 21` shifts bo's bit 11 -- the sign bit, which only exists
+// after the doubling -- out of the word, so every backward `b.n` became a
+// small FORWARD branch.
+//
+// Measured at the save prompt (operator savestate + A at frames 1990..1996):
+// 0x212B932 `e56d b.n 0x212B410` (offset -0x526) was executed by the live
+// decoder at 0x212BC10 = target + 0x800, inside the neighbouring function
+// 0x212B93C, whose shared return thunk `pop {r3,r4,r5,r6,r7,pc}` then popped a
+// frame that function's prologue had never pushed: pc=0, halt at 0x0212CCF6.
+#[test]
+fn phase_5aw_live_decoder_sign_extends_a_thumb_backward_branch() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+
+    // 1. The compiled path's semantics (the reference): 0xE56D at 0x0212B932 is
+    //    `b.n 0x0212b410`, i.e. displacement -0x526 from pc+4.
+    let insn = decode_thumb(0xE56D, 0, 0x0212_B932, 2);
+    assert_eq!(insn.text, "b.n 0x0212b410");
+    match insn.kind {
+        Kind::B { link: false, target, cond: 14 } => {
+            assert_eq!(target, 0x0212_B410, "negative imm11 must branch backwards")
+        }
+        other => panic!("E56D must decode as an unconditional b.n, got {:?}", other),
+    }
+
+    // 2. The idiom: 12-bit sign extension of the DOUBLED displacement.  The old
+    //    11-bit form is shown to be wrong on this exact instruction so a future
+    //    regression cannot look equivalent.
+    let bo: i32 = (((0xE56Du32 & 0x7FFu32) << 1)) as i32; // 0xADA
+    let good = (bo << 20) >> 20;
+    let bad = (bo << 21) >> 21;
+    assert_eq!(good, -0x526, "sign-extend the doubled imm11 from bit 11");
+    assert_eq!(bad, 0x2DA, "the old 11-bit form turns -0x526 into +0x2DA");
+    assert_eq!(
+        0x0212_B936u32.wrapping_add(bad as u32),
+        0x0212_BC10,
+        "the measured wrong target: -0x526 + 0x800 lands in 0x212B93C's body"
+    );
+
+    // 3. The live decoder carries that idiom, and the other branch forms are
+    //    unaffected (format 15's doubled imm8 is 9 bits: `<<23 >>23` is right;
+    //    the BL/BLX pair sign-extends from bit 24: `<<7 >>7`).
+    let smc = std::fs::read_to_string(root.join("../tools/nnk_smc.inc")).expect("nnk_smc.inc");
+    assert!(
+        smc.contains("int32_t bo = (int32_t)((hw & 0x7FFu) << 1);"),
+        "the format-17 displacement computation changed shape"
+    );
+    assert!(
+        smc.contains("*npc = pc + 4u + (uint32_t)((bo << 20) >> 20);"),
+        "format 17 must sign-extend the doubled imm11 from bit 11 (`<<20 >>20`)"
+    );
+    assert!(
+        !smc.contains("(bo << 21) >> 21"),
+        "the 11-bit sign extension drops the sign of a backward b.n"
+    );
+    assert!(
+        smc.contains("*npc = pc + 4u + (uint32_t)((bo << 23) >> 23);"),
+        "format 15 (conditional) keeps its 9-bit extension"
+    );
+    assert!(smc.contains("o = (o << 7) >> 7;"), "the BL/BLX pair keeps its 25-bit extension");
+}
