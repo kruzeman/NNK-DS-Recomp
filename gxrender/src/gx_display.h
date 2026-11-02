@@ -23,6 +23,7 @@
 #define GX_DISPLAY_H
 
 #include <stdint.h>
+#include <stddef.h>
 
 typedef struct Gxd Gxd;
 
@@ -173,6 +174,20 @@ void gxd_load_tex(Gxd *g, const uint8_t *texvram, uint32_t vram_size,
 /* Override the 3D layer fed to the compositor with a captured f%05u.fb
  * buffer (256*192 u32, fb layout); NULL restores the rendered layer. */
 void gxd_load_fb3d(Gxd *g, const uint32_t *fb);
+
+/* ---- full-state snapshot (Phase-5AQ savestates) --------------------------
+ *
+ * gxd_state_size() is the exact blob size for THIS instance (the retained
+ * polygon lists are dynamic).  gxd_state_save() writes it; gxd_state_load()
+ * restores it, rebinding every host-owned pointer from the live instance so
+ * the blob carries no host addresses and works in a different process.
+ * Returns the bytes written, or <0 on a format/layout mismatch.  The blob's
+ * layout is fingerprinted by gxd_state_layout_fp() — a state written by a
+ * different build must be refused, not applied. */
+size_t gxd_state_size(const Gxd *g);
+int gxd_state_save(const Gxd *g, uint8_t *buf, size_t cap);
+int gxd_state_load(Gxd *g, const uint8_t *buf, size_t len);
+uint32_t gxd_state_layout_fp(void);
 
 /* Diagnostics. */
 uint32_t gxd_unhandled_io(const Gxd *g);

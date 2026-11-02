@@ -457,6 +457,12 @@ def main():
     # ROM), so it must sit next to nnk_main.c like the fragments above.
     shutil.copyfile(os.path.join(here, "nnk_rom.inc"),
                     os.path.join(outdir, "nnk_rom.inc"))
+    # Phase-5AQ: the savestate container (F5/F9, NNK_SAVESTATE_*).  Its field
+    # table (nnk_state_fields.h) is GENERATED at build time by
+    # tools/nnks_gen_state_fields.py from this same split output, so the state
+    # carries every runtime static the effective prelude actually has.
+    shutil.copyfile(os.path.join(here, "nnk_state.inc"),
+                    os.path.join(outdir, "nnk_state.inc"))
     # Phase-5AP: the ROM-derived `pc -> form` map (tools/gen_pcform.py).  It is
     # a build artifact under work/ and never committed, so the build names it
     # with NNK_PCFORM_MAP; without it an EMPTY map is written and the runtime
@@ -674,7 +680,6 @@ def main():
                      "    cycles++;                       /* coarse timing: ~1 cycle per instruction */\n"
                      "    {   /* Phase-5F: VBlank IRQ producer (melonDS GPU.cpp VCount==192\n"
                      "         * -> SetDispStatIRQ(0,0), gated on DISPSTAT bit 3). */\n"
-                     "        static uint32_t p5f_vc_last = 0xFFFFFFFFu;\n"
                      "        uint32_t p5f_vc = vcount();\n"
                      "        if (p5f_vc != p5f_vc_last) {\n"
                      "            if (p5f_vc == 192u && (dispstat & 0x8u)) iflags |= 0x1u;\n"
@@ -702,7 +707,12 @@ def main():
                      " * The Phase-5F cap (20,000 hits) was consumed at step\n"
                      " * 23,490,852, so the LATE idle-loop state (the stall at\n"
                      " * 39M+) could never be sampled; the window is data now. */\n"
-                     "static unsigned long long nnk_wfi_lo = 0;",
+                     "static unsigned long long nnk_wfi_lo = 0;\n"
+                     "/* Phase-5AQ: hoisted from the VBlank producer: a"
+                     " function-local static is unreachable from the"
+                     " savestate field table, and its value is machine"
+                     " state (the last VCOUNT edge), not a probe. */\n"
+                     "static uint32_t p5f_vc_last = 0xFFFFFFFFu;",
                      "Phase-5F WFI probe statics")
     prelude = inject(prelude,
                      "        else if (!irq_active && (irq_trig_n >= IRQ_TRIG_N || steps > irq_trig_log[irq_trig_n])",
@@ -918,6 +928,22 @@ def main():
                if io16 in l else l for l in prelude]
     sys.stderr.write("Phase-4W: KEYINPUT read trace + EXTKEYIN spliced into io_read16\n")
 
+    # ---- Phase-5AQ: savestate per-step hook ------------------------------
+    # nnks_tick() is two integer compares when no SAVE_AT/HASH_AT is armed; it
+    # is called once per dispatched instruction, next to the other per-step
+    # shims, so NNK_SAVESTATE_SAVE_AT / NNK_STATE_HASH_AT can name an exact
+    # guest step.  It never alters guest state.
+    prelude = inject(prelude, "        arm7_evt_tick();",
+                     "        arm7_evt_tick();\n        nnks_tick(&pc);",
+                     "Phase-5AQ savestate per-step hook")
+    # The restored state must resume at the PC it was saved at, so run()
+    # takes its entry PC from the state module (ENTRY_CONST unless a
+    # state was loaded).  nnks_tick(pc) above keeps that mirror current.
+    prelude = inject(prelude, "    uint32_t pc = ENTRY_CONST;",
+                     "    uint32_t pc = nnks_entry_pc();",
+                     "Phase-5AQ resume PC")
+    sys.stderr.write("Phase-5AQ: savestate per-step hook spliced\n")
+
     # ---- main TU: prelude + band table + dispatch + tail
     prelude = list(prelude)          # un-static'd copy
     tf_idx = next((i for i, l in enumerate(prelude)
@@ -942,6 +968,10 @@ def main():
         # same runtime statics visible; io_read16 hook spliced into the
         # prelude above, tick called once per dispatch below.
         fh.write('#include "nnk_input.inc"\n\n')
+        # Phase-5AQ: savestates.  Included LAST so it sees every runtime static
+        # the fragments above declare; its per-step hook is injected into run()
+        # below and its boot hook into main().
+        fh.write('#include "nnk_state.inc"\n\n')
         fh.write("static const NnkPartFn nnk_band_table[NNK_BAND_COUNT] = {\n")
         for bi in sorted(bands):
             if bi == ITCM_BAND:
@@ -1006,6 +1036,12 @@ def main():
             die("Phase-4M: run-summary anchor matched %d lines" % len(tail_repl))
         tail = inject(tail, 'fprintf(stderr, "done steps=',
                       "    nnk_vrc_report();\n" + tail_repl[0], "vramcnt report call")
+        # Phase-5AQ: arm the savestate subsystem after the display exists (the
+        # display model is part of the state) and load NNK_SAVESTATE=<path> if
+        # the operator asked to boot straight from a state.
+        tail = inject(tail, "    nnk_display_open();",
+                      "    nnk_display_open();\n    nnks_boot(argc, argv);",
+                      "Phase-5AQ savestate boot hook")
         fh.writelines(tail)
     n_cases = sum(len(c) for c in bands.values())
     if n_cases != len(blocks):

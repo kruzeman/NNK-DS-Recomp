@@ -149,11 +149,20 @@ static void nnk_input_key(SDL_Scancode sc, int down)
 }
 
 /* ---- SDL event filter: the single owner of keyboard state ---- */
+/* Phase-5AQ: F5/F9 are HOST keys (save/load a savestate), not DS keys.  They
+ * are declared here because this filter runs before gx_display's pump and the
+ * savestate fragment (tools/nnk_state.inc) is included after this file. */
+static void nnk_state_ui_key(int fkey);
+
 static int nnk_input_filter(void *ud, SDL_Event *ev)
 {
     (void)ud;
     if (ev->type == SDL_KEYDOWN || ev->type == SDL_KEYUP) {
         if (ev->key.repeat) return 0;        /* repeat policy: ignore */
+        if (ev->type == SDL_KEYDOWN) {
+            if (ev->key.keysym.scancode == SDL_SCANCODE_F5) { nnk_state_ui_key(5); return 0; }
+            if (ev->key.keysym.scancode == SDL_SCANCODE_F9) { nnk_state_ui_key(9); return 0; }
+        }
         nnk_input_key(ev->key.keysym.scancode, ev->type == SDL_KEYDOWN);
         return 0;                            /* consumed: gxd's built-in keymap
                                               * must never see key events */
