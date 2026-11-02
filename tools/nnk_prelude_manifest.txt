@@ -87,6 +87,11 @@ smc_store_note	required	smc_note	tools/nnk_smc.inc	Phase-5N/5P: store hook (watc
 5aj_rom_derived_image	required	nnk_rom_guest_image	tools/nnk_rom.inc	Phase-5AJ: the boot image is the ROM's arm9 slice zero-padded (no arm9_stored_padded.bin)
 5aj_rom_decompress	required	nnk_code_decompress	tools/nnk_rom.inc	Phase-5AJ: DS code-compression (reversed LZ77 + 0xFF footer) decompressor
 5aj_rom_smc_segments	required	nnk_rom_arena_window	tools/nnk_rom.inc	Phase-5AJ: SMC generation-0 segments derived from the ROM (NNK_SMC_IMAGE is an override)
+5aq_state_container	required	NNKS_VERSION	tools/nnk_state.inc	Phase-5AQ: the NNKS savestate container (identity block, per-region offset/length/CRC32, payload CRC)
+5aq_state_field_table	required	nnk_state_fields.h	tools/nnk_state.inc	Phase-5AQ: the generated field table — every mutable runtime static travels in the state
+5aq_state_step_hook	required	nnks_tick	tools/split_dispatch.py	Phase-5AQ: per-step hook (NNK_SAVESTATE_SAVE_AT / NNK_STATE_HASH_AT)
+5aq_state_boot_hook	required	nnks_boot	tools/split_dispatch.py	Phase-5AQ: main() arms the subsystem and applies NNK_SAVESTATE after the display exists
+5aq_state_f5f9	required	nnk_state_ui_key	tools/nnk_input.inc	Phase-5AQ: F5 save / F9 load from the SDL event filter (host keys, never guest keys)
 
 # --------------------------------------------------------------- divergent
 # Tree ahead of the frozen image, deliberately NOT enforced this phase: each

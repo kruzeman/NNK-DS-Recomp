@@ -1699,6 +1699,230 @@ int gxd_write_window_ppm(Gxd *g, const char *path)
     return 0;
 }
 
+/* ---- full-state snapshot (Phase-5AQ: savestates) ----
+ *
+ * A savestate must restore the display model, not just the guest RAM: every
+ * byte the compositor renders comes from state owned here (VRAM banks, the
+ * 2D register image, the retained 3D polygon set, the latched render env,
+ * the composed screen buffers).  The guest's writes reached this state
+ * through gxd_io_write/gxd_gx_*, and a restore does NOT replay them, so the
+ * state has to travel in the blob.
+ *
+ * Format (little-endian):
+ *   u32 magic 'GDX1' | u32 version(1) | u32 sizeof(Gxd) | u32 GX2D_STATE_SIZE
+ *   u32 n_pending | u32 n_current | u32 n_scratch | u32 sizeof(GxPolygon)
+ *   then the Gxd struct as a byte image with every HOST-OWNED pointer field
+ *   zeroed (win, pctx, gl3d, scr_tex, win_shot, img, fb3d_override, the three
+ *   PolyList arrays, gx.draw_fn/draw_user, gx.surface.*, gx.env.tex/toon,
+ *   gx.texmem.vram/pal), then the img bytes, then the three polygon arrays.
+ *   The host fields are rebound from the LIVE instance on load — a state
+ *   never carries a host pointer, so it is portable between processes and
+ *   unaffected by ASLR.  Everything else (including padding) is written from
+ *   a zeroed copy, so a state file is byte-reproducible.
+ *
+ * gxd_state_layout_fp() is the build fingerprint of that layout: the state
+ * container refuses a blob produced by a different one. */
+
+#define GXD_STATE_VERSION 1u
+#define GXD_STATE_MAGIC 0x31584447u /* 'GDX1' little-endian */
+
+typedef struct {
+    uint32_t magic, version;
+    uint32_t gxd_size, img_size;
+    uint32_t n_pending, n_current, n_scratch, poly_size;
+} GxdStateHdr;
+
+uint32_t gxd_state_layout_fp(void)
+{
+    /* FNV-1a over the layout-defining numbers only: a change in any of them
+     * (struct sizes, the 2D image size, the polygon record) means a state
+     * written by another build cannot be restored safely. */
+    uint32_t v[8];
+    uint32_t h = 2166136261u;
+    int i;
+    v[0] = (uint32_t)sizeof(Gxd);
+    v[1] = (uint32_t)sizeof(Gx);
+    v[2] = (uint32_t)GX2D_STATE_SIZE;
+    v[3] = (uint32_t)sizeof(GxPolygon);
+    v[4] = (uint32_t)VRAM_BANKS;
+    v[5] = (uint32_t)TEXVRAM_SIZE;
+    v[6] = (uint32_t)TEXPAL_SIZE;
+    v[7] = (uint32_t)FB_PIXELS;
+    for (i = 0; i < 8; i++) {
+        h ^= v[i];
+        h *= 16777619u;
+    }
+    return h;
+}
+
+/* Allocate the scratch copy in which host pointers are blanked.  malloc'd
+ * once; the saver is called at most a few times per run. */
+static Gxd *state_scratch(void)
+{
+    static Gxd *z;
+    if (!z) z = (Gxd *)calloc(1, sizeof(Gxd));
+    return z;
+}
+
+size_t gxd_state_size(const Gxd *g)
+{
+    if (!g) return 0;
+    return sizeof(GxdStateHdr) + sizeof(Gxd) + GX2D_STATE_SIZE +
+           (size_t)(g->pending.n + g->current.n + g->scratch.n) * sizeof(GxPolygon);
+}
+
+int gxd_state_save(const Gxd *g, uint8_t *buf, size_t cap)
+{
+    GxdStateHdr h;
+    Gxd *z;
+    size_t need, off;
+    if (!g || !buf) return -1;
+    need = gxd_state_size(g);
+    if (cap < need) return -2;
+    z = state_scratch();
+    if (!z) return -3;
+    memcpy(z, g, sizeof *z);
+    /* host-owned / self-referential pointers: never written to a file */
+    z->img = NULL;
+    z->win = NULL;
+    z->pctx = NULL;
+    z->gl3d = NULL;
+    memset(z->scr_tex, 0, sizeof z->scr_tex);
+    z->have_tex = 0;
+    z->win_shot = NULL;
+    z->fb3d_override = NULL;
+    z->pending.poly = NULL;
+    z->current.poly = NULL;
+    z->scratch.poly = NULL;
+    z->gx.draw_fn = NULL;
+    z->gx.draw_user = NULL;
+    memset(&z->gx.surface, 0, sizeof z->gx.surface);
+    memset(&z->sf, 0, sizeof z->sf);   /* points into colorbuf/depthbuf too */
+    z->gx.env.tex = NULL;
+    z->gx.env.toon = NULL;
+    z->gx.texmem.vram = NULL;
+    z->gx.texmem.pal = NULL;
+
+    memset(&h, 0, sizeof h);
+    h.magic = GXD_STATE_MAGIC;
+    h.version = GXD_STATE_VERSION;
+    h.gxd_size = (uint32_t)sizeof(Gxd);
+    h.img_size = (uint32_t)GX2D_STATE_SIZE;
+    h.n_pending = (uint32_t)g->pending.n;
+    h.n_current = (uint32_t)g->current.n;
+    h.n_scratch = (uint32_t)g->scratch.n;
+    h.poly_size = (uint32_t)sizeof(GxPolygon);
+
+    off = 0;
+    memcpy(buf + off, &h, sizeof h);                 off += sizeof h;
+    memcpy(buf + off, z, sizeof *z);                 off += sizeof *z;
+    memcpy(buf + off, g->img, GX2D_STATE_SIZE);      off += GX2D_STATE_SIZE;
+    memcpy(buf + off, g->pending.poly, (size_t)g->pending.n * sizeof(GxPolygon));
+    off += (size_t)g->pending.n * sizeof(GxPolygon);
+    memcpy(buf + off, g->current.poly, (size_t)g->current.n * sizeof(GxPolygon));
+    off += (size_t)g->current.n * sizeof(GxPolygon);
+    memcpy(buf + off, g->scratch.poly, (size_t)g->scratch.n * sizeof(GxPolygon));
+    off += (size_t)g->scratch.n * sizeof(GxPolygon);
+    return (int)off;
+}
+
+/* Replace list contents from the blob; capacity grows to n. */
+static int state_list_load(PolyList *l, const uint8_t *src, uint32_t n)
+{
+    if (n == 0) { l->n = 0; return 0; }
+    if (n > l->cap || !l->poly) {
+        GxPolygon *p = (GxPolygon *)realloc(l->poly, (size_t)n * sizeof *p);
+        if (!p) return -1;
+        l->poly = p;
+        l->cap = (int)n;
+    }
+    memcpy(l->poly, src, (size_t)n * sizeof(GxPolygon));
+    l->n = (int)n;
+    return 0;
+}
+
+int gxd_state_load(Gxd *g, const uint8_t *buf, size_t len)
+{
+    GxdStateHdr h;
+    Gxd tmp;
+    const uint8_t *p;
+    size_t off;
+    uint32_t np, nc, ns;
+    if (!g || !buf || len < sizeof h) return -1;
+    memcpy(&h, buf, sizeof h);
+    if (h.magic != GXD_STATE_MAGIC || h.version != GXD_STATE_VERSION) return -2;
+    if (h.gxd_size != sizeof(Gxd) || h.img_size != GX2D_STATE_SIZE ||
+        h.poly_size != sizeof(GxPolygon)) return -3;
+    np = h.n_pending; nc = h.n_current; ns = h.n_scratch;
+    if (len != sizeof h + sizeof(Gxd) + GX2D_STATE_SIZE +
+               (size_t)(np + nc + ns) * sizeof(GxPolygon)) return -4;
+
+    p = buf + sizeof h;
+    memcpy(&tmp, p, sizeof tmp);
+    off = sizeof h + sizeof tmp;
+
+    /* Rebind everything the host owns.  A state never carries these. */
+    tmp.windowed = g->windowed;
+    tmp.gl_3d = g->gl_3d;
+    tmp.scale = g->scale;
+    tmp.layout = g->layout;
+    tmp.win_w = g->win_w;
+    tmp.win_h = g->win_h;
+    tmp.img = g->img;
+    tmp.win = g->win;
+    tmp.pctx = g->pctx;
+    tmp.gl3d = g->gl3d;
+    memcpy(tmp.scr_tex, g->scr_tex, sizeof tmp.scr_tex);
+    tmp.have_tex = g->have_tex;
+    tmp.win_shot = g->win_shot;
+    tmp.win_shot_w = g->win_shot_w;
+    tmp.win_shot_h = g->win_shot_h;
+    tmp.fb3d_override = g->fb3d_override;
+    tmp.gx.draw_fn = g->gx.draw_fn;
+    tmp.gx.draw_user = g->gx.draw_user;
+    tmp.gx.surface = g->gx.surface;
+    tmp.sf = g->sf;                    /* pointers into the live buffers */
+    tmp.gx.env.tex = &tmp.gx.texmem;
+    tmp.gx.env.toon = tmp.gx.toon;
+    tmp.gx.texmem.vram = tmp.texvram;
+    tmp.gx.texmem.pal = tmp.texpal;
+    tmp.pending.poly = g->pending.poly;
+    tmp.pending.cap = g->pending.cap;
+    tmp.pending.n = 0;
+    tmp.current.poly = g->current.poly;
+    tmp.current.cap = g->current.cap;
+    tmp.current.n = 0;
+    tmp.scratch.poly = g->scratch.poly;
+    tmp.scratch.cap = g->scratch.cap;
+    tmp.scratch.n = 0;
+
+    /* The freshly allocated instance (g) keeps its host bindings + poly
+     * capacities; adopt the restored state into it. */
+    {
+        GxPolygon *pp = g->pending.poly; int ppc = g->pending.cap;
+        GxPolygon *cp = g->current.poly; int cpc = g->current.cap;
+        GxPolygon *sp = g->scratch.poly; int spc = g->scratch.cap;
+        *g = tmp;
+        g->pending.poly = pp; g->pending.cap = ppc;
+        g->current.poly = cp; g->current.cap = cpc;
+        g->scratch.poly = sp; g->scratch.cap = spc;
+    }
+
+    memcpy(g->img, buf + off, GX2D_STATE_SIZE);
+    off += GX2D_STATE_SIZE;
+    if (state_list_load(&g->pending, buf + off, np)) return -5;
+    off += (size_t)np * sizeof(GxPolygon);
+    if (state_list_load(&g->current, buf + off, nc)) return -5;
+    off += (size_t)nc * sizeof(GxPolygon);
+    if (state_list_load(&g->scratch, buf + off, ns)) return -5;
+
+    /* Flat VRAM/2D views are derived from vramcnt + the raw banks: rebuild
+     * them rather than trusting a stale flat image. */
+    g->flat_dirty = 1;
+    g->bulk_win = 0;
+    return 0;
+}
+
 void gxd_load_2d_state(Gxd *g, const uint8_t *image)
 {
     memcpy(g->img, image, GX2D_STATE_SIZE);

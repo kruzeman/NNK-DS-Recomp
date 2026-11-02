@@ -273,6 +273,16 @@ for f in nnk_main.c nnk_rt.h; do
   [[ -f "$SPLIT/$f" ]] || { echo "split output incomplete: missing $SPLIT/$f" >&2; exit 2; }
 done
 
+# ---- Phase-5AQ: savestate field table -------------------------------------
+# The savestate must carry EVERY mutable runtime static; the list is derived
+# from the split output (nnk_main.c up to run() + the *.inc fragments) instead
+# of being hand-maintained, so a static added by a later phase is carried
+# automatically.  Regenerated on every build; it is part of the runtime TU and
+# of the object cache key (HDR_HASH below).
+echo "== Phase-5AQ: savestate field table =="
+python3 tools/nnks_gen_state_fields.py "$SPLIT" > "$SPLIT/nnk_state_fields.h"
+echo "   $(grep -c 'NNKS_F(' "$SPLIT/nnk_state_fields.h") fields in $(grep -c 'NnkStateField nnks_fields_' "$SPLIT/nnk_state_fields.h") regions"
+
 # ---- Phase-5AG: prelude feature audit -------------------------------------
 # The runtime TU ($SPLIT/nnk_main.c + the *.inc fragments next to it, after the
 # splices above and split_dispatch.py's injections) must carry EVERY feature
@@ -317,7 +327,7 @@ done
 
 # Everything that must invalidate a cached .o is captured once here.
 CC_ID=$("$CC" --version | head -1)
-HDR_HASH=$(cat "$SPLIT/nnk_rt.h" "$SPLIT"/nnk_smc_map.h "$SPLIT"/nnk_smc.inc "$SPLIT"/nnk_boot.inc "$SPLIT"/nnk_dma.inc "$SPLIT"/nnk_vramcnt.inc "$SPLIT"/nnk_input.inc "$SPLIT"/nnk_mobiclip.inc "$SPLIT"/nnk_mobiclip_dec.inc "$SPLIT"/nnk_rom.inc "$SPLIT"/nnk_pcform_map.h 2>/dev/null | sha256sum | cut -d' ' -f1)
+HDR_HASH=$(cat "$SPLIT/nnk_rt.h" "$SPLIT"/nnk_smc_map.h "$SPLIT"/nnk_smc.inc "$SPLIT"/nnk_boot.inc "$SPLIT"/nnk_dma.inc "$SPLIT"/nnk_vramcnt.inc "$SPLIT"/nnk_input.inc "$SPLIT"/nnk_mobiclip.inc "$SPLIT"/nnk_mobiclip_dec.inc "$SPLIT"/nnk_rom.inc "$SPLIT"/nnk_state.inc "$SPLIT"/nnk_state_fields.h "$SPLIT"/nnk_pcform_map.h 2>/dev/null | sha256sum | cut -d' ' -f1)
 
 # compile_cached <source.c> <target.o> <flag-array-name>
 # Reuse <target.o> when its sidecar stamp still matches the current content
