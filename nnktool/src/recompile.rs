@@ -402,7 +402,7 @@ fn emit_insn(
                 // to SYS mode at lr-4 = 0x02015EC4.
                 body.push(
                     "if (mode_priv()) { uint32_t _spsr = spsr_bank[mode_cur]; \
-                     cpsr_set_ctl(_spsr & 0xFFu); n = (_spsr >> 31) & 1; z = (_spsr >> 30) & 1; \
+                     cpsr_set_ctl(_spsr & 0xDFu); n = (_spsr >> 31) & 1; z = (_spsr >> 30) & 1; \
                      c = (_spsr >> 29) & 1; v = (_spsr >> 28) & 1; \
                      nnk_smc_note_exc_return(pc, _spsr); }"
                         .into(),
