@@ -10,6 +10,7 @@
 //   recompile-entry <image> <out.c> [--base A] [--entry A] [--max-insns N]
 
 mod decode;
+mod modeov;
 mod pcform;
 mod recover;
 mod recompile;
@@ -275,7 +276,8 @@ fn usage() -> ! {
          \n  nnktool disasm <image> [--base 0xADDR] [--start 0xADDR] [--end 0xADDR] [--mode arm|thumb] [--count N]\
          \n  nnktool decompile <image> <out_dir> [--base 0xADDR] [--entry 0xADDR] [--seeds <ghidra.tsv>] [--max-insns N] [--max-funcs N]\
          \n  nnktool recompile-entry <image> <out.c> [--base 0xADDR] [--entry 0xADDR] [--max-insns N]\
-         \n  nnktool recompile-all <image> <out.c> [--base 0xADDR] [--entry 0xADDR] [--seeds <ghidra.tsv>] [--max-insns N] [--max-funcs N]\
+         \n  nnktool recompile-all <image> <out.c> [--base 0xADDR] [--entry 0xADDR] [--seeds <ghidra.tsv>] [--max-insns N] [--max-funcs N] [--mode-overrides <file>]\
+         \n  nnktool recompile-cases <image> <out.c> [--base 0xADDR] [--entry 0xADDR] [--mode arm|thumb] [--max-insns N] [--mode-overrides <file>]\
          \n  nnktool pcform <manifest> <out.h>   (Phase-5AP ROM-derived pc->form map)"
     );
     exit(2);
@@ -288,9 +290,9 @@ fn opt(args: &[String], key: &str) -> Option<String> {
 
 /// Split argv into positionals, `--key value` options and the --full flag.
 fn split_args(args: &[String]) -> (Vec<String>, Vec<String>, bool) {
-    const VALUE_FLAGS: [&str; 10] = [
+    const VALUE_FLAGS: [&str; 11] = [
         "--base", "--start", "--end", "--mode", "--count", "--entry", "--entry-mode",
-        "--max-insns", "--max-funcs", "--seeds",
+        "--max-insns", "--max-funcs", "--seeds", "--mode-overrides",
     ];
     let mut pos: Vec<String> = Vec::new();
     let mut flat: Vec<String> = Vec::new(); // key, value, key, value... for opt()
@@ -404,6 +406,10 @@ fn main() {
             let entry_thumb = opt(&args, "--entry-mode").map(|s| s == "thumb").unwrap_or(false);
             let max_insns = opt(&args, "--max-insns").map(|s| parse_addr(&s) as usize).unwrap_or(20_000);
             let max_funcs = opt(&args, "--max-funcs").map(|s| parse_addr(&s) as usize).unwrap_or(20_000);
+            // Phase-5AT: install tools/nnk_mode_overrides.txt before any seed is
+            // decoded, and say which rows are in force (the audit trail for a
+            // regeneration).
+            install_mode_overrides(&args);
             let seeds = opt(&args, "--seeds");
             cmd_decompile(&image, base, entry, entry_thumb, Path::new(pos[2]), max_insns, max_funcs, seeds);
         }
@@ -464,7 +470,42 @@ fn main() {
             let max_insns = opt(&args, "--max-insns").map(|s| parse_addr(&s) as usize).unwrap_or(20_000);
             let max_funcs = opt(&args, "--max-funcs").map(|s| parse_addr(&s) as usize).unwrap_or(50_000);
             let seeds = opt(&args, "--seeds");
+            install_mode_overrides(&args);
             cmd_recompile_all(&image, base, entry, seeds, Path::new(pos[2]), max_insns, max_funcs);
+        }
+        "recompile-cases" => {
+            // Phase-5AT: one function's dispatch cases in an EXPLICIT state.
+            //   nnktool recompile-cases <image> <out.c> [--base A] [--entry A]
+            //          [--mode arm|thumb] [--mode-overrides F] [--max-insns N]
+            // tools/p5at_mode_splice.py drives this; the emitted labels are
+            // the frozen image's dialect so the splitter keeps matching.
+            if pos.len() != 3 {
+                usage();
+            }
+            let image = load(pos[1]);
+            let base = opt(&args, "--base").map(|s| parse_addr(&s)).unwrap_or(ARM9_BASE);
+            let entry = opt(&args, "--entry").map(|s| parse_addr(&s)).unwrap_or(ARM9_ENTRY);
+            let asked = match opt(&args, "--mode").as_deref() {
+                Some("thumb") => recover::Mode::Thumb,
+                Some("arm") | None => recover::Mode::Arm,
+                Some(_) => die("--mode must be arm or thumb"),
+            };
+            let max_insns = opt(&args, "--max-insns").map(|s| parse_addr(&s) as usize).unwrap_or(20_000);
+            install_mode_overrides(&args);
+            // The committed table is authoritative over the command line.
+            let mode = recover::mode_override(entry).unwrap_or(asked);
+            let st = recompile::recompile_cases(&image, base, entry, mode, Path::new(pos[2]), max_insns)
+                .unwrap_or_else(|e| die(&e));
+            println!(
+                "recompile-cases: 0x{:08X} {} {} cases 0x{:08X}..0x{:08X} undef={} calls={}",
+                entry & !1,
+                st.mode,
+                st.cases,
+                st.first,
+                st.past_end,
+                st.undef,
+                st.calls.iter().map(|a| format!("0x{:08X}", a)).collect::<Vec<_>>().join(",")
+            );
         }
         _ => usage(),
     }
@@ -681,8 +722,29 @@ fn load_seeds(path: &str) -> Vec<recover::FuncKey> {
     seen
 }
 
-// ------------------------------------------------------- recompile-all ---
+// -------------------------------------------------- Phase-5AT overrides ---
 
+/// Install `--mode-overrides <file>` for this run and print every row in force.
+///
+/// The file is the committed `tools/nnk_mode_overrides.txt`; see
+/// `nnktool/src/modeov.rs` for the format and why a row needs a reason.  This
+/// is called before any seed is decoded, and `recover::mode_override` makes
+/// the table authoritative for seeds AND for functions reached by a direct
+/// call, so a regeneration cannot reproduce the wrong-mode body.
+fn install_mode_overrides(args: &[String]) -> usize {
+    let Some(path) = opt(args, "--mode-overrides") else {
+        return 0;
+    };
+    let ovs = modeov::load(&path).unwrap_or_else(|e| die(&e));
+    for o in &ovs {
+        eprintln!("mode-override 0x{:08X} {} -- {}", o.addr, o.mode.name(), o.reason);
+    }
+    let n = ovs.len();
+    recover::set_mode_overrides(ovs.iter().map(|o| (o.addr, o.mode)).collect());
+    n
+}
+
+// ------------------------------------------------------- recompile-all ---
 fn cmd_recompile_all(
     image: &[u8],
     base: u32,

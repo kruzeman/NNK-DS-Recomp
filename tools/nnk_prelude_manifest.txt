@@ -84,6 +84,7 @@ smc_store_note	required	smc_note	tools/nnk_smc.inc	Phase-5N/5P: store hook (watc
 5ah_yuv_is_override	required	A/B OVERRIDE	tools/nnk_smc.inc	Phase-5AH: NNK_MOVIE_YUV* is an optional A/B diagnostic, never a requirement
 5aj_rom_only_input	required	nnk_rom_image_load	nnktool/src/recompile.rs	Phase-5AJ: main() takes the card image as argv[1] and derives the guest image from it
 5ap_pop_note_interwork	required	Phase-5AP pop-note splice applied	tools/p5ap_pop_note_splice.py	Phase-5AP: an ARM `ldmfd sp!,{pc}` (A_POP) hands the RAW loaded word to the state note (bit0 = Thumb return tag); only the non-SP single-register LDM forces the tag.  The frozen image gets it from tools/p5ap_pop_note_splice.py, so it is not enforced in the image's own bytes.
+5at_mode_override	required	Phase-5AT mode-override splice applied	tools/p5at_mode_splice.py	Phase-5AT: a wrong-mode function body (0x02062C44 is Thumb, the seed table said ARM) is replaced by `nnktool recompile-cases` output driven by the committed tools/nnk_mode_overrides.txt, so the shipped image and a future `recompile-all --mode-overrides` cannot disagree.
 5aj_rom_derived_image	required	nnk_rom_guest_image	tools/nnk_rom.inc	Phase-5AJ: the boot image is the ROM's arm9 slice zero-padded (no arm9_stored_padded.bin)
 5aj_rom_decompress	required	nnk_code_decompress	tools/nnk_rom.inc	Phase-5AJ: DS code-compression (reversed LZ77 + 0xFF footer) decompressor
 5aj_rom_smc_segments	required	nnk_rom_arena_window	tools/nnk_rom.inc	Phase-5AJ: SMC generation-0 segments derived from the ROM (NNK_SMC_IMAGE is an override)

@@ -6,6 +6,7 @@
 
 use crate::decode::*;
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::OnceLock;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum Mode {
@@ -511,6 +512,36 @@ pub struct Recovered {
     pub truncated: bool,
 }
 
+// ---- Phase-5AT: the function-mode override table ------------------------
+//
+// A recovered function's state must be the hardware's, not the seed table's
+// guess.  `tools/nnk_mode_overrides.txt` (parsed by crate::modeov) is
+// installed once per run and consulted here, at the single point where a
+// FuncKey is created from an address: every seed AND every function reached
+// by a direct call is normalised before it is decoded, so an override applies
+// transitively instead of only to the row it names.
+static MODE_OVERRIDES: OnceLock<Vec<(u32, Mode)>> = OnceLock::new();
+
+/// Install the audited override table for this process (idempotent).
+pub fn set_mode_overrides(v: Vec<(u32, Mode)>) {
+    let _ = MODE_OVERRIDES.set(v);
+}
+
+/// The overridden state of `addr`, if the committed table names it.
+pub fn mode_override(addr: u32) -> Option<Mode> {
+    MODE_OVERRIDES
+        .get()
+        .and_then(|v| v.iter().find(|(a, _)| *a == (addr & !1)).map(|(_, m)| *m))
+}
+
+/// Apply the override table to a key, if any (Phase-5AT).
+fn with_override(key: FuncKey) -> FuncKey {
+    match mode_override(key.addr) {
+        Some(m) if m != key.mode => FuncKey { addr: key.addr & !1, mode: m },
+        _ => key,
+    }
+}
+
 /// Reachability-guided recovery of every function reachable from `entry`.
 pub fn recover(
     data: &[u8],
@@ -539,6 +570,10 @@ pub fn recover_seeds(
     let mut pending: Vec<FuncKey> = seeds.to_vec();
     let mut truncated = false;
     while let Some(key) = pending.pop() {
+        // Phase-5AT: the committed override table wins over the seed's guessed
+        // mode and over the mode inferred from a call site, for seeds and for
+        // every transitively recovered function alike.
+        let key = with_override(key);
         if funcs.contains_key(&key) {
             continue;
         }
