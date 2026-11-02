@@ -823,6 +823,13 @@ static void nnk_p4s_fire(void) {
     uint32_t s = ld32(obj);
     st32(obj, s + 1u);
     nnk_p4s_done++;
+    if (steps >= 500000000ull && getenv("NNK_P4S_TRACE"))
+        fprintf(stderr, "p5ay: arm7 bump 0x%08X->0x%08X step=%llu cyc=%llu "
+                "pc=0x%08X lr=0x%08X snap=%u rec=%u pub=%u free_head=0x%08X\n",
+                s, s + 1u, (unsigned long long)steps,
+                (unsigned long long)cycles, last_pc, r[14],
+                ld32(0x0206CA5Cu), ld32(0x0206CA6Cu), ld32(0x0206CA70u),
+                ld32(0x0206CA58u));
     if (nnk_p4s_done <= 8u || (nnk_p4s_done & 63u) == 0u) {
         fprintf(stderr, "p4s: ARM7 card-phase effect seq 0x%08X -> 0x%08X "
                 "obj=0x%08X ptr=0x%08X snap=0x%08X step=%llu cyc=%llu\n",
@@ -836,6 +843,30 @@ static void nnk_p4s_fire(void) {
 }
 
 static void nnk_p4s_request(uint32_t v) {
+    /* Phase-5AY: the mailbox sequence is a HANDSHAKE, not a free-running
+     * counter.  The ARM9 publishes a ring (0x0200AE88), sends the class-7
+     * request, then waits for the ARM7 to advance *(*(0x0206E580)); its
+     * reclaim (0x0200ACC8) consumes exactly one increment and then advances
+     * the pool's own sequence (+0x04 = 0x0206CA5C).  Phase-4S measured the
+     * wait exiting 89..109 ts after the write — the ARM7's word is never more
+     * than ONE ahead of the pool's.  Arming a completion while the previous
+     * one is still unconsumed banks a credit, and a banked credit lets
+     * RECLAIM run twice on one publish: the second ring it takes is still the
+     * chain it just appended, so `tail->next = head-of-ring` closes the
+     * Phase-5AX 2-cycle.  Measured in the operator's state (probe below):
+     * seq=0xA0 vs poolseq=0x9F right before the 546,142,360 cycle. */
+    {
+        uint32_t p = ld32(0x0206E580u);          /* the sequence pointer    */
+        uint32_t obj = p ? p : 0x0206CAA0u;      /* the ARM7's write target */
+        uint32_t shared = ld32(obj), pool = ld32(0x0206CA5Cu);
+        if (shared != pool) {
+            if (getenv("NNK_P4S_TRACE"))
+                fprintf(stderr, "p5ay: request 0x%08X deferred: arm7 word "
+                        "0x%08X still unconsumed (pool 0x%08X) step=%llu\n",
+                        v, shared, pool, (unsigned long long)steps);
+            return;
+        }
+    }
     if (!nnk_p4s_first) {
         nnk_p4s_first = 1;
         /* measured: first completion = reply + 164,505 (A); next = tick slot */
