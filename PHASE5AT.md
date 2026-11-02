@@ -154,7 +154,8 @@ table, and Phase-5AT removes the reason the carrier was needed at
 | check | result |
 |---|---|
 | `cargo test` | **57 passed** (was 56; `phase_5at_mode_override_corrects_a_wrong_mode_seed` added) |
-| `tools/verify_phase2a.sh` | see §7 |
+| `tools/verify_phase2a.sh` | `rc=0`; decoder cross-check `RESULT: PASS`; melonDS-vs-native trace **1000/1000** strict common prefix, 1000/1000 window-filtered, 1000/1000 in-order |
+| prelude audit, negative control | `NNK_PRELUDE_DISABLE_SPLICE=5at_mode_override` → `AUDIT FAILED -- 1 of 52 required features MISSING … 5at_mode_override`, build refused (the gate works) |
 | sabestate round trip 5M→6M | `state hash: step=6000000 fnv=0xE013EFB9 crc=0x214965FF` — identical on save and reload |
 | savestate round trip 30M→32M | `state hash: step=32000000 fnv=0x16418EE6 crc=0xDA68B041` — identical |
 | ROM-only runtime in a clean dir | 20M steps from `arm9_p5at` + `Ni No Kuni.nds` alone: `done steps=20000001 ... 41 frames presented` |
