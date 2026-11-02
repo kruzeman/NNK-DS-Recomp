@@ -404,6 +404,12 @@ static int nnks_region_load(uint32_t idx, const uint8_t *src, size_t len)
         if (len % sizeof(NnkStateMovie)) return -1;
         n = (uint32_t)(len / sizeof(NnkStateMovie));
         if (n > (uint32_t)P5T_MAXSTREAM) return -1;
+        /* An EMPTY stream table carries no decoder state: leave the lazily
+         * initialised p5t_state exactly as the `movie` region restored it
+         * (0 = not yet initialised).  Calling p5t_init() here turned the saved
+         * 0 into 3, so a restored run's state hash differed from the original
+         * run's at the same step although every byte of RAM/VRAM/ITCM matched. */
+        if (n == 0) return 0;
         if (!p5t_state) p5t_init();
         if (p5t_state < 2) {
             fprintf(stderr, "state: %u movie stream(s) in the state but the"
