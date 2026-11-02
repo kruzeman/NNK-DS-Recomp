@@ -1000,6 +1000,12 @@ def main():
         fh.write("                        r[13], r[14], (unsigned long long)steps);\n")
         fh.write("            }\n")
         fh.write("            if (nnk_smc_try(&pc)) continue;\n")
+        # Phase-5AS: the state CARRIER.  A compiled case translates ONE form
+        # of the words at its pc; when the instruction that branched here
+        # promised the other form (bx/blx/pop bit0, `bl` in Thumb, ...) the
+        # compiled case must not run -- decode the live word in the carried
+        # state instead (3 compares per dispatch when no carrier matches).
+        fh.write("            if (nnk_smc_carry_override(&pc)) continue;\n")
         if ITCM_BAND in bands:
             # ITCM-resident code: band -1, below the flat window, dispatched
             # to its own part (Phase-4B execute-from-ITCM).

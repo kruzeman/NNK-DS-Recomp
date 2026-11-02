@@ -735,7 +735,7 @@ fn interworking_targets_carry_their_state_across_the_dispatch() {
     let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../tools/nnk_smc.inc");
     let src = std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("cannot read {}: {}", p.display(), e));
     assert!(
-        src.contains("void nnk_smc_note_branch(uint32_t raw) { smc_branch_mode(raw); }"),
+        src.contains("void nnk_smc_note_branch(uint32_t raw) { smc_branch_mode(raw);"),
         "regression: the runtime lost the interworking-state hook the band TUs call"
     );
     let hdr = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../tools/split_dispatch.py");
@@ -3228,4 +3228,95 @@ fn phase_5ap_thumb_blx_return_keeps_its_state_in_the_arm_pop_note() {
         2,
         "both ladders must resolve through smc_pick_state()"
     );
+}
+
+// Phase-5AS, class 52: the STATE CARRIER must win over a compiled case, and a
+// compiled carrier must never overrule one.
+//
+// Measured (operator cold-boot session, `work/repro_5as/`): ov17's Thumb
+// function 0x020FEB94 calls the arm9 Thumb function at 0x02062C44 with
+//     0x020FEBB2  f764 f847   bl 0x02062C44     (Thumb BL: LR = 0x020FEBB7)
+// where the bytes are
+//     0x02062C44  b510        push {r4,lr}
+//     0x02062C46  1c04        adds r4,r0,#0
+//     0x02062C48  f000 f94a   bl 0x02062EE0
+// but the COMPILED image carries 0x02062C44 as the ARM `cdpne` reading of the
+// same bytes (the phase3a function seed lists that entry as `arm`, 8 bytes) and
+// then traps at 0x02062C48 with `undefined instruction 0xF94AF000`.  The
+// pcform map is a HOLE there (no ROM seed/pointer reaches the function) and no
+// literal 0x02062C48 exists in any of the 22 images, so the form has to come
+// from the branch: the dynamic state carrier, which the compiled switch used to
+// ignore entirely.
+#[test]
+fn phase_5as_state_carrier_wins_over_a_wrong_form_compiled_case() {
+    // 1. The branch and the state it promises (Thumb BL stays in Thumb).
+    let bl = decode_thumb(0xF764, 0xF847, 0x020F_EBB2, 4);
+    assert!(
+        bl.text.contains("bl"),
+        "0xF764 0xF847 at 0x020FEBB2 must decode as a bl, got {}",
+        bl.text
+    );
+    assert_eq!(0x020F_EBB2u32 + 4, 0x020F_EBB6, "the instruction is 4 bytes wide");
+    assert_eq!(
+        (0x020F_EBB2u32 + 4) | 1,
+        0x020F_EBB7,
+        "a Thumb BL links LR = next|1 (bit0 = the caller's state, Thumb)"
+    );
+
+    // 2. The target is Thumb code; the ARM reading of the same bytes is the
+    //    coprocessor garbage the compiled case executed instead.
+    let push = decode_thumb(0xB510, 0x1C04, 0x0206_2C44, 4);
+    assert!(
+        push.text.contains("push") && push.text.contains("lr"),
+        "0xB510 at 0x02062C44 must decode as `push {{r4,lr}}`, got {}",
+        push.text
+    );
+    let arm = decode_arm(0x1C04_B510, 0x0206_2C44);
+    assert!(
+        arm.text.contains("cdp") || arm.text.contains("stc") || arm.text.contains("<UNDEFINED>"),
+        "the ARM reading of 0x02062C44 must be the coprocessor garbage the image \
+         carries, got {}",
+        arm.text
+    );
+    let trap = decode_arm(0xF94A_F000, 0x0206_2C48);
+    assert!(
+        trap.text.is_empty() || trap.text.contains("<UNDEFINED>") || trap.text.contains("undefined"),
+        "0xF94AF000 at 0x02062C48 must be the ARM undefined instruction the run \
+         halted on, got {}",
+        trap.text
+    );
+
+    // 3. The runtime: the carrier is consulted at the compiled dispatch, after
+    //    the stale-word re-decoder and before the band switch.
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let sd = std::fs::read_to_string(dir.join("../tools/split_dispatch.py"))
+        .expect("split_dispatch.py");
+    let try_i = sd.find("if (nnk_smc_try(&pc)) continue;").expect("stale-word hook");
+    let car_i = sd
+        .find("if (nnk_smc_carry_override(&pc)) continue;")
+        .expect("the state carrier hook is gone from the dispatch loop");
+    let band_i = sd[car_i..]
+        .find("NnkPartFn fn = nnk_band_table")
+        .map(|k| car_i + k)
+        .expect("band switch");
+    assert!(
+        try_i < car_i && car_i < band_i,
+        "the carrier must run after nnk_smc_try() and before the compiled band switch"
+    );
+
+    let smc = std::fs::read_to_string(dir.join("../tools/nnk_smc.inc")).expect("nnk_smc.inc");
+    // 3a. The override exists, forces the carried state, and holds it for the
+    //     sequential successor (interpreter contract).
+    assert!(smc.contains("int nnk_smc_carry_override(uint32_t *pcp)"));
+    assert!(smc.contains("static void smc_carry_forward(uint32_t pc, uint32_t npc, int st)"));
+    assert!(smc.contains("if (npc == pc + 2u || npc == pc + 4u) smc_branch_mode(npc | (uint32_t)st);"));
+    // 3b. Only a LIVE-decoded instruction's carrier may overrule a compiled
+    //     case: an ARM `ldmfd sp!,{pc}` at 0x0200F2D8 once popped a stray odd
+    //     word, "proved" Thumb for the ARM routine at 0x0200DC38 and re-decoded
+    //     a whole ARM block as Thumb.
+    assert!(smc.contains("if (!smc_t_live) return 0;"));
+    assert!(smc.contains("void nnk_smc_note_branch(uint32_t raw) { smc_branch_mode(raw); smc_t_live = 0; }"));
+    // 3c. A reproducer state must stay loadable across rebuilds.
+    let st = std::fs::read_to_string(dir.join("../tools/nnk_state.inc")).expect("nnk_state.inc");
+    assert!(st.contains("NNK_SAVESTATE_IGNORE_BUILD"));
 }

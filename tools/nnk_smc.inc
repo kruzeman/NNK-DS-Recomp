@@ -103,15 +103,46 @@ static unsigned long long smc_t_sticky_step;
 static uint32_t smc_t_pc = 0xFFFFFFFFu;
 static int smc_t_val = -1;
 static unsigned long long smc_t_step;
+/* Phase-5AS: the carried state handed to the live decoder for exactly one
+ * dispatch by nnk_smc_carry_override() (-1 = none).  It exists because the
+ * compiled dispatch switch never asked the carrier anything: a pc whose
+ * COMPILED case is in the other form ran that case regardless of the state
+ * the branching instruction actually promised. */
+static int smc_force_state = -1;
+/* Phase-5AS: where the carrier came from.  A carrier produced by a LIVE-decoded
+ * instruction is the only one that may overrule a compiled case: the compiled
+ * image is a statically self-consistent world (every case was emitted from the
+ * state the recovery walked it in, and its fall-through targets are cases in
+ * the same state), while a live-decoded stream is exactly where the static
+ * world has no answer.  Measured counter-example for trusting a COMPILED
+ * carrier: an ARM `ldmfd sp!,{pc}` at 0x0200F2D8 popped an odd return address
+ * (stack value written by a Thumb call elsewhere), which "proved" Thumb for the
+ * ARM routine at 0x0200DC38 and made the cold-boot session mis-decode a whole
+ * ARM block.  smc_branch_mode() is called by the live decoders (live = 1);
+ * nnk_smc_note_branch() is the compiled cases' entry point (live = 0). */
+static int smc_t_live;
 static void smc_branch_mode(uint32_t raw_target) {
     smc_t_pc = raw_target & ~1u;
     smc_t_val = (int)(raw_target & 1u);
     smc_t_step = steps;
+    smc_t_live = 1;
 }
 static int smc_carried_thumb(uint32_t pc, int *state) {
     if (smc_t_val < 0 || smc_t_pc != pc || steps != smc_t_step + 1ull) return 0;
     *state = smc_t_val;
     return 1;
+}
+/* Phase-5AS: the state of the SEQUENTIAL successor of an instruction the live
+ * decoder executed in a known state.  A fall-through does not change the
+ * processor state, so pc+2 / pc+4 (the instruction's own length) inherits it;
+ * a real branch has already called smc_branch_mode() with its target's own
+ * state, so this only fills in the fall-through case.  Without it the
+ * carrier described one instruction and the next pc fell back to inference —
+ * measured: the Thumb `bl` at 0x020FEBB2 carried Thumb to 0x02062C44, the
+ * live decode of `push {r4,lr}` carried nothing, and 0x02062C48 (a compiled
+ * ARM case) trapped. */
+static void smc_carry_forward(uint32_t pc, uint32_t npc, int st) {
+    if (npc == pc + 2u || npc == pc + 4u) smc_branch_mode(npc | (uint32_t)st);
 }
 
 /* Phase-5X: the PIC-base register.  A Thumb `add rd, pc` (format 5 case 0)
@@ -152,7 +183,7 @@ static int smc_is_pcbase(int k) {
  * live decoder ran the pop's Thumb bytes as an ARM `ldrsh`+`pc=pc+4`, sp was
  * then clobbered by an ARM `andcs sp,r1,r1` at 0x020F5CE8 and the frame's
  * epilogue popped 0 into pc. */
-void nnk_smc_note_branch(uint32_t raw) { smc_branch_mode(raw); }
+void nnk_smc_note_branch(uint32_t raw) { smc_branch_mode(raw); smc_t_live = 0; }
 
 /* Emitted next to the dispatch image by tools/split_dispatch.py.  A mono
  * (recompile-all -> cc) build has no generated map, so fall back to ARM-only
@@ -345,6 +376,8 @@ static int smc_map_live_ok(uint32_t pc)
 }
 
 static unsigned long long smc_nlive;   /* map skipped: guest-rewritten band */
+static unsigned long long smc_ncarry;  /* Phase-5AS: carried state overrode a
+                                        * compiled case's form */
 static uint32_t smc_live_pc[16];
 static unsigned smc_nlive_pc;
 
@@ -561,8 +594,8 @@ static void smc_stats(void) {
     int i, shown = 0;
     if (!smc_armed) return;
     fprintf(stderr, "smc: probes=%llu stale=%llu redecoded=%llu halts=%llu "
-            "state_fallbacks=%llu on_demand=%llu\n",
-            smc_ntry, smc_nhit, smc_ninsn, smc_nhalt, smc_nfb, smc_nany);
+            "state_fallbacks=%llu on_demand=%llu carry_overrides=%llu\n",
+            smc_ntry, smc_nhit, smc_ninsn, smc_nhalt, smc_nfb, smc_nany, smc_ncarry);
     if (smc_stconf) {
         fprintf(stderr, "stateconf: map_decisions=%llu conflicts=%llu flips=%llu "
                 "hole_executions=%llu hole_pcs=%u live_band_skips=%llu\n",
@@ -2047,6 +2080,10 @@ int nnk_smc_exec_any(uint32_t *pcp) {
     smc_nany++;
     trace_pc(pc);
     thumb = nnk_pc_is_thumb(pc);
+    /* Phase-5AS: a carried T bit wins over every static guess, including the
+     * compiled case's own form (nnk_smc_carry_override() set this). */
+    if (smc_force_state >= 0) { thumb = smc_force_state;
+        if (smc_stconf) smc_note_seen(pc, thumb); goto smc_mode_done; }
     { int st; if (smc_carried_thumb(pc, &st)) { thumb = st;
         if (smc_stconf) smc_note_seen(pc, thumb); goto smc_mode_done; } }
     if (!thumb) thumb = smc_pick_state(pc, prev_pc);   /* Phase-5AP: ROM map */
@@ -2079,10 +2116,83 @@ int nnk_smc_exec_any(uint32_t *pcp) {
                 (unsigned long long)steps, pc, w, thumb ? "thumb" : "arm", smc_t_sticky, npc);
     }
     *pcp = npc;
+    /* Phase-5AS: an instruction executed under a CARRIED state hands that
+     * state to its sequential successor (interpreter contract), so a stream
+     * entered through a state-carrying branch stays in that state for as long
+     * as it falls through — not just for its first instruction. */
+    if (smc_force_state >= 0) smc_carry_forward(pc, npc, thumb);
     /* Phase-5T: the callback returns to its caller (0x0207B21C, right after
      * the `blx r1` at 0x0207B218) — replace its pixel output with the host
      * frame for this decode step, before the guest converter reads the plane. */
     if (npc == P5T_CB_RET && pc >= ITCM_LO && pc < ITCM_HI) p5t_present();
+    return 1;
+}
+
+/* ==========================================================================
+ * Phase-5AS — the state CARRIER across the dispatch boundary.
+ *
+ * The compiled dispatch switch runs a case without ever asking what state the
+ * guest is in: a case is a translation of ONE form of the words at its pc, and
+ * the only thing the loop knew was nnk_pc_is_thumb(pc) — which is itself
+ * derived from the compiled case set, so a case compiled in the wrong form
+ * simply runs wrong.  Blocks 5AN/5AP fixed the live ladder and the map; this
+ * fixes the carrier those two never consulted at the compiled switch.
+ *
+ * MEASURED (operator savestate work/repro_5as/operator_title_notice.nnks,
+ * frame 1097, restored step 611,840,034): ov17's Thumb function 0x020FEB94
+ *    0x020FEBB2  f764 f847   bl 0x02062C44        (Thumb BL: LR=0x020FEBB7,
+ *                                                  processor state stays Thumb)
+ * enters the arm9 Thumb function at 0x02062C44
+ *    (b510 push {r4,lr}; 1c04 adds r4,r0,#0; f000 f94a bl 0x02062EE0; ...)
+ * but the COMPILED image carries 0x02062C44 as the ARM `cdpne 5,0,cr4,cr11`
+ * that falls into a trap at 0x02062C48, because the phase3a function seed
+ * file (work/phase3a/arm9_functions.tsv) lists that entry as `arm` with an
+ * 8-byte body: a WRONG-MODE SEED, not a pointer.  The ROM-derived pcform map
+ * cannot arbitrate either — the enclosing function is a HOLE (no ROM-declared
+ * entry, ctor or pointer word reaches it).  So the run died at
+ * `halt_pc=0x02062C48 halt=undefined instruction 0xF94AF000`.
+ *
+ * THE RULE: the form of an arrived pc comes from the instruction that branched
+ * there (bx/blx rM = bit0, pop {..,pc} = the loaded word, `bl`/`b` = the
+ * branch's own state).  That carrier already exists (smc_branch_mode, 5C/5J/
+ * 5AP); what was missing is that the COMPILED switch ignored it.  When a fresh
+ * carried state disagrees with the compiled case's form, the carrier wins: the
+ * pc is decoded from live memory in the carried state and the contract
+ * continues along its fall-through (smc_carry_forward).  When the compiled form
+ * agrees, nothing changes — the override costs three compares per dispatch.
+ * ========================================================================== */
+int nnk_smc_carry_override(uint32_t *pcp)
+{
+    uint32_t pc = *pcp;
+    int st;
+    /* Phase-5AS A/B control.  The carrier is OPT-IN (NNK_STATE_CARRIER=1)
+     * because one of its producers is still untrusted: with it enabled the
+     * operator's cold-boot session diverges at step 18,395,574 (halt pc
+     * 0x027FF800) instead of reaching the 508.8M barrier, while the savestate
+     * reproducer moves 611,864,075 -> 612,149,847.  NNK_STATE_CARRIER=0 is the
+     * default (pre-5AS behaviour: a compiled case always runs). */
+    static int smc_carrier_ab = -1;
+    if (smc_carrier_ab < 0) {
+        const char *p = getenv("NNK_STATE_CARRIER");
+        smc_carrier_ab = (p && p[0] == '1');
+        if (smc_carrier_ab)
+            fprintf(stderr, "smc: state carrier ENABLED (NNK_STATE_CARRIER=1, Phase-5AS experiment)\n");
+    }
+    if (!smc_carrier_ab) return 0;
+    if (!smc_armed) return 0;
+    if (!smc_carried_thumb(pc, &st)) return 0;      /* no fresh carrier */
+    if (!smc_t_live) return 0;                     /* compiled carrier: the
+                                                    * compiled world agrees
+                                                    * with itself */
+    if (nnk_pc_is_thumb(pc) == st) return 0;        /* compiled form agrees */
+    smc_force_state = st;
+    if (!nnk_smc_exec_any(pcp)) { smc_force_state = -1; return 0; }
+    smc_force_state = -1;
+    smc_ncarry++;
+    if (smc_stconf || smc_ncarry <= 16u)
+        fprintf(stderr, "stateconf CARRIED pc=0x%08X carried=%s compiled=%s step=%llu\n",
+                pc, st ? "thumb" : "arm", nnk_pc_is_thumb(pc) ? "thumb" : "arm",
+                (unsigned long long)steps);
     return 1;
 }
 
