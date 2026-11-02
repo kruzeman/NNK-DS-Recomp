@@ -79,6 +79,12 @@ CONFIG = {'step_limit', 'trace_from', 'mode_trace', 'gxd_shot_every',
           'storewatch_state', 'storewatch_lo', 'storewatch_hi',
           'storewatch_mask', 'storewatch_n', 'storewatch_limit',
           'smc_trace_left', 'smc_trace_from', 'smc_f8log', 'smc_stconf',
+          # Phase-5AS: the carried-state override handoff (`smc_force_state`)
+          # lives for exactly one dispatch and `smc_ncarry` is its diagnostic
+          # counter — neither is machine state, and keeping both out of the
+          # payload keeps this build's state layout byte-identical to the
+          # pre-5AS ones (the operator's bug reproducer is such a state).
+          'smc_force_state', 'smc_ncarry', 'smc_t_live', 'smc_carrier_ab',
           'nnk_vrc_trace', 'nnk_vrc_win', 'nnk_vrc_win5', 'nnk_vrc_win_first',
           'nnk_vrc_win_last', 'nnk_p4s_log', 'nnk_p4r_drop_log',
           'nnk_p4r_drain_log', 'nnk_p4s_done', 'nnk_p4s_first',

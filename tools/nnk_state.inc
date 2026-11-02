@@ -597,11 +597,28 @@ static int nnks_load_file(const char *path)
         return 1;
     }
     if (h.build_fp != nnks_build_fp()) {
-        fclose(fp);
-        fprintf(stderr, "state: REFUSED %s: build fingerprint 0x%08X != 0x%08X"
-                        " (state was written by a different binary/layout)\n",
-                path, h.build_fp, nnks_build_fp());
-        return 1;
+        /* Phase-5AS: a state recorded by one build must not be applied by
+         * another by default (the field layout can differ).  A bug
+         * REPRODUCER, however, has to survive a rebuild: the operator's
+         * session state was written by build 0x0768D9EB and every fix
+         * rebuilds the binary.  NNK_SAVESTATE_IGNORE_BUILD=1 accepts the
+         * file anyway and says so, loudly, on every load.  Only the build
+         * fingerprint is relaxed: magic, version, header/payload/region
+         * CRCs, region names+lengths and the ROM identity stay strict, so a
+         * genuinely incompatible layout is still refused. */
+        const char *ib = getenv("NNK_SAVESTATE_IGNORE_BUILD");
+        if (ib && ib[0] == '1') {
+            fprintf(stderr, "state: WARNING: NNK_SAVESTATE_IGNORE_BUILD=1 accepts %s"
+                            " written by build 0x%08X on build 0x%08X -- reproduce-only,"
+                            " never for a round trip\n",
+                    path, h.build_fp, nnks_build_fp());
+        } else {
+            fclose(fp);
+            fprintf(stderr, "state: REFUSED %s: build fingerprint 0x%08X != 0x%08X"
+                            " (state was written by a different binary/layout)\n",
+                    path, h.build_fp, nnks_build_fp());
+            return 1;
+        }
     }
     if (h.rom_size != nnks_rom_size()) {
         fclose(fp);
