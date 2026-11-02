@@ -28,8 +28,8 @@ IDENT = re.compile(r'[A-Za-z_][A-Za-z_0-9]*')
 # The splitter un-static's exactly these DATA objects so the band TUs can see
 # them (tools/split_dispatch.py prints the shared-symbol list at split time).
 # They live at column 0 in nnk_main.c but are ordinary machine state.
-SHARED_DATA = {'r', 'n', 'z', 'c', 'v', 'spsr_bank', 'carry_out', 'cp15_reg',
-               'cpsr_ctl', 'mode_cur', 'b'}
+SHARED_DATA = {'r', 'n', 'z', 'c', 'v', 'spsr_bank', 'bank13', 'bank14',
+               'carry_out', 'cp15_reg', 'cpsr_ctl', 'mode_cur', 'b'}
 
 TYPES = {'uint8_t', 'uint16_t', 'uint32_t', 'uint64_t', 'int8_t', 'int16_t',
          'int32_t', 'int64_t', 'int', 'unsigned', 'signed', 'long', 'short',
@@ -91,26 +91,41 @@ def scan(path, stop_at_run=True):
     lines = open(path, errors='replace').read().split('\n')
     i = 0
     while i < len(lines):
-        line = strip_comments(lines[i]).strip()
+        raw = strip_comments(lines[i]).rstrip()
+        line = raw.strip()
         if stop_at_run and line.startswith('static void run(void)'):
             break
         i += 1
         if not line.startswith('static '):
-            # The splitter un-static's the SHARED data symbols (r, n, z, c, v,
-            # carry_out, cp15_reg, spsr_bank, ...) so the band TUs can see
-            # them: in nnk_main.c they are plain column-0 definitions.  They
-            # are machine state all the same, so accept them as candidates.
-            if (not line or line[0].isspace() or '{' in line or '(' in line
+            # The splitter un-static's exactly the SHARED objects so the band
+            # TUs can see them: in nnk_main.c they are plain column-0
+            # definitions.  They are machine state all the same, but a
+            # column-0 line is otherwise just as likely to be a statement or a
+            # local of an .inc fragment (nnk_dma.inc, nnk_smc.inc, ... are
+            # pasted at column 0), so accept them only through the explicit
+            # whitelist.  Every declarator of the statement is considered:
+            # `uint32_t n, z, c, v;` and `bank13[6], bank14[6], spsr_bank[6]`
+            # must each carry all three objects.
+            if (not line or raw[:1].isspace() or '{' in line or '(' in line
                     or not line.endswith(';')):
                 continue
             body = line.rstrip(';').strip()
             decls = split_declarators(body)
-            name, typ, _ = name_of(decls[0])
-            if not name or typ is None or '*' in typ or name in SKIP_NAMES:
-                continue
-            if not typ.split() or typ.split()[0] not in TYPES:
-                continue          # #define / enum junk, not a definition
-            names.append(name)
+            base_typ = None
+            for d in decls:
+                name, typ, _ = name_of(d)
+                if typ is None:
+                    continue
+                if not typ.split():
+                    typ = base_typ or ''   # a later declarator inherits it
+                else:
+                    base_typ = typ
+                if (not name or '*' in typ
+                        or name not in SHARED_DATA):
+                    continue
+                if not typ.split() or typ.split()[0] not in TYPES:
+                    continue      # #define / enum junk, not a definition
+                names.append(name)
             continue
         if '(' in line.split('{')[0]:
             continue                      # function definition / prototype

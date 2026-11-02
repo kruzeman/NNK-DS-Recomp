@@ -353,6 +353,19 @@ static void nnks_movie_resync(void)
             continue;
         }
         if (!s->dec.opened || s->index <= 0) continue;
+        /* Rebuild the decoder instead of rewinding it: mobiclip_flush() does
+         * not clear every reference-frame slot, and a decoder rewound in
+         * place then replays with a corrupt lower half of the picture
+         * (measured, window F9: rows 102..191 differed from the continued
+         * run while a fresh boot load of the same state was byte-identical).
+         * A fresh nnk_mobi_open() + sequential decode 0..index-1 is exactly
+         * the path a boot load takes. */
+        nnk_mobi_close(&s->dec);
+        if (nnk_mobi_open(&s->dec, s->mods.width, s->mods.height) < 0) {
+            fprintf(stderr, "state: warning: movie stream %d decoder reopen"
+                            " failed\n", i);
+            continue;
+        }
         if (nnk_mobi_frame(&s->dec, &s->mods, (int)(s->index - 1),
                            NULL, NULL, NULL) < 0)
             fprintf(stderr, "state: warning: movie stream %d re-decode to frame"
@@ -387,7 +400,36 @@ static int nnks_region_load(uint32_t idx, const uint8_t *src, size_t len)
         return 0;
     case 2: {
         const NnkStateMovie *m = (const NnkStateMovie *)src;
-        if (len != (size_t)p5t_nstr * sizeof(NnkStateMovie)) return -1;
+        uint32_t n;
+        if (len % sizeof(NnkStateMovie)) return -1;
+        n = (uint32_t)(len / sizeof(NnkStateMovie));
+        if (n > (uint32_t)P5T_MAXSTREAM) return -1;
+        if (!p5t_state) p5t_init();
+        if (p5t_state < 2) {
+            fprintf(stderr, "state: %u movie stream(s) in the state but the"
+                            " movie HLE is off in this process\n", n);
+            return -1;
+        }
+        /* The `movie` region restored p5t_nstr BEFORE this table, and a fresh
+         * process (NNK_SAVESTATE= boot load) has no open stream yet.  Rebuild
+         * the missing streams from the saved codecs in saved order:
+         * p5t_stream() re-opens the same container from the same card image
+         * and initialises the decoder at frame 0, and the cursors below plus
+         * nnks_movie_resync() then replay the decode deterministically.  Only
+         * an EMPTY table is rebuilt — live streams whose codec disagrees with
+         * the state are refused instead of being rebound under the guest. */
+        if (p5t_nstr && !p5t_str[0].codec) {
+            memset(p5t_str, 0, sizeof p5t_str);
+            p5t_nstr = 0;
+        }
+        for (i = (uint32_t)p5t_nstr; i < n; i++) {
+            if (!p5t_stream(m[i].codec)) {
+                fprintf(stderr, "state: cannot recreate movie stream %u"
+                                " (codec 0x%08X)\n", i, m[i].codec);
+                return -1;
+            }
+        }
+        if (p5t_nstr != (int)n) return -1;
         for (i = 0; i < (uint32_t)p5t_nstr; i++) {
             if (m[i].codec != p5t_str[i].codec) {
                 fprintf(stderr, "state: movie stream %u codec 0x%08X != 0x%08X\n",
@@ -601,8 +643,12 @@ static int nnks_load_file(const char *path)
     }
 
     /* Verify EVERY region before touching the machine: a half-applied state
-     * would be worse than a refused one. */
+     * would be worse than a refused one.  Field/display regions have a
+     * compile-time length; the movie stream table is the one state-sized
+     * region (its length follows the saved stream count), so it is checked
+     * for shape here and rebuilt in nnks_region_load. */
     for (i = 0; i < (int)NNKS_NREGIONS; i++) {
+        size_t want;
         if (strncmp(regs[i].name, nnks_regions[i].name, sizeof regs[i].name) != 0 ||
             regs[i].offset + regs[i].length > h.payload_size) {
             free(payload);
@@ -610,6 +656,25 @@ static int nnks_load_file(const char *path)
                             " vs '%s')\n", path, i, regs[i].name,
                     nnks_regions[i].name);
             return 1;
+        }
+        if (nnks_regions[i].kind == 2) {
+            if (regs[i].length % sizeof(NnkStateMovie) != 0 ||
+                regs[i].length / sizeof(NnkStateMovie) > (uint64_t)P5T_MAXSTREAM) {
+                free(payload);
+                fprintf(stderr, "state: REFUSED %s: region '%s' has %llu bytes,"
+                                " not a stream table\n", path, regs[i].name,
+                        (unsigned long long)regs[i].length);
+                return 1;
+            }
+        } else {
+            want = nnks_region_len((uint32_t)i);
+            if (regs[i].length != (uint64_t)want) {
+                free(payload);
+                fprintf(stderr, "state: REFUSED %s: region '%s' is %llu bytes,"
+                                " this build writes %zu\n", path, regs[i].name,
+                        (unsigned long long)regs[i].length, want);
+                return 1;
+            }
         }
         if (regs[i].crc != nnks_crc32(payload + regs[i].offset, (size_t)regs[i].length)) {
             free(payload);
@@ -718,8 +783,14 @@ static void nnks_boot(int argc, char **argv)
             (unsigned long long)nnks_save_at, (unsigned long long)nnks_hash_at);
     s = getenv("NNK_SAVESTATE");
     if (s && s[0]) {
-        if (nnks_load_file(s) == 0) nnks_boot_load_done = 1;
-        else fprintf(stderr, "state: boot from '%s' failed — replaying the boot\n", s);
+        if (nnks_load_file(s) == 0) {
+            nnks_boot_load_done = 1;
+            /* `steps` now starts at the recorded step, so the compile-time
+             * budget (a run LENGTH) would stop on the first instruction.
+             * Give the resumed run a full budget; an explicit NNK_STEP_LIMIT
+             * is absolute and still wins (main parses it after this hook). */
+            if (step_limit <= steps) step_limit = steps + STEP_LIMIT;
+        } else fprintf(stderr, "state: boot from '%s' failed — replaying the boot\n", s);
     }
 }
 

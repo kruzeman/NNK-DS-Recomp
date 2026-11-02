@@ -1,0 +1,234 @@
+# SAVESTATES — the NNKS container (Phase-5AQ / 5AR)
+
+A savestate is the **entire emulated machine**: CPU register file (including
+the banked r13/r14 and SPSR per mode), NZCV, CP15/TCM configuration, the I/O
+model (timers, DMA, IPC, DIV/SQRT, VRAMCNT, EXMEMCNT/POWCNT, IRQ controller),
+the card model, the SMC re-decoder state, the input script cursor, the movie
+HLE cursors, the 24 MiB guest RAM window, ITCM/DTCM **and** the whole display
+model (VRAM banks, the 2D register image, palette, OAM, retained polygon
+lists, composed screens). Restoring one continues the guest at the instruction
+that was about to execute — not at the boot entry.
+
+Everything is code in `tools/nnk_state.inc` (spliced into the runtime TU by
+`tools/split_dispatch.py` next to the other fragments) plus the state snapshot
+entry points the renderer gained in `gxrender/src/gx_display.c`
+(`gxd_state_size/save/load/layout_fp`).
+
+A state contains **no game bytes that are not already guest state**: RAM, VRAM
+and TCM images are the emulated machine's memory, exactly what melonDS's own
+save states hold. States are build artifacts: keep them out of git.
+
+## 1. File format
+
+Little-endian, one header, one region table, one payload. All integers are
+native-width little-endian (`uint32_t` / `uint64_t`).
+
+```
+offset size field
+     0    4 magic "NNKS"
+     4    4 version                (1)
+     8    4 header_size            (72 + 40 * region_count = 512 for 11 regions)
+    12    4 region_count
+    16    4 build_fp               identity: region/field layout + gx layout
+    20    4 (padding)
+    24    8 rom_size               identity: card image size in bytes
+    32    4 rom_hdr_crc            identity: CRC32 of ROM bytes 0x000..0x1FF
+    36    4 arm9_crc               identity: CRC32 of the ROM's ARM9 (header 0x20/0x2C)
+    40    8 record_step            guest step counter at the save point
+    48    8 record_frames          display frame counter at the save point
+    56    8 payload_size
+    64    4 payload_crc            CRC32 over the whole payload
+    68    4 header_crc             CRC32 over bytes 0..67
+    72  40*n region table, region_count entries:
+             char name[16]         NUL-padded ASCII region name
+             u64  offset           offset into the payload
+             u64  length
+             u32  crc32            CRC32 of this region's bytes
+             u32  rsv              zero
+  ...        payload
+```
+
+`header_crc` is checked before anything is applied, then the identity block,
+then every region's own CRC, then the payload CRC. The two CRCs are
+overlapping by design: a corrupt header is reported as a header problem even
+when it also changes the identity fields.
+
+## 2. Regions
+
+`nnks_region_len` / `nnks_region_store` / `nnks_region_load` own each region.
+Regions of kind 0 are generated field tables (below); kind 1 is the display
+blob; kind 2 is the movie stream cursor table.
+
+| region | kind | content | length in this build |
+|---|---|---|---|
+| `io` | 0 | CPU regs/flags/banked regs/SPSR, CP15+TCM config, counters, DISPCNT/DISPSTAT, IE/IF/IME, timers, DMA, EXMEMCNT/POWCNT, DIV/SQRT, VRAMCNT, IRQ script cursor, ARM7 IPC state | 68,648 |
+| `smc` | 0 | SMC generation/band tables, per-band generations, re-decode counters, sticky T-bit, conflict counters | 134,300 |
+| `card` | 0 | card command latch, address/length/position/FIFO, scheduling clock, SPI/ROM control, DRQ/poll bookkeeping | 104 |
+| `input` | 0 | effective key mask + EXTKEYIN, parsed frame script + cursor, injection schedule, recorder counters | 6,288 |
+| `movie` | 0 | movie HLE stream count/codec cursor | 12 |
+| `moviestreams` | 2 | per-stream {codec,cursor,rom,index,frames,presents,shortr} | `p5t_nstr * 28` |
+| `display` | 0 | `gxd_frames`, `gxd_last_vc` | 8 |
+| `gxblob` | 1 | the whole display model (VRAM banks, 2D register image, palette, OAM, latched 3D env, retained polygon lists, composed screens) | 5,270,752 |
+| `ram` | 0 | the 24 MiB guest window (main RAM 4 MiB + its mirror + shared WRAM at 0x03000000) | 25,165,824 |
+| `itcm` | 0 | ITCM image | 32,768 |
+| `dtcm` | 0 | DTCM image | 16,384 |
+
+Total: 512 + 30,695,088 = **30,695,600 bytes** for the measured state.
+
+The `gxblob` length is `gxd_state_size()`: the display snapshot is a
+self-describing POD image whose host pointers (`win`, `pctx`, textures, the
+window back-buffer, FILE handles, decode references) are blanked on save and
+rebound/re-derived on load, so a state is portable across processes and ASLR.
+The movie stream cursors are re-synchronised by replaying the Mobiclip decode
+from frame 0 (deterministic) rather than storing reference frames.
+
+## 3. The field table is generated, not hand-written
+
+`tools/nnks_gen_state_fields.py` derives the table from the **effective
+prelude** at build time and writes `work/split/*/nnk_state_fields.h`:
+
+* `$SPLIT/nnk_main.c` — everything before `static void run(void)` (the frozen
+  image prelude + the spliced fragments);
+* `$SPLIT/nnk_dma.inc`, `nnk_vramcnt.inc`, `nnk_input.inc`, `nnk_smc.inc`,
+  `nnk_boot.inc`.
+
+`nnk_state_fields.h` is regenerated by `tools/build_split.sh` on every build,
+so a runtime static added by a later phase is carried automatically. Each row
+is `NNKS_F(name)` = `{#name, sizeof(name), &name}`.
+
+Two scanner rules matter:
+
+* **`static` data** at any indentation is carried (functions, prototypes and
+  pointers are skipped).
+* **The splitter's un-static'd shared objects** — `r`, `n`, `z`, `c`, `v`,
+  `spsr_bank`, `bank13`, `bank14`, `carry_out`, `cp15_reg`, `cpsr_ctl`,
+  `mode_cur` — live at column 0 in `nnk_main.c`, so they are NOT `static`
+  lines. `tools/nnks_list_statics.py` accepts column-0 declarations only
+  through the explicit `SHARED_DATA` whitelist. Without that gate the
+  prelude's ordinary column-0 statements and the `.inc` fragments' locals
+  produce false rows (`fa`, `wv`, …) that do not compile; without the
+  whitelist entries for `bank13`/`bank14`/`spsr_bank` a restore silently
+  zeroes the banked r13/r14/SPSR. Both were measured defects in Phase-5AQ.
+  Multi-declarator statements are parsed declarator by declarator, so
+  `uint32_t n, z, c, v;` yields all four rows.
+
+Rows are grouped into payload regions by `classify()` (RAM/ITCM/DTCM/card/SMC/
+movie/input/display, everything else `io`). `CONFIG` excludes run
+configuration (step limit, probe/trace addresses, shot cadence): restoring a
+state must never change the current process's flags.
+
+## 4. NOT carried (host-owned)
+
+Rebound or re-derived on load — a state must never contain a host address
+(ASLR / new process / different allocation layout):
+
+```
+gxd (SDL/GL handle), gxd_shot, rom, smc_img, smc_seg[].data,
+smc_seen_key, smc_seen_form, nnk_in_log, nnk_rec, storewatch_fp,
+p5t_str[].fp, p5t_str[].dec   (Mobiclip reference frames — re-decoded),
+p5t_buf                       (decode scratch)
+```
+
+Also not carried: run configuration (`NNK_STEP_LIMIT`, probe/trace gate
+addresses, `NNK_GX_SHOT_EVERY`, …) and the default state path.
+
+## 5. Environment hooks
+
+| variable | effect |
+|---|---|
+| `NNK_SAVESTATE=<path>` | boot straight from a state instead of replaying the boot |
+| `NNK_SAVESTATE_DIR=<dir>` | directory of the default state file (default: `dirname(argv[0])`) |
+| `NNK_SAVESTATE_SAVE_AT=<step>` | write a state at that guest step and **keep running** |
+| `NNK_SAVESTATE_SAVE=<path>` | path for `SAVE_AT` (default `<dir>/nnk_save1.nnks`) |
+| `NNK_STATE_HASH_AT=<step>` | print the canonical state hash at that step |
+| `NNKS_HASH_REGIONS=1` | per-region CRCs in the hash line (debug) |
+
+`NNK_STATE_HASH_AT` prints
+`state hash: step=<n> fnv=0x… crc=0x… bytes=<payload> build=0x…`, where
+`fnv`/`crc` are taken over the **same payload bytes a save would write**, in
+table order. Two runs that reach the same step with the same machine state
+print the same hash; that is the round-trip test.
+
+## 6. F5 / F9 in the window
+
+With `NNK_GX=window` the SDL event filter in `tools/nnk_input.inc` consumes
+`SDL_SCANCODE_F5` / `SDL_SCANCODE_F9` before the keymap sees them and calls
+`nnk_state_ui_key(5|9)`:
+
+* **F5** writes `<NNK_SAVESTATE_DIR or dirname(argv[0])>/nnk_save1.nnks`
+  (`NNK_SAVESTATE_SAVE` overrides the path) and prints `state: saved …` with
+  the step and frame.
+* **F9** loads that file. On success the run rewinds to the saved instruction
+  (`state: F9 restored …`); a refused state prints `state: F9 refused … — the
+  run is unchanged` and the run continues untouched.
+
+Saving does not disturb the run-by-design: the file is written to `<path>.tmp`
+and renamed, so an interrupted save never leaves a half state.
+
+## 7. Identity and refusal
+
+A state is applied only when **all** of these match the running build/ROM:
+
+1. magic `NNKS`, format version 1, header size/region count consistent;
+2. header CRC32, payload CRC32, every region CRC32;
+3. `build_fp` — a FNV-1a over the region names and every field's name/length
+   (i.e. the exact field table layout) plus the renderer's
+   `gxd_state_layout_fp()` in `-DNNK_GX` builds;
+4. `rom_size`, `rom_hdr_crc` (first 0x200 bytes), `arm9_crc` (the ROM's ARM9
+   blob as named by the header at 0x20/0x2C).
+
+A mismatch prints
+
+```
+state: REFUSED <path>: <the failing field>
+```
+
+and the process **keeps running**: at boot `NNK_SAVESTATE=` falls back to
+replaying the boot (`state: boot from '…' failed — replaying the boot`), and
+an F9 refusal leaves the current run untouched. Nothing is applied
+partially: the payload is read and all region CRCs verified before the first
+region is touched.
+
+Measured refusal cases (header byte flipped in a copy):
+
+```
+NNKS -> XNKS              state: REFUSED … bad magic (not an NNKS savestate)
+version 1 -> 2            state: REFUSED … format version 2, this build writes 1
+rom_hdr_crc byte flipped  state: REFUSED … header CRC mismatch (corrupt or from another format)
+```
+
+## 8. Determinism: what a restore guarantees, and what it does not
+
+The emulator has **no wall-clock reads** (no `SDL_GetTicks`, no `time()`, no
+sleep): guest time is `cycles`/`steps`, and presentation is driven by the
+emulated VBlank. A headless run is therefore reproducible and a restore is
+exact — measured: a state saved at step 30,000,000 and continued to
+32,000,000 gives the same state hash as a run booted from that state, and the
+`<base>.<frame>.top/bot.ppm` frames are byte-identical (`cmp`).
+
+The one thing that is *not* part of the machine is **real keyboard input in
+the window**. SDL key events arrive at host wall-clock times while the
+emulator runs as fast as the host can (there is no real-time pacing), so the
+same physical press spans a different number of emulated frames from run to
+run. That is the source of "same binary, same presses, different result" in
+interactive sessions — not a clock inside the emulator. For reproducible
+window sessions drive the game with `NNK_INPUT_FILE` (frame-indexed script)
+and use F5/F9 only as discrete, frame-synchronous events. A state restore is
+also independent of that: the effective key mask is part of the `input`
+region.
+
+## 9. Tools and checks
+
+* `tools/nnks_inspect.py <state>` — header identity, region table, per-region
+  CRC32 recomputation and a coarse content summary.
+* `tools/nnks_scan_shots.py '<glob>'` — print PPM captures that are not a
+  single colour (non-blank evidence).
+* Round trip:
+  ```
+  NNK_SAVESTATE_SAVE_AT=30000000 NNK_SAVESTATE_SAVE=/tmp/s.nnks \
+  NNK_STATE_HASH_AT=32000000 NNK_STEP_LIMIT=32000000 ./nnk_runner ROM
+  NNK_SAVESTATE=/tmp/s.nnks NNK_STATE_HASH_AT=32000000 \
+  NNK_STEP_LIMIT=32000000 ./nnk_runner ROM
+  ```
+  the two `state hash:` lines must be identical, and any `NNK_GX_SHOT` frames
+  written after the save point must be byte-identical (`cmp`).
