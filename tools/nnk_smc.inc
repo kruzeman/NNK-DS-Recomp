@@ -398,12 +398,62 @@ static unsigned long long smc_ncarry;  /* Phase-5AS: carried state overrode a
 static uint32_t smc_live_pc[16];
 static unsigned smc_nlive_pc;
 
+/* Phase-5AZ: the state of a pc reached by a NON-interworking transfer.
+ *
+ * ARMv5T changes the pc in exactly four ways, and three of them carry the
+ * successor's state explicitly: an interworking transfer (smc_branch_mode /
+ * nnk_smc_note_branch), an exception return (nnk_smc_note_exc_return), and a
+ * fall-through (pc+2 / pc+4, which cannot change the state).  Those are all
+ * consulted BEFORE this rule.  What is left is a direct B/BL, and on ARMv5T a
+ * direct branch PRESERVES the processor state: an ARM `bl` runs its target as
+ * ARM, a Thumb `bl`/`b` runs its target as Thumb.
+ *
+ * So when the predecessor's state is known, the successor's state is hardware
+ * truth.  Two authorities are consulted, in order: the ROM-derived pcform map
+ * (for a predecessor whose bytes the guest has not rewritten) and the compiled
+ * thumbnail map (`nnk_pc_is_thumb`, which answers for every case the compiled
+ * image carries — the overlay arenas are compiled code, so the ROM map is
+ * skipped for exactly the predecessor measured below).  The old fallback —
+ * smc_t_sticky, the state of some unrelated earlier live decode — was the last
+ * resort for a pc the map does not cover, and it can be arbitrarily stale.
+ *
+ * Measured (Phase-5AZ, cold boot step 39,238,544): ov17's ARM routine at
+ * 0x020FBEAC does `bl 0x020033C0` (0xEBFC1D43).  0x020033C0 is a map HOLE (the
+ * ROM descent never reached it) and the ARM `bl` sets pc directly, so neither
+ * smc_carried_thumb nor the ROM map answered.  The stale sticky said Thumb, and
+ * the Thumb reading of the ARM veneer
+ *     0x020033C0  ldr r1, [pc, #8]     Thumb: 0x1008 `asrs r0, r1, #0`  (2 bytes)
+ *     0x020033C2  ldr r12, [pc, #8]   Thumb: 0xE59F `b.n 0x02002F04`
+ * ran the `b.n` into the MIDDLE of the ARM epilogue at 0x02002F04
+ * (`cmp r5, #0 / addeq sp, sp, #0x30 / popeq {r3,r4,r5,pc}` taken from
+ * 0x02F08), popped the garbage 0x020D23E2 and wandered into the SDK idle loop
+ * at 0x02007134/0x02007138 (500k+ steps of WFI with IF bit 19 latched and
+ * IE bit 19 clear).  The correct ARM reading is a 4-instruction veneer
+ * (`r1 = 0x04000330, r12 = 0x02009B24, r2 = 0x10, bx r12` -> the halfword copy
+ * at 0x02009B24) that returns to the ov17 caller. */
+static int smc_state_from_branch(uint32_t pc, uint32_t prev_pc)
+{
+    int pf;
+    if (pc == prev_pc + 2u || pc == prev_pc + 4u) return -1;  /* fall-through */
+    if (pc == prev_pc) return -1;                            /* not a transfer */
+    if (smc_map_live_ok(prev_pc)) {         /* predecessor's bytes still the ROM's */
+        pf = nnk_pcform_lookup(prev_pc);
+        if (pf >= 0) return pf;
+    }
+    /* The compiled image's own form map: 1 = Thumb case run, 0 = every other
+     * case (an ARM case, or a pc the image does not carry — for which ARM is the
+     * documented default the Phase-4Z rule already used). */
+    return nnk_pc_is_thumb(prev_pc) ? 1 : 0;
+}
+
 static int smc_infer_state(uint32_t pc, uint32_t prev_pc, int *form, const char **src)
 {
     int m = smc_state_from_regs(pc);
     if (m >= 0) { *form = m; *src = "branch-register"; return m; }
     m = smc_state_from_stride(pc, prev_pc);
     if (m >= 0) { *form = m; *src = "predecessor-stride"; return m; }
+    m = smc_state_from_branch(pc, prev_pc);      /* Phase-5AZ */
+    if (m >= 0) { *form = m; *src = "branch-predecessor"; return m; }
     *form = smc_t_sticky;
     *src = "sticky";
     return smc_t_sticky;
