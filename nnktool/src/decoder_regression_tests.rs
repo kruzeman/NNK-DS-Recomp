@@ -1188,7 +1188,12 @@ fn cpsr_i_transitions_are_observable_through_the_single_ctl_funnel() {
     // Both exception paths must stay inside the funnel.
     for needle in [
         "cpsr_set_ctl(0xD2u);",              // exception entry: IRQ mode, I+F
-        "cpsr_set_ctl(sr & 0xFFu);",         // exception return: SPSR restore
+        // Phase-5BB: the SPSR restore must NOT leak the T bit into ctl (ctl is
+        // the state-free control byte; the resume state travels through
+        // nnk_smc_note_exc_return / nnk_smc_note_resume instead).  Both the
+        // compiled `subs pc,lr,#4` return and the BIOS return mask it out.
+        "cpsr_set_ctl(sr & 0xDFu);",         // exception return: SPSR restore (BIOS)
+        "cpsr_set_ctl(_spsr & 0xDFu);",      // exception return: SPSR restore (compiled)
         "static void irq_enter(uint32_t *pc)",
         "static void bios_irq_return(uint32_t *pc)",
     ] {
@@ -3498,8 +3503,9 @@ fn phase_5aw_exception_return_carries_the_spsr_instruction_state() {
     let e = super::emit_insn(&insn, 0x0200_729C, false, false, String::new(), &mut out, true);
     let body = e.body.join("\n");
     assert!(
-        body.contains("cpsr_set_ctl(_spsr & 0xFFu)"),
-        "the exception return must still restore the mode byte: {}",
+        body.contains("cpsr_set_ctl(_spsr & 0xDFu)"),
+        "the exception return must still restore the mode byte (with the T bit \
+         masked out of ctl — Phase-5BB): {}",
         body
     );
     assert!(

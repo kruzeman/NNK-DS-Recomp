@@ -402,7 +402,7 @@ fn emit_insn(
                 // to SYS mode at lr-4 = 0x02015EC4.
                 body.push(
                     "if (mode_priv()) { uint32_t _spsr = spsr_bank[mode_cur]; \
-                     cpsr_set_ctl(_spsr & 0xFFu); n = (_spsr >> 31) & 1; z = (_spsr >> 30) & 1; \
+                     cpsr_set_ctl(_spsr & 0xDFu); n = (_spsr >> 31) & 1; z = (_spsr >> 30) & 1; \
                      c = (_spsr >> 29) & 1; v = (_spsr >> 28) & 1; \
                      nnk_smc_note_exc_return(pc, _spsr); }"
                         .into(),
@@ -3666,6 +3666,11 @@ static void irq_tick(void) {
         fprintf(stderr, "arm7 ipcstat step=%llu [0x02FFFC40]=1\n", (unsigned long long)steps);
     }
 }
+/* Phase-5BB: the instruction-state witness an exception entry needs for the
+ * interrupted CPSR's T bit (defined in tools/nnk_smc.inc, included later in
+ * this TU). */
+static int nnk_state_of_next(uint32_t next, uint32_t prev);
+void nnk_smc_note_resume(uint32_t target, uint32_t spsr);
 static void irq_enter(uint32_t *pc) {
     uint32_t vec = ld32(((cp15_dtcm_setting & ~0xFFu) + 0x4000u) - 4u);
     if (vec < ITCM_LO || vec >= ITCM_HI) {
@@ -3678,8 +3683,23 @@ static void irq_enter(uint32_t *pc) {
     /* Exception entry: SPSR_irq = the interrupted CPSR, then switch to IRQ
      * mode (I+F masked) which swaps in the IRQ bank of r13/r14.  The guest
      * sets that bank itself (crt0 at 0x02000834..0x02000840 computes
-     * 0x027E3F7C), so no seed is applied here. */
-    spsr_bank[MODE_IRQ] = (n << 31) | (z << 30) | (c << 29) | (v << 28) | 0x10u | cpsr_ctl;
+     * 0x027E3F7C), so no seed is applied here.
+     *
+     * Phase-5BB: the interrupted T bit is part of the CPSR and ONLY exists
+     * here -- the runtime resolves the instruction state per dispatch and
+     * keeps cpsr_ctl free of it (a `mrs rd, CPSR` inside ARM code must read
+     * T=0).  Synthesising the SPSR from cpsr_ctl alone therefore told the
+     * guest that every interrupted thread was in ARM state.  Measured: an IRQ
+     * over ov17's Thumb dialog code at 0x02137A92 handed the thread switcher
+     * SPSR 0x4000001F; 460 frames later the restored context resumed ARM at
+     * lr-4 = 0x02137A92 (live-decoded Thumb bytes), walked 5 ARM words into
+     * the `pop {r4,r5,r6,pc}` at 0x02137AA2, popped the heap address
+     * 0x02267068 and halted on SWI #0x65 at 0x02270CDC.  nnk_state_of_next()
+     * is the same witness the dispatch uses (stream stride, else the
+     * compiled pc-form map). */
+    spsr_bank[MODE_IRQ] = (n << 31) | (z << 30) | (c << 29) | (v << 28) | 0x10u |
+                          (cpsr_ctl & ~0x20u) |
+                          (nnk_state_of_next(resume, last_pc) ? 0x20u : 0u);
     cpsr_set_ctl(0xD2u);
     {
         uint32_t sp = r[13] - 24u;      /* BIOS frame: r0-r3, r12, lr */
@@ -3704,10 +3724,19 @@ static void bios_irq_return(uint32_t *pc) {
         uint32_t sr = spsr_bank[MODE_IRQ];
         n = (sr >> 31) & 1u; z = (sr >> 30) & 1u;
         c = (sr >> 29) & 1u; v = (sr >> 28) & 1u;
-        cpsr_set_ctl(sr & 0xFFu);       /* back to the interrupted mode+bank */
+        /* Phase-5BB: back to the interrupted mode+bank, but NOT its T bit --
+         * cpsr_ctl stays the "control byte without state" the rest of the
+         * model uses (the dispatch resolves the state per pc).  The bit is
+         * still in the guest-visible SPSR, which is where the scheduler reads
+         * it. */
+        cpsr_set_ctl(sr & 0xDFu);
     }
     irq_active = 0;
     *pc = lr - 4u;
+    /* Phase-5BB: resume the interrupted instruction in the state the SPSR
+     * names.  The BIOS return lands in the SAME loop iteration as the
+     * dispatch, so the carrier is stamped for the current step. */
+    nnk_smc_note_resume(*pc, spsr_bank[MODE_IRQ]);
     cycles += 4u;                      /* BIOS epilogue */
     fprintf(stderr, "irq return step=%llu pc=0x%08X cpsr_ctl=0x%08X mode=%d sp=0x%08X\n",
             (unsigned long long)steps, *pc, cpsr_ctl, mode_cur, r[13]);

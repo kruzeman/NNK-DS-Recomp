@@ -197,8 +197,43 @@ void nnk_smc_note_branch(uint32_t raw) { smc_branch_mode(raw); smc_t_live = 0; }
  * 0x022C9F38, halting with `dispatch to untranslated pc` on the data word
  * 0xFFFFFFD3 at 0x022CA20C.)  The SPSR bit is hardware state, not a guess, so
  * the carrier is marked live and may also overrule a compiled case. */
+/* Phase-5BB: the exception-return CARRIER is the only place the resumed state
+ * of an `subs pc, lr, #4` lives, and Phase-5AS's A/B switch
+ * (NNK_STATE_CARRIER, default off) also gates it.  When it is off, a dynamic
+ * return target has no carrier and 5AZ's "a non-interworking transfer inherits
+ * its predecessor's state" rule answers instead -- which is false for an
+ * exception return, whose successor state is the SPSR's T bit, not the
+ * handler's.  NNK_EXC_TRACE=1 logs every exception return (target, lr-4 and
+ * the SPSR actually restored) so the arbitration is measured, not assumed. */
+static int smc_exc_trace = -1;
+static unsigned long long smc_nexc;
 void nnk_smc_note_exc_return(uint32_t target, uint32_t spsr) {
+    if (smc_exc_trace < 0) {
+        const char *p = getenv("NNK_EXC_TRACE");
+        smc_exc_trace = (p && p[0] == '1');
+    }
+    if (smc_exc_trace && smc_nexc < 200000ull) {
+        smc_nexc++;
+        fprintf(stderr, "exc_return step=%llu target=0x%08X spsr=0x%08X thumb=%d mode=%d\n",
+                (unsigned long long)steps, target, spsr, (int)((spsr >> 5) & 1u),
+                (int)(spsr & 0x1Fu));
+    }
     smc_branch_mode((target & ~1u) | ((spsr >> 5) & 1u));
+    smc_t_live = 1;
+}
+
+/* Phase-5BB: the same carrier for the BIOS IRQ return.  `bios_irq_return` runs
+ * inside the dispatch-loop iteration BEFORE the instruction it resumes, so its
+ * carrier is consumed by a dispatch at the SAME `steps` value -- the
+ * one-step-scoped stamp has to name the previous step for the carrier to still
+ * be fresh when the dispatch asks.  Measured (Phase-5BB): an IRQ over ov17's
+ * Thumb `blx 0x02043BD0` at 0x020D82BE resumed at 0x020D827A (SPSR T=1), the
+ * dispatcher had no carrier and fell to 5AZ's predecessor rule (the ARM BIOS
+ * IRQ stub), ran 0x020D827A..BE as ARM (the `blx` halfwords are an undefined
+ * ARM word) and jumped to 0x08BD8000. */
+void nnk_smc_note_resume(uint32_t target, uint32_t spsr) {
+    smc_branch_mode((target & ~1u) | ((spsr >> 5) & 1u));
+    smc_t_step = steps ? steps - 1ull : 0ull;
     smc_t_live = 1;
 }
 
@@ -214,6 +249,26 @@ void nnk_smc_note_exc_return(uint32_t target, uint32_t spsr) {
 #define NNK_SMC_MAP_H 1
 static inline int nnk_pc_is_thumb(uint32_t pc) { (void)pc; return 0; }
 #endif
+
+/* Phase-5BB: the instruction state of the pc the machine is ABOUT TO execute,
+ * for the one consumer that needs it outside the dispatch: the IRQ entry's
+ * SPSR (the interrupted CPSR's T bit).
+ *
+ * The runtime resolves the state per dispatch and never stores it in
+ * cpsr_ctl, so an exception entry has to ask the same witnesses the dispatch
+ * uses, in the same order:
+ *   1. the stream stride: a 2-byte successor is Thumb, a 4-byte one is ARM
+ *      (the rule Phase-5AO measured and tools/split_dispatch.py uses to build
+ *      nnk_pc_is_thumb from the emitted fall-throughs);
+ *   2. a non-sequential successor (the interrupted instruction was a taken
+ *      branch) is classified by the compiled pc-form map.
+ * Called once per IRQ, so the binary search in (2) costs nothing. */
+static int nnk_state_of_next(uint32_t next, uint32_t prev)
+{
+    if (next == prev + 2u) return 1;
+    if (next == prev + 4u) return 0;
+    return nnk_pc_is_thumb(next) ? 1 : 0;
+}
 
 /* Phase-5AO: the LAST structural rule before falling back to the sticky guess.
  *

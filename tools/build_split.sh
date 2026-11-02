@@ -264,6 +264,29 @@ if [[ -f "$IMAGE" ]] && ! grep -q 'Phase-5AW exception-return state splice appli
   fi
 fi
 
+# Phase-5BB: the frozen image synthesises SPSR_irq from cpsr_ctl, which is
+# state-free by design, so every IRQ taken over Thumb code told the guest its
+# interrupted thread was in ARM state; the restored context then resumed ARM at
+# a Thumb address (0x02137A92) and walked into the heap (halt SWI #0x65 at
+# 0x02270CDC).  The canonical fix is in nnktool/src/recompile.rs (irq_enter /
+# bios_irq_return) + tools/nnk_smc.inc (nnk_state_of_next); this transform
+# applies it to the frozen prelude.  Same policy as the splices above: no-op
+# when the marker is already there, and
+# NNK_PRELUDE_DISABLE_SPLICE=5bb_irq_state is the negative control.
+if [[ -f "$IMAGE" ]] && ! grep -q 'Phase-5BB IRQ-state splice applied' "$IMAGE"; then
+  if splice_disabled 5bb_irq_state; then
+    echo "== splice DISABLED by NNK_PRELUDE_DISABLE_SPLICE: Phase-5BB IRQ state (negative control) =="
+  else
+    SPLICED_IMAGE8="$(dirname "$SPLIT")/$(basename "$IMAGE" .c).p5bb.c"
+    mkdir -p "$(dirname "$SPLICED_IMAGE8")"
+    echo "== splice (Phase-5BB): SPSR_irq carries the interrupted T bit -> $SPLICED_IMAGE8 =="
+    python3 tools/p5bb_irq_state_splice.py "$IMAGE" "$SPLICED_IMAGE8" || {
+      echo "phase-5bb: IRQ-state splice failed" >&2; exit 2; }
+    IMAGE=$SPLICED_IMAGE8
+    SPLICED_FEATURES+=(5bb_irq_state)
+  fi
+fi
+
 if [[ "$GX" == "1" ]]; then
   [[ -f "$GXDIR/Makefile" ]] || { echo "NNK_GX=1 but $GXDIR/Makefile missing" >&2; exit 2; }
   echo "== gxrender: building libgxrender.a + gx_display.o + gx_gl.o =="
