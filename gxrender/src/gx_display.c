@@ -922,6 +922,79 @@ void gxd_gx_cmd(Gxd *g, uint8_t cmd, uint32_t param)
     gx_cmd_entry(&g->gx, cmd, param);
 }
 
+/* ---- Phase-5BL: GXSTAT (0x04000600) -------------------------------------
+ * The guest polls this word before every GX submission
+ * (0x0200985C..6C: `ldr r0,[0x04000600]; and r0,#0x07000000; lsr #24;
+ * tst r0,#2; beq` — "wait until the command FIFO is less than half full").
+ * Before this, the runtime had no READ path for the register: io_read32 fell
+ * into `default: return 0`, so bit 25 never appeared and the guest spun
+ * forever (Phase-5BK §3: 99.6 % of the post-skip trace, 795,481 hits at each
+ * of the five loop PCs, and the instruction after the loop never executed).
+ *
+ * Composition follows melonDS GPU3D::Read32 case 0x04000600 exactly:
+ *
+ *   GXStat | (PosMatrixStackPointer & 0x1F) << 8
+ *          | (ProjMatrixStackPointer & 0x1) << 13
+ *          | fifolevel << 16
+ *          | (fifolevel < 128) << 25      "FIFO less than half full"
+ *          | (fifolevel == 0)  << 26      "FIFO empty"
+ *
+ * where GXStat holds only the CPU-owned bits (30-31 IRQ condition, 15 stack
+ * error, 14/0 pending push-pop/test, 27 commands queued) and fifolevel comes
+ * from THIS renderer's own FIFO (gx_fifo_level) — not a constant, so the
+ * flags keep telling the truth after the first poll.
+ *
+ * Bits we cannot derive honestly: bit 1 (box-test found the box/position in
+ * the volume) and the test result registers stay 0 because BOX_TEST/POS_TEST/
+ * VEC_TEST are stubs in gx_fifo.c (no geometry test is performed).  Bit 15
+ * (matrix stack error) is modelled only as far as the CPU's own clear-on-
+ * write of bit 15; gx_fifo's push/pop does not flag overflow/underflow. */
+static uint32_t gxstat_word(const Gxd *g)
+{
+    uint32_t lvl = gx_fifo_level(&g->gx);
+    return g->gx.gxstat
+         | ((g->gx.pos_sp & 0x1Fu) << 8)
+         | ((g->gx.proj_sp & 0x1u) << 13)
+         | ((lvl & 0xFFu) << 16)
+         | (lvl < 128u ? (1u << 25) : 0u)
+         | (lvl == 0u   ? (1u << 26) : 0u);
+}
+
+/* melonDS GPU3D::Write32/16/8 case 0x04000600: bit 15 clears the matrix-stack
+ * error and resets the projection (and texture) stack pointer; bits 30-31
+ * latch the GXFIFO IRQ condition; every other bit is read-only status. */
+static void gxstat_write(Gxd *g, uint32_t off, uint32_t val, int width)
+{
+    uint32_t mask = (width == 4) ? 0xFFFFFFFFu : (width == 2 ? 0xFFFFu : 0xFFu);
+    uint32_t w = (val & mask) << (off * 8);
+    uint32_t m = mask << (off * 8);
+
+    if (w & 0x8000u) {
+        g->gx.gxstat &= ~0x8000u;
+        g->gx.proj_sp = 0;
+        g->gx.tex_sp = 0;      /* melonDS: TexMatrixStackPointer = 0 (CHECKME) */
+    }
+    g->gx.gxstat = (g->gx.gxstat & ~(m & 0xC0000000u)) | (w & m & 0xC0000000u);
+}
+
+/* melonDS GPU3D::CheckFIFOIRQ: GXStat bits 30-31 select when the GXFIFO IRQ
+ * line is asserted — 1 = FIFO less than half full, 2 = FIFO empty, 0 = off.
+ * The line is LEVEL-sensitive: it is re-evaluated on every GXFIFO write, on
+ * every GXSTAT write and on every IF acknowledge (melonDS calls
+ * CheckFIFOIRQ from exactly those three places), so the guest's submission
+ * path can chain chunks: handler feeds a block, FIFO drains inside the write,
+ * line re-asserts, handler runs again, ... and the handler disables IE when
+ * its queue is empty. */
+int gxd_gxfifo_irq(const Gxd *g)
+{
+    uint32_t lvl = gx_fifo_level(&g->gx);
+    switch (g->gx.gxstat >> 30) {
+    case 1: return lvl < 128u;
+    case 2: return lvl == 0u;
+    default: return 0;
+    }
+}
+
 static void gfx_write(Gxd *g, uint32_t addr, uint32_t val, int width)
 {
     if (addr >= 0x04000400 && addr < 0x04000440) {
@@ -932,11 +1005,8 @@ static void gfx_write(Gxd *g, uint32_t addr, uint32_t val, int width)
         gxd_gx_cmd(g, (uint8_t)((addr & 0x1FC) >> 2), val);
         return;
     }
-    if (addr == 0x04000600) {
-        if (val & 0x8000) {                     /* GXSTAT stack reset */
-            g->gx.proj_sp = 0;
-            g->gx.tex_sp = 0;
-        }
+    if (addr >= 0x04000600 && addr < 0x04000604) {
+        gxstat_write(g, addr - 0x04000600u, val, width);
         return;
     }
     gxd_write_3d(g, addr, val, width);
@@ -1154,6 +1224,16 @@ uint32_t gxd_io_read(Gxd *g, uint32_t addr, int width)
         return g->keycnt;
     case 0x0400024E:
         return glob(g)[G_VRAMSTAT];
+    case 0x04000600: case 0x04000601: case 0x04000602: case 0x04000603: {
+        /* Phase-5BL: GXSTAT, byte-addressable like melonDS GPU3D::Read8/16/32
+         * (0x04000600 low byte, 0x04000601 stack pointers, 0x04000602 FIFO
+         * level / flags in the low byte, 0x04000603 bits 24-31 + level>>8). */
+        uint32_t w = gxstat_word(g);
+        unsigned off = addr - 0x04000600u;
+        if (width == 4)   return w;
+        if (width == 2)   return (w >> (off * 8)) & 0xFFFFu;
+        return (w >> (off * 8)) & 0xFFu;
+    }
     }
     g->unhandled++;
     return 0;

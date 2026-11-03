@@ -2713,6 +2713,9 @@ static void io_do_dma(int i) {
         s += step; d += step;
     }
     dma_cnt[i] = cnt & ~0x80000000u;         /* clear enable (non-repeating) */
+    /* Phase-5BL: melonDS DMA::End raises IRQ_DMA0+Num when Cnt bit30 is set;
+     * the SDK's async-DMA queue retires through that interrupt. */
+    if (cnt & (1u << 30)) iflags |= 1u << (8 + i);
     fprintf(stderr, "io: DMA%d immediate count=%u words=%d\n", i, count, words);
 }
 /* Card transfer state machine (melonDS NDSCart.cpp, see the state block). */
@@ -2810,6 +2813,29 @@ static void io_card_start(uint32_t val) {
     }
 }
 static uint32_t io_read32(uint32_t a) {
+    /* Phase-5BL: GXSTAT (0x04000600) read path.  The guest waits for
+     * "command FIFO less than half full" (bit 25) before every GX submission:
+     *   0x0200985C  ldr  r0,[0x04000600]
+     *   0x02009860  and  r0,r0,#0x07000000
+     *   0x02009864  lsr  r0,r0,#24
+     *   0x02009868  tst  r0,#2
+     *   0x0200986C  beq  0x0200985C
+     * io_read32 had NO case for the register, so it returned 0 and the poll
+     * could never end (Phase-5BK §3: 99.6 % of the post-skip trace in that
+     * loop, the instruction after it never executed).  The status is modelled
+     * in gx_display from this renderer's own FIFO/stack state (never a
+     * constant: bits 25/26 and the level follow gx_fifo_level), and the byte
+     * offset of a narrower access selects the byte melonDS's Read8/16 would
+     * return. */
+    if ((a & ~3u) == 0x04000600u) {
+        uint32_t w;
+#ifdef NNK_GX
+        if (gxd) w = gxd_io_read(gxd, 0x04000600u, 4);
+        else
+#endif
+        w = 0x06000000u;      /* no renderer: an idle GXFIFO (bit25|bit26) */
+        return w >> ((a & 3u) * 8u);
+    }
     { uint32_t _s; if (io2d_read(a, 4, &_s)) return _s; }
     if (vrc_in(a)) return vrc_read(a, 4);
     if (a == 0x0400024Eu) return vrc_stat();
@@ -2999,12 +3025,30 @@ static void io_write8_sw(uint32_t a, uint32_t v) {
  * does not own, so over-forwarding is safe; the *_sw variants are the raw
  * models used for internal read-modify-write composition (no second
  * forwarding, no double-width clobber of the display state). */
+/* Phase-5BL: mirror melonDS GPU3D::CheckFIFOIRQ into IF bit 21 (IRQ_GXFIFO).
+ * melonDS re-evaluates the level-sensitive line at exactly three points: a
+ * GXFIFO write (WriteToGXFIFO), a GXSTAT write, and an IF acknowledge
+ * (NDS.cpp Write32 0x04000214).  All three are 32/16-bit IO writes here, so
+ * one hook after the register model covers them.  The condition itself lives
+ * in gx_display (GXStat bits 30-31 + our own FIFO level); with bits 30-31
+ * never written this is a no-op, so the model costs nothing on paths that do
+ * not use the GXFIFO interrupt. */
+#ifdef NNK_GX
+static void nnk_gx_irq_eval(void) {
+    if (!gxd) return;
+    if (gxd_gxfifo_irq(gxd)) iflags |= 0x00200000u;
+    else                      iflags &= ~0x00200000u;
+}
+#else
+#define nnk_gx_irq_eval() ((void)0)
+#endif
 static void io_write32(uint32_t a, uint32_t v) {
     io2d_write(a, v, 4);
 #ifdef NNK_GX
     if (gxd) gxd_io_write(gxd, a, v, 4);
 #endif
     io_write32_sw(a, v);
+    nnk_gx_irq_eval();
 }
 static void io_write16(uint32_t a, uint32_t v) {
     io2d_write(a, v, 2);
@@ -3012,6 +3056,7 @@ static void io_write16(uint32_t a, uint32_t v) {
     if (gxd) gxd_io_write(gxd, a, v, 2);
 #endif
     io_write16_sw(a, v);
+    nnk_gx_irq_eval();
 }
 static void io_write8(uint32_t a, uint32_t v) {
     io2d_write(a, v, 1);

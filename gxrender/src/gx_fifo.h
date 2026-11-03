@@ -35,6 +35,15 @@ typedef struct Gx {
     uint32_t exec_params[32];
     int exec_param_count;
 
+    /* Phase-5BL: GXSTAT (0x04000600) latch.  Only the bits the CPU owns are
+     * stored here -- 30-31 (FIFO IRQ condition), 15 (matrix stack
+     * error/underflow, cleared by writing bit 15), 14 (push/pop pending),
+     * 0 (position/vector test pending), 1 (box-test result) and 27 (commands
+     * still queued).  The FIFO level, the empty/less-than-half flags and the
+     * matrix stack pointers are DERIVED at read time from this renderer's own
+     * FIFO/stack state (see gx_fifo_level / gxd_io_read), never stored. */
+    uint32_t gxstat;
+
     /* matrix engine */
     int matrix_mode;
     int32_t proj[16], pos[16], vec[16], texm[16];
@@ -92,6 +101,16 @@ void gx_set_disp_cnt(Gx *gx, uint32_t disp_cnt);
 
 void gx_fifo_write(Gx *gx, uint32_t word);
 void gx_fifo_write_block(Gx *gx, const uint32_t *words, size_t n);
+
+/* Phase-5BL: how many command entries this decoder still has to execute.
+ * melonDS reports CmdFIFO/CmdPIPE occupancy in GXSTAT bits 16-23 and derives
+ * "less than half full" (bit 25) and "empty" (bit 26) from it; our renderer
+ * executes a command as soon as its last parameter word arrives, so the
+ * occupancy is the number of packed command bytes still buffered in the
+ * current word plus one for a multi-parameter command that is still
+ * collecting parameters.  It is therefore 0 after a completed submission and
+ * small (<= 4) in between -- never a constant, and never >= 128. */
+uint32_t gx_fifo_level(const Gx *gx);
 
 /* Execute one command entry (command byte + one parameter) directly, as the
  * hardware direct command ports (4000440h-40005CCh) do; the parameter
