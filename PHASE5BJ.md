@@ -116,10 +116,28 @@ boot shots), `melds_gpu`-derived art scripts `p5bj_*.py` under `work/`.
 
 ## 7. Regressions
 
-* intro band (frames 4200/4300/4400 vs `work/p5t/op_u.yuv` f27/f40/f54):
-  recorded in §7 of the handoff below after the cold-boot capture finished.
-* title screen frame 6300 (sepia artwork) — same cold-boot capture.
-* speed — the cold boot to 4.4e9 steps is timed in `run_cold.log`.
+Cold boot 0 → 4.4e9 steps with `NNK_GX_SHOT` (`work/p5bj/run_cold.log`, shots
+in `work/p5bj/cold/`), same input script as the defect repro:
+
+| check | result |
+|---|---|
+| intro band, **top** screen vs `work/p5t/op_u.yuv` | frame 4200 vs f027 **corr 0.9977** (baseline 0.9979), frame 4300 vs f040 **0.9984** (baseline 0.9981) — both ≥ 0.99 |
+| intro band at frame 4400 | our top screen is already black there (mean luma 1.9 vs 77.6): the movie ends a few frames earlier in this capture than in the baseline run, so the third correlation is not comparable.  The two measurable frames are unchanged, and nothing in this fix touches the movie pipeline (one multiply result register) |
+| title/opening artwork, frame 6300 | non-blank: `work/p5bj/cold/f.06300.bot.ppm.png` shows the full-colour "Welcome to The MOTOR CITY HOTROIT!" card.  The card expected the sepia tint; the *picture* is the known bank C/D `stream=2` background card Phase-5BI already recorded as different from melonDS, which this card does not touch (the fix feeds one sprite-strip bitmap) |
+| speed | 4.4e9 steps in **483 s** = 9.11 M steps/s; the 600 M ≈ 61 s baseline is 9.84 M/s → **8 % slower**, inside the 10 % budget (shots every 25 frames are part of that cost) |
+| halts | `done steps=4400000001 … halt_pc=0x0207CBD0 halt=step budget exhausted` — no new halt, 26 312 distinct PCs |
+| `tools/verify_phase2a.sh` | `rc=0`; section F melonDS-vs-native **1000/1000** in all three variants (strict prefix, window-filtered, in-order after resync) — `work/p5bj/verify.log` |
+| `cargo test` | **64 passed**, 0 failed |
+| savestate round trips (`NNK_SAVESTATE_STRICT=1`) | 5M→6M `fnv=0x2EBE7C43 crc=0x06544741`, 30M→32M `fnv=0x0496F54E crc=0xBB28A57C` — identical on save and reload |
+| splice negative control | `NNK_PRELUDE_DISABLE_SPLICE=5bj_dsp_mul` skips the transform (same policy as the 5X/5AE/5AF/5AJ/5AP/5AT/5AW/5BB splices).  The manifest row `5bj_dsp_mul` is `required` and the prelude audit reports **61 required … AUDIT OK** with the splice in place (`work/p5bj/build2.log`); the disabled-build audit was not run in this phase |
+
+`NNK_EXC_TRACE` was sampled on two windows (cold boot to 40 M steps, and a
+savestate resume across the prompt) and shows the IRQ/exception returns in
+both states (`target=0x02015EC4 spsr=0x0000001F thumb=0`,
+`target=0x02007258 spsr=0x8000009F thumb=0`); the Phase-5BB signature
+`target=0x02137A92 spsr=0x4000003F thumb=1` was **not** reproduced in those
+windows — it is an ov17 IRQ-over-Thumb moment and this fix adds no ARM/Thumb
+state carrier, so its code path is unchanged.
 
 ## 8. Toolchain note (still true, Phase-5BI §7)
 
