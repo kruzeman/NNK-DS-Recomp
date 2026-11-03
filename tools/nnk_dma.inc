@@ -70,6 +70,35 @@ static void nnk_bus_wr16(uint32_t a, uint32_t v) { if (nnk_is_io(a)) io_write16(
  * Measured card time per 0x200 transfer: native 10,761 cycles vs melonDS
  * 21,457 raw = 10,728 ARM9 cycles (ARM9ClockShift=1), 0.3%. */
 static void nnk_dma_card(int i);   /* defined below: mode-5 FIFO drain */
+
+/* Phase-5BF: log every SHIM-executed DMA that lands in the AOBJ (sprite tile)
+ * window 0x06400000..0x0643FFFF.  NOTE (measured): the prompt's tile upload is
+ * NOT in this path — it is an *immediate* word DMA, which the prelude's
+ * io_do_dma() runs (that is where the half-length copy happens, see
+ * PHASE5BF.md §2).  This log covers the timed-mode transfers the Phase-4L shim
+ * owns, so the two halves of the DMA model can be told apart.
+ * Env NNK_AOBJ_TRACE=1. */
+static int nnk_dma_aobj_on = -1;
+static unsigned nnk_dma_aobj_n;
+static void nnk_dma_aobj_log(int i, uint32_t cnt, uint32_t count, int word,
+                             uint32_t s, uint32_t d)
+{
+    uint32_t v0 = 0, v1 = 0;
+    if (nnk_dma_aobj_on < 0) {
+        const char *e = getenv("NNK_AOBJ_TRACE");
+        nnk_dma_aobj_on = (e && e[0] && !(e[0] == '0' && e[1] == '\0')) ? 1 : 0;
+    }
+    if (!nnk_dma_aobj_on) return;
+    if (d < 0x06400000u || d >= 0x06440000u) return;
+    if (!nnk_is_io(s)) { v0 = ld32(s & ~3u); v1 = ld32((s & ~3u) + 4u); }
+    nnk_dma_aobj_n++;
+    fprintf(stderr, "aobjdma #%u ch=%d step=%llu pc=0x%08X cnt=0x%08X count=%u %s "
+            "sadir=%u dadir=%u src=0x%08X dst=0x%08X end=0x%08X src0=%08X,%08X\n",
+            nnk_dma_aobj_n, i, (unsigned long long)steps, last_pc, cnt, count,
+            word ? "word" : "half", (cnt >> 23) & 3u, (cnt >> 21) & 3u,
+            s, d, d + (uint32_t)count * (word ? 4u : 2u), v0, v1);
+}
+
 static int nnk_dma_mode5_ch(void) {
     for (int i = 0; i < 4; i++)
         if ((dma_cnt[i] & 0x80000000u) && (((dma_cnt[i] >> 27) & 7u) == 5u)) return i;
@@ -105,6 +134,7 @@ static void nnk_dma_copy(int i) {
     uint32_t dadir = (cnt >> 21) & 3u;
     uint32_t s = dma_sad[i], d = dma_dad[i];
     if (!count) count = 0x00200000u;
+    nnk_dma_aobj_log(i, cnt, count, word, s, d);
     for (uint32_t k = 0; k < count; k++) {
         if (word) nnk_bus_wr32(d, nnk_bus_rd32(s));
         else nnk_bus_wr16(d, nnk_bus_rd16(s));

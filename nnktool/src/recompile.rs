@@ -2652,6 +2652,19 @@ static void io_do_dma(int i) {
                                               * source) as a timed transfer. */
     if (timing != 0u) return;                /* vblank/hblank: tools/nnk_dma.inc */
     uint32_t count = cnt & 0x7FFFu; if (!count) count = 0x8000u;
+    /* Phase-5BF (READ THIS BEFORE "FIXING" IT): the ARM9 transfer-size bit is
+     * bit26 and the count field is 21 bits (melonDS DMA::Run9 / Start), so the
+     * two lines below are WRONG — every 32-bit DMA is executed as a 16-bit
+     * copy of HALF its length.  That is exactly what drops the second half of
+     * every AOBJ sprite-tile upload at the "Skip the cutscene?" prompt
+     * (PHASE5BF.md §2/§3 has the per-transfer evidence: dst 0x06401380 len
+     * 0xD80 delivered 0x6C0, dst 0x06402100 len 0xC00 delivered 0x600, ...).
+     * Correcting it here and in tools/split_dispatch.py fixes the AOBJ upload
+     * (the tiles land) but DIVERGES THE BOOT: the guest's VRAMCNT layout at
+     * frame 6182 becomes 82 83 8B 84 81 83 8B 81 83 instead of the melonDS
+     * 81 82 89 91 00 85 00 00 00 and the prompt frame renders black
+     * (PHASE5BF.md §5).  The corrected model is therefore kept OPT-IN in the
+     * split splice (NNK_DMA_FIX=1) until the divergence is understood. */
     int words = (cnt & (1u << 30)) != 0u;    /* bit30: word(1)/half(0) — approximate */
     uint32_t s = dma_sad[i], d = dma_dad[i];
     uint32_t step = words ? 4u : 2u;

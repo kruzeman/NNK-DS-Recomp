@@ -161,6 +161,48 @@ static void nnk_vrc_mem(uint32_t a)
     nnk_vrc_win_last[k] = (unsigned long long)steps;
 }
 
+/* ---- Phase-5BF: per-transfer AOBJ (sprite tile) upload coverage ----------
+ * WHY: at the "Skip the cutscene?" prompt VRAM bank B (AOBJ) holds 3 186
+ * nonzero bytes where melonDS holds 6 546, and the missing bytes fall in
+ * whole 128-byte (4-tile) blocks.  The atlas in guest RAM is intact, so the
+ * question is whether the guest WROTE those blocks at all (and the write was
+ * dropped / misrouted) or never issued the store.  This hook runs on every
+ * routed store into the AOBJ window 0x06400000..0x0643FFFF with the guest's
+ * exact address, width and value, and accumulates BYTES WRITTEN per 128-byte
+ * block, so the report answers that question per block instead of per frame.
+ *
+ *   NNK_AOBJ_TRACE=1     log every store (step, pc, addr, width, value)
+ *   (the per-block report prints with the ordinary vrc report)
+ */
+#define NNK_AOBJ_BLOCKS 2048            /* 0x40000 / 128 */
+#define NNK_AOBJ_A0     0x06400000u
+static uint32_t nnk_aobj_bytes[NNK_AOBJ_BLOCKS];
+static uint32_t nnk_aobj_pc[NNK_AOBJ_BLOCKS];
+static unsigned nnk_aobj_calls;
+static unsigned nnk_aobj_log_n;
+static int nnk_aobj_mode = -1;
+
+static void nnk_aobj_note(uint32_t a, uint32_t v, int w)
+{
+    uint32_t rel, blk;
+    if (nnk_aobj_mode < 0) {
+        const char *s = getenv("NNK_AOBJ_TRACE");
+        nnk_aobj_mode = (s && s[0] && !(s[0] == '0' && s[1] == '\0')) ? 1 : 0;
+    }
+    if (a < NNK_AOBJ_A0 || a >= 0x06440000u) return;
+    rel = a - NNK_AOBJ_A0;
+    blk = rel >> 7;
+    if (blk >= NNK_AOBJ_BLOCKS) return;
+    nnk_aobj_calls++;
+    nnk_aobj_bytes[blk] += (uint32_t)w;
+    if (!nnk_aobj_pc[blk]) nnk_aobj_pc[blk] = last_pc;
+    if (nnk_aobj_mode && nnk_aobj_log_n < 20000u) {
+        nnk_aobj_log_n++;
+        fprintf(stderr, "aobj: st step=%llu pc=0x%08X a=0x%08X w=%d v=0x%08X blk=%u\n",
+                (unsigned long long)steps, last_pc, a, w, v, blk);
+    }
+}
+
 /* DISPCNT shadow (engine A is in the runtime model; engine B is forwarded to
  * gx_display only, so record it here for the report). */
 static void nnk_vrc_set_dispcnt(int n, uint32_t v) { nnk_vrc_dispcnt[n & 1] = v; }
@@ -326,6 +368,20 @@ static void nnk_vrc_report(void)
     fprintf(stderr, "p4t: last B7 block addr=0x%08X crc=0x%08llX n=%u starts=%u last_op=0x%02X\n",
             nnk_card_last_addr, (unsigned long long)nnk_blkcrc, nnk_blk_n,
             nnk_card_starts, nnk_card_last_op);
+    /* Phase-5BF: AOBJ per-block write coverage (bytes the guest actually
+     * stored into 0x06400000.. per 128-byte / 4-tile block). */
+    {
+        int b, nz = 0;
+        fprintf(stderr, "aobj: stores=%u blocks_written=", nnk_aobj_calls);
+        for (b = 0; b < NNK_AOBJ_BLOCKS; b++) if (nnk_aobj_bytes[b]) nz++;
+        fprintf(stderr, "%d map=", nz);
+        for (b = 0; b < 96; b++) fputc(nnk_aobj_bytes[b] ? '#' : '.', stderr);
+        fprintf(stderr, "\n");
+        for (b = 0; b < 96; b++)
+            if (nnk_aobj_bytes[b])
+                fprintf(stderr, "aobj: blk %2d off=0x%04X bytes=%u first_pc=0x%08X\n",
+                        b, b * 128, nnk_aobj_bytes[b], nnk_aobj_pc[b]);
+    }
 }
 
 /* ==========================================================================
