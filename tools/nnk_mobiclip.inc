@@ -494,6 +494,143 @@ static int nnk_rom_file(const uint8_t *rom, size_t rom_len, const char *path,
     }
 }
 
+/* ------------------------------------------ FNT directory walk (movie dir) --
+ * Phase-5BD: the HLE must bind a stream to the container the GUEST opened,
+ * not to the order in which codecs were registered.  The guest's own copy of
+ * the container header is the identity: the MobiClip player object embeds the
+ * first 48 bytes of the MODS header of the file it loaded (measured at
+ * 0x022C9E54, i.e. player+4, in the in-game cutscene of Phase-5BC:
+ * "MODS","N3\n\0",581,256x192, payload words 0x36a8/0x12301c/1 ==
+ * data/movie/s01.mods byte for byte).  The 52-byte header's last word is the
+ * FIRST FRAME RECORD LENGTH, which the player object overwrites with its codec
+ * pointer, so identity is the 48 bytes before it.
+ * These helpers enumerate `data/movie/` in the Nitro FNT and compare that
+ * header against every container the card image really has. */
+#define NNK_MODS_IDENT 48
+
+/* Iterate one directory.  `idx` is the 0-based entry index; returns 1 and
+ * fills name/id/isdir while entries remain, 0 at the terminator, -1 on a
+ * malformed table.  File ids come from the directory's own first-file id
+ * (Nitro FNT: u32 subtable offset, u16 first file id, u16 parent dir id), so
+ * they are exact without a global counter. */
+static int nnk_fnt_dir_at(const uint8_t *rom, uint32_t fnt_off, uint32_t fnt_size,
+                          int did, int idx, char *name, int cap, int *fid, int *isdir) {
+    uint32_t ent_off, p, end;
+    uint16_t first_id;
+    int seen = 0;
+    if (did < 0 || (size_t)fnt_off + 8u * ((size_t)did + 1u) > (size_t)fnt_off + (size_t)fnt_size) return -1;
+    ent_off = nnk_mobi_rd32(rom + fnt_off + 8u * (uint32_t)did);
+    first_id = (uint16_t)(rom[fnt_off + 8u * (uint32_t)did + 4] |
+                          (rom[fnt_off + 8u * (uint32_t)did + 5] << 8));
+    p = fnt_off + ent_off;
+    end = fnt_off + fnt_size;
+    while (p < end) {
+        uint8_t ctrl = rom[p++];
+        int len, n;
+        if (ctrl == 0) return 0;
+        len = ctrl & 0x7F;
+        if (p + (uint32_t)len > end || len >= cap) return -1;
+        if (seen == idx) {
+            n = len < cap - 1 ? len : cap - 1;
+            memcpy(name, rom + p, (size_t)n);
+            name[n] = 0;
+            *isdir = (ctrl & 0x80) ? 1 : 0;
+            if (!*isdir) *fid = (int)first_id;
+            p += (uint32_t)len;
+            if (ctrl & 0x80) {
+                if (p + 2u > end) return -1;
+                *fid = rom[p] | (rom[p + 1] << 8);
+            }
+            return 1;
+        }
+        p += (uint32_t)len;
+        if (ctrl & 0x80) {
+            if (p + 2u > end) return -1;
+            p += 2u;
+        } else {
+            first_id++;
+        }
+        seen++;
+    }
+    return -1;
+}
+
+/* Resolve a directory path ("data/movie") to its FNT directory id. */
+static int nnk_fnt_dir_find(const uint8_t *rom, uint32_t fnt_off, uint32_t fnt_size,
+                            const char *path, int *out) {
+    int dir = 0, isdir = 0, id;
+    const char *s = path;
+    while (*s == '/') s++;
+    if (!*s) { *out = 0; return 0; }
+    for (;;) {
+        const char *e = s;
+        while (*e && *e != '/') e++;
+        id = nnk_fnt_lookup(rom, fnt_off, fnt_size, dir, s, (int)(e - s), &isdir);
+        if (id < 0 || !isdir) return -1;
+        dir = id;
+        if (!*e) { *out = dir; return 0; }
+        s = e + 1;
+    }
+}
+
+static int nnk_mobi_ends_ieq(const char *s, const char *suf) {
+    int ls = 0, lf = 0, i;
+    while (s[ls]) ls++;
+    while (suf[lf]) lf++;
+    if (lf > ls) return 0;
+    for (i = 0; i < lf; i++)
+        if (nnk_rom_ieq(s + ls - lf + i, suf + i, 1) != 1) return 0;
+    return 1;
+}
+
+/* Match the guest's 48-byte MODS header against the containers the card image
+ * actually contains under `data/movie/`.  Returns the number of matches;
+ * on the first match *outpath receives "data/movie/<name>" and *nf the frame
+ * count from that container's own header.  A miss or an ambiguous hit is the
+ * caller's business — this function never picks a substitute. */
+static int nnk_rom_movie_match(const uint8_t *rom, size_t rom_len, const uint8_t *hdr,
+                               char *outpath, size_t outcap, int *nf) {
+    uint32_t fnt_off, fnt_size, fat_off;
+    int did, idx, fid = 0, isdir = 0, nmatch = 0;
+    char name[96];
+    if (!rom || rom_len < 0x60 || !hdr) return -1;
+    fnt_off  = nnk_mobi_rd32(rom + 0x040);
+    fnt_size = nnk_mobi_rd32(rom + 0x044);
+    fat_off  = nnk_mobi_rd32(rom + 0x048);
+    if ((size_t)fnt_off + fnt_size > rom_len) return -1;
+    if (nnk_fnt_dir_find(rom, fnt_off, fnt_size, "data/movie", &did) < 0) return -1;
+    for (idx = 0; nnk_fnt_dir_at(rom, fnt_off, fnt_size, did, idx, name, sizeof name,
+                                 &fid, &isdir) == 1; idx++) {
+        uint32_t a, b;
+        if (isdir || !nnk_mobi_ends_ieq(name, ".mods")) continue;
+        if ((size_t)fat_off + 8u * (uint32_t)fid + 8u > rom_len) continue;
+        a = nnk_mobi_rd32(rom + fat_off + 8u * (uint32_t)fid);
+        b = nnk_mobi_rd32(rom + fat_off + 8u * (uint32_t)fid + 4u);
+        if (b <= a || (size_t)b > rom_len || (size_t)(b - a) < NNK_MODS_HDR) continue;
+        if (memcmp(rom + a, hdr, NNK_MODS_IDENT) != 0) continue;
+        nmatch++;
+        if (nmatch == 1) {
+            snprintf(outpath, outcap, "data/movie/%s", name);
+            *nf = (int)nnk_mobi_rd32(rom + a + 8u);
+        } else {
+            fprintf(stderr, "movie: identity ALSO matches data/movie/%s (ambiguous)\n", name);
+        }
+    }
+    return nmatch;
+}
+
+/* CRC-32 (bitwise; only used by the NNK_MOVIE_TRACE diagnostic). */
+static uint32_t nnk_mobi_crc32(const uint8_t *p, size_t n) {
+    uint32_t c = 0xFFFFFFFFu;
+    size_t i;
+    int k;
+    for (i = 0; i < n; i++) {
+        c ^= p[i];
+        for (k = 0; k < 8; k++) c = (c >> 1) ^ (0xEDB88320u & (uint32_t)(-(int32_t)(c & 1u)));
+    }
+    return c ^ 0xFFFFFFFFu;
+}
+
 #include "nnk_mobiclip_dec.inc"
 
 /* ------------------------------------------------------------- decode API --
