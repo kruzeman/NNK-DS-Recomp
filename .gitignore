@@ -54,3 +54,6 @@ shots/
 *.mods
 *.yuv
 *.nnks
+
+# captured game frames (never publish game content)
+evidence/**/*.ppm
