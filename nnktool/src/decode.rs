@@ -64,6 +64,15 @@ pub enum MulKind {
     Umlal,
     Smull,
     Smlal,
+    /// ARMv5TE `smulbb/smulbt/smultb/smultt` — x selects the top halfword of
+    /// Rm, y the top halfword of Rs.
+    Smulxy { x: bool, y: bool },
+    /// `smlabb/smlabt/smlatb/smlatt` — as Smulxy plus the Rn addend.
+    Smlaxy { x: bool, y: bool },
+    /// `smulwb/smulwt` — 32x16 product, bits 31..16.
+    Smulwx { y: bool },
+    /// `smlawb/smlawt` — as Smulwx plus the Rn addend.
+    Smlawx { y: bool },
 }
 
 #[derive(Clone, Debug)]
@@ -755,6 +764,69 @@ pub fn decode_arm(w: u32, addr: u32) -> Insn {
             cs, (w >> 8) & 15, (w >> 20) & 15, (w >> 16) & 15, (w >> 12) & 15, w & 15, (w >> 5) & 7
         );
         return Insn { addr, words: vec![w], text, kind: Kind::Coproc };
+    }
+    // ---- ARMv5TE DSP multiplies (SMULxy / SMLAxy / SMULWx / SMLAWx) ----
+    // These share the data-processing encoding space: `smulbb r1, r1, r5`
+    // (0xE1610581) looks exactly like `cmn r1, r1, lsl #11` to a decoder that
+    // only looks at bits 27-26 / 25 / 24-21 / 20.  The distinguishing bit is
+    // bit 7: no register-shifted data-processing instruction ever sets it
+    // (bits 11-4 are Rs/shamt/stype/0 for the register form and shamt/stype/0/0
+    // for the immediate form), and bits 27-20 are 0x16 / 0x10 / 0x12.
+    //
+    // Phase-5BJ (measured): before this rule the instruction ran as a
+    // flag-only CMN, i.e. as a NO-OP on its destination.  The guest's glyph
+    // blitter computes its 1-bpp source row stride with
+    // `smulbb r1, r1, r5` (0x02030784, 1 byte/row x 11 rows) and got 1 instead
+    // of 11, so rows were read one bit apart instead of eleven and the
+    // "Skip the cutscene?" text lost ~6/7 of its ink at shifted positions.
+    {
+        let low = w & 0x0FF0_0090;
+        let loww = w & 0x0FF0_00B0;
+        let is_16 = low == 0x0160_0080 || low == 0x0100_0080;
+        let is_w = loww == 0x0120_00A0 || loww == 0x0120_0080;
+        if is_16 || is_w {
+            let rd = ((w >> 16) & 15) as u8;
+            let rn = ((w >> 12) & 15) as u8;
+            let rs = ((w >> 8) & 15) as u8;
+            let rm = (w & 15) as u8;
+            let x = w & (1 << 5) != 0;
+            let y = w & (1 << 6) != 0;
+            let (kind, base, is_w) = if low == 0x0160_0080 {
+                (MulKind::Smulxy { x, y }, "smul", false)
+            } else if low == 0x0100_0080 {
+                (MulKind::Smlaxy { x, y }, "smla", false)
+            } else if loww == 0x0120_00A0 {
+                (MulKind::Smulwx { y }, "smulw", true)
+            } else {
+                (MulKind::Smlawx { y }, "smlaw", true)
+            };
+            let acc = matches!(kind, MulKind::Smlaxy { .. } | MulKind::Smlawx { .. });
+            // mnemonic suffix: SMULxy/SMLAxy are "xy" (x = Rm half, y = Rs
+            // half), SMULWx/SMLAWx are a single "y" (Rs half only).
+            let mut name = String::from(base);
+            if !is_w {
+                name.push(if x { 't' } else { 'b' });
+            }
+            name.push(if y { 't' } else { 'b' });
+            let text = if acc {
+                format!(
+                    "{} {}, {}, {}, {}",
+                    name, REGS[rd as usize], REGS[rm as usize], REGS[rs as usize],
+                    REGS[rn as usize]
+                )
+            } else {
+                format!(
+                    "{} {}, {}, {}",
+                    name, REGS[rd as usize], REGS[rm as usize], REGS[rs as usize]
+                )
+            };
+            return Insn {
+                addr,
+                words: vec![w],
+                text,
+                kind: Kind::Mul { kind, s: false, rd, rn, rm, ra: rs },
+            };
+        }
     }
     // ---- data processing (catch-all) ----
     if w & 0x0C00_0000 == 0x0000_0000 {

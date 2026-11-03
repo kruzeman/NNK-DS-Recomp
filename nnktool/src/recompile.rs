@@ -440,6 +440,46 @@ fn emit_insn(
                         rmv, rav
                     ),
                 ),
+                MulKind::Smulxy { x, y } => (
+                    format!(
+                        "(uint32_t)((int32_t)(int16_t)({} >> {}) * (int32_t)(int16_t)({} >> {}))",
+                        rmv,
+                        if *x { 16 } else { 0 },
+                        rav,
+                        if *y { 16 } else { 0 }
+                    ),
+                    "0u".to_string(),
+                ),
+                MulKind::Smlaxy { x, y } => (
+                    format!(
+                        "(uint32_t)((int32_t)(int16_t)({} >> {}) * (int32_t)(int16_t)({} >> {}) + (int32_t){})",
+                        rmv,
+                        if *x { 16 } else { 0 },
+                        rav,
+                        if *y { 16 } else { 0 },
+                        rnv
+                    ),
+                    "0u".to_string(),
+                ),
+                MulKind::Smulwx { y } => (
+                    format!(
+                        "(uint32_t)(((int64_t)(int32_t){} * (int64_t)(int32_t)(int16_t)({} >> {})) >> 16)",
+                        rmv,
+                        rav,
+                        if *y { 16 } else { 0 }
+                    ),
+                    "0u".to_string(),
+                ),
+                MulKind::Smlawx { y } => (
+                    format!(
+                        "(uint32_t)((((int64_t)(int32_t){} * (int64_t)(int32_t)(int16_t)({} >> {})) >> 16) + (int32_t){})",
+                        rmv,
+                        rav,
+                        if *y { 16 } else { 0 },
+                        rnv
+                    ),
+                    "0u".to_string(),
+                ),
                 MulKind::Umlal => (
                     format!(
                         "(uint32_t)((uint64_t){} * (uint64_t){} + (((uint64_t)r[{}] << 32) | r[{}]))",

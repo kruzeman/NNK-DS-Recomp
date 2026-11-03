@@ -1258,6 +1258,37 @@ static int smc_exec_arm(uint32_t pc, uint32_t w, uint32_t *npc, uint32_t *costp)
         }
         return 1;
     }
+    /* Phase-5BJ: ARMv5TE DSP multiplies (SMULxy / SMLAxy / SMULWx / SMLAWx).
+     * They live inside the data-processing encoding space — `smulbb r1,r1,r5`
+     * is 0xE1610581, which reads as `cmn r1, r1, lsl #11` — and are told apart
+     * only by bit 7, which no register-shifted or immediate-shifted
+     * data-processing instruction ever sets.  Decoded as CMN they were a
+     * flag-only no-op on their destination: the glyph blitter's row stride
+     * (`smulbb r1, r1, r5` at 0x02030784, 1 byte x 11 rows) stayed 1 instead of
+     * 11 and the prompt text lost ~6/7 of its ink at shifted positions. */
+    if ((w & 0x0FF00090u) == 0x01600080u || (w & 0x0FF00090u) == 0x01000080u ||
+        (w & 0x0FF000B0u) == 0x012000A0u || (w & 0x0FF000B0u) == 0x01200080u) {
+        unsigned rd = (w >> 16) & 0xFu, rn = (w >> 12) & 0xFu;
+        unsigned rs = (w >> 8) & 0xFu, rm = w & 0xFu;
+        int32_t a = (int32_t)smc_reg(rm, pc, 0);
+        int32_t b = (int32_t)smc_reg(rs, pc, 0);
+        int32_t res;
+        if ((w & 0x0FF00090u) == 0x01600080u || (w & 0x0FF00090u) == 0x01000080u) {
+            /* halfword x halfword: bit5 = top half of Rm, bit6 = top of Rs */
+            int32_t av = (int32_t)(int16_t)((w & 0x20u) ? (uint32_t)a >> 16 : (uint32_t)a);
+            int32_t bv = (int32_t)(int16_t)((w & 0x40u) ? (uint32_t)b >> 16 : (uint32_t)b);
+            res = av * bv;
+            if ((w & 0x0FF00090u) == 0x01000080u) res += (int32_t)smc_reg(rn, pc, 0);
+        } else {
+            /* 32 x 16, bits 31..16 of the 48-bit product */
+            int32_t bv = (int32_t)(int16_t)((w & 0x40u) ? (uint32_t)b >> 16 : (uint32_t)b);
+            res = (int32_t)(((int64_t)a * (int64_t)bv) >> 16);
+            if ((w & 0x0FF000B0u) == 0x01200080u) res += (int32_t)smc_reg(rn, pc, 0);
+        }
+        r[rd] = (uint32_t)res;
+        *costp = 1;
+        return 1;
+    }
     if ((w & 0x0C000000u) == 0x00000000u) {            /* data processing */
         unsigned I = (unsigned)((w >> 25) & 1u);
         unsigned op = (unsigned)((w >> 21) & 0xFu);

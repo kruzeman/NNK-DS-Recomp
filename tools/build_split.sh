@@ -287,6 +287,36 @@ if [[ -f "$IMAGE" ]] && ! grep -q 'Phase-5BB IRQ-state splice applied' "$IMAGE";
   fi
 fi
 
+# Phase-5BJ: the frozen image has no ARMv5TE DSP-multiply rule, so
+# `smulbb r1, r1, r5` (and every sibling) ran as the data-processing
+# instruction its encoding also spells — a flag-only CMN, i.e. a NO-OP on the
+# destination.  The guest's glyph blitter computes its 1-bpp source row stride
+# with that multiply (0x02030784: 1 byte/row x 11 rows) and got 1 instead of
+# 11, so every glyph row was read one bit further into the bitmap instead of
+# eleven and the prompt text lost ~6/7 of its ink at shifted positions.  The
+# canonical fix is nnktool/src/decode.rs + recompile.rs + the runtime's live
+# decoder (tools/nnk_smc.inc); this transform re-emits the 21 affected cases
+# from the fixed recompiler.  No-op when the marker is already there;
+# NNK_PRELUDE_DISABLE_SPLICE=5bj_dsp_mul is the negative control.
+if [[ -f "$IMAGE" ]] && ! grep -q 'Phase-5BJ dsp-multiply splice applied' "$IMAGE"; then
+  if splice_disabled 5bj_dsp_mul; then
+    echo "== splice DISABLED by NNK_PRELUDE_DISABLE_SPLICE: Phase-5BJ DSP multiply (negative control) =="
+  else
+    if [[ ! -x nnktool/target/release/nnktool ]]; then
+      echo "== phase-5bj: building nnktool (the splice needs the recompiler's emitter) =="
+      (cd nnktool && cargo build --release) || {
+        echo "phase-5bj: nnktool build failed; cannot re-emit the DSP-multiply cases" >&2; exit 2; }
+    fi
+    SPLICED_IMAGE9="$(dirname "$SPLIT")/$(basename "$IMAGE" .c).p5bj.c"
+    mkdir -p "$(dirname "$SPLICED_IMAGE9")"
+    echo "== splice (Phase-5BJ): DSP multiplies re-emitted -> $SPLICED_IMAGE9 =="
+    python3 tools/p5bj_dsp_mul_splice.py "$IMAGE" "$SPLICED_IMAGE9" || {
+      echo "phase-5bj: DSP-multiply splice failed" >&2; exit 2; }
+    IMAGE=$SPLICED_IMAGE9
+    SPLICED_FEATURES+=(5bj_dsp_mul)
+  fi
+fi
+
 if [[ "$GX" == "1" ]]; then
   [[ -f "$GXDIR/Makefile" ]] || { echo "NNK_GX=1 but $GXDIR/Makefile missing" >&2; exit 2; }
   echo "== gxrender: building libgxrender.a + gx_display.o + gx_gl.o =="
