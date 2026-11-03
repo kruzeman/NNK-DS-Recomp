@@ -119,6 +119,10 @@ scale/stride arithmetic truncates.
 
 ## 5. Tests and repository state
 
+* `sh tools/verify_phase2a.sh`: **EXIT 0** — sections A/A2/B/C/D/E/F all ran;
+  the melonDS PC ground truth reproduced **1000 / 1000** (strict prefix,
+  window-filtered and resync variants), 96.1 % Ghidra agreement, 96.5 %
+  byte-weighted body coverage (`work/p5bi/verify.log`).
 * `nnktool` class test suite: **62 passed, 0 failed** (`cargo test`,
   `work/p5bi/cargo_test.log`).
 * No source change: this card is diagnostic only (`git diff` is empty apart from
