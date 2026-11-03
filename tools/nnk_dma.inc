@@ -406,7 +406,16 @@ static void nnk_regwatch(uint32_t pc)
     }
 }
 
+/* Phase-5BN (perf): 1 = run the per-step debug probes (NNK_PROBES=1), 0 = skip
+ * them.  File scope so the savestate field table sees it like other globals. */
+static int nnk_probes_on = -1;
+
 void nnk_dma_tick(void) {
+    /* Phase-5BN (perf): the per-step DEBUG PROBES below cost ~6% of a whole run
+     * (measured 20.0 s -> 18.5 s per 200M steps) and are useless in a shipped
+     * build, so they are skipped unless NNK_PROBES=1.  The DMA/vblank/timer/
+     * card/IPC ENGINE is NOT gated — that is real work. */
+    if (nnk_probes_on < 0) nnk_probes_on = (getenv("NNK_PROBES") != NULL) ? 1 : 0;
     /* Phase-4X: VBlank IF raise (edge into vc==192) before the delivery check. */
     p4x_vblank_tick();
     /* Phase-4U: timer overflows may raise IF before the delivery check. */
@@ -416,7 +425,7 @@ void nnk_dma_tick(void) {
     /* Phase-4Q probe: the IE write history.  At the barrier native held
      * IE=0x00000009 where melonDS holds 0x00040019 (IPCRecv bit18 / Timer1
      * bit4), so this logs every IE change with the writing pc. */
-    { static uint32_t last_ie; static int init, n;
+    if (nnk_probes_on) { static uint32_t last_ie; static int init, n;
       if (init && ie != last_ie && n < 60) {
           fprintf(stderr, "iewr step=%llu pc=0x%08X ie 0x%08X -> 0x%08X "
                   "if=0x%08X ime=%u\n", (unsigned long long)steps, last_pc,
@@ -430,7 +439,7 @@ void nnk_dma_tick(void) {
     /* Phase-4P probe: who writes DMA2CNT (the card-DRQ channel) and what the
      * card model looks like at that instant.  Polled, so no call site is
      * needed in the generated io_write32. */
-    { static uint32_t seen[4]; static int init, wr_n;
+    if (nnk_probes_on) { static uint32_t seen[4]; static int init, wr_n;
       for (int i = 0; i < 4; i++) {
           uint32_t v = dma_cnt[i];
           if (init && v != seen[i] && wr_n < 80) {
@@ -452,7 +461,7 @@ void nnk_dma_tick(void) {
      * tst #0x80000000 / 0x020168A8 bne) spinning without the transfer's end
      * event ever firing.  One-shot state dump after 100k consecutive loop
      * dispatches. */
-    { static unsigned long stall_n; static int stall_done;
+    if (nnk_probes_on) { static unsigned long stall_n; static int stall_done;
       unsigned long long ticks_at_dump = (unsigned long long)card_cycles;
       if (last_pc == 0x020168A0u || last_pc == 0x020168A4u || last_pc == 0x020168A8u) {
           stall_n++;
@@ -470,7 +479,7 @@ void nnk_dma_tick(void) {
       }
     }
     /* Phase-4N probe: one-shot state dump at the ARM9 WFI idle loop. */
-    { static int lp_done;
+    if (nnk_probes_on) { static int lp_done;
       if (!lp_done && last_pc == 0x02007134u) {
           lp_done = 1;
           fprintf(stderr, "loopprobe step=%llu card_cycles=%llu card_next=%lld "
