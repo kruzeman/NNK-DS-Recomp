@@ -101,7 +101,9 @@ Two PNGs delivered (cold boot, this build):
 `work/p5bm/c.07600.bot.ppm.png` — bottom: the parchment dialogue box
 "Hey, Oliver!" with the red advance arrow;
 `work/p5bm/c.07600.top.ppm.png` — top: the town map ("Norton Street").
-Frames 07450 / 07475 / 07500 pin the transition itself.
+Frames 07450 / 07475 / 07500 pin the transition itself.  The map frame 6575 was
+viewed as well: a top-down town map with streets, trees and the yellow street
+label — not a movie frame and not black.
 
 ## 4. Why 5BL reported black: its own last capture already showed the screen
 
@@ -125,7 +127,7 @@ mean-of-frames table evidently stopped at 7450; the picture was on disk.
 | `SKIP_MELONDS=0 sh tools/verify_phase2a.sh` | **1000 / 1000** on all three melonDS prefix checks, `rc=0` |
 | intro corr (top screen vs `work/p5t/op_u.yuv`) | f4200 → f27 **0.9978**, f4300 → f40 **0.9983** (both ≥ 0.99) |
 | prompt text, cold boot | frame 6400 dark band (x70..200, y88..104) **219 px** — the 5BI/5BJ number |
-| "No" path | `work/p5bm/no.nnk` (A at 6420): film runs on (bottom 55.9 at 7600 … 57.6 at 8100), next scene at frame **8200** (mean 75.7), run to 5.3e9 steps |
+| "No" path | `work/p5bm/no.nnk` (A at 6420): the film runs on (bottom 55.9 at 7600 … 57.6 at 8100 — "That must mean he finally finished it…" in the shop) and the next cutscene is on screen at frame **8200** (mean 75.7); run to 5.3e9 steps |
 | savestate 5 M → 6 M, `NNK_SAVESTATE_STRICT=1` | fnv `0x5F9DD1AD` crc `0x3ACA5B0A` **both** runs, `identity OK` |
 | savestate 30 M → 32 M, STRICT | fnv `0x2AFC0F98` crc `0x3E0F0619` **both** runs |
 | speed, 600 M steps headless | **59.43 s** (reference ≈ 61 s) — within 10 % |
