@@ -97,6 +97,12 @@ Measured with the committed `tools/p5bm_postskip_shots.py` (`first-nonblack
 work/p5bm/c bot 6450` → `7475 mean=29.5`; `... top 6420` → `6525 mean=26.1`;
 `darkband` → 219; `corr` → 0.9978/0.9983).
 
+In steps: the savestate anchor of the same run is `step=4200000000 frame=7508`
+and the 6.5e9-step run ends at `frame=11618`, i.e. **559,611 steps per display
+frame**; the first post-skip bottom frame 7475 is therefore **step ≈ 4.182e9**
+(the answer is at frame 6420 ≈ step 3.59e9, as Phase-5BK measured for the
+same input script).
+
 Two PNGs delivered (cold boot, this build):
 `work/p5bm/c.07600.bot.ppm.png` — bottom: the parchment dialogue box
 "Hey, Oliver!" with the red advance arrow;
