@@ -4340,3 +4340,83 @@ fn phase_5bj_dsp_halfword_multiplies_are_not_flag_only_cmn() {
     assert!(splice.contains("(0x02030784, \"smulbb\", \"r1, r1, r5\")"),
             "the splice must re-emit the glyph blitter's row-stride multiply");
 }
+
+// ---------------------------------------------------------------------------
+// class 60 (Phase-5BM): the post-skip "park" is the idle thread, not a teardown
+// ---------------------------------------------------------------------------
+/// Phase-5BL reported the "Yes" path as parked in an *IRQ-off* WFI loop at
+/// `0x02009118..0x02009120` and asked for the missing wake event.  Measured in
+/// Phase-5BM on the same build (cold boot, `work/p5bm/yes.nnk`, 4.2e9 steps):
+///
+///   * `0x02009118` is the SDK's shared `wfi()` helper (`mov r0,#0;
+///     mcr p15,0,r0,cr7,cr0,{4}; bx lr`) and has three callers in the image:
+///     the **idle thread** `0x0200712C` (its `bl 0x02008D0C` *enables* IRQ),
+///     the **teardown** helper `0x02009108` (its `bl 0x02008D20` masks IRQ)
+///     and `0x02010564`;
+///   * the run's halt state is `r13=0206C8A8 r14=02007138` -- the return
+///     address of the idle thread's `bl 0x02009118`, not of `0x02009110`;
+///   * every IRQ entry taken at the WFI carries `spsr=0x0000001F` (System mode,
+///     CPSR.I = 0) with `ie=0x00040019` / `ime=1`, so the WFI **does** wake and
+///     the handler at `0x02007258` runs (55,643 entries);
+///   * `NNK_DEBUG_AT_PC=0x020090D8 NNK_DEBUG_N=16` reports **0 hits** over the
+///     whole run: the 5AI/5AK/5AL stream-guard abort entry is never reached on
+///     the "Yes" path, so that abort does not recur here.
+///
+/// The post-skip picture then appears on its own: after the answer the guest
+/// spends the black window in the card read loop (`0x02016B30` = ROMCTRL
+/// `0x040001A4` poll, 43 % of a 4 M-step sample, 39,552 words delivered) and
+/// the next screen is on display at frame 7475/7500 -- the same frame
+/// (`f.07500.bot.ppm`, mean 72.7) that is already byte-identical to Phase-5BL's
+/// own capture.  Locked here (source + measurement-tool invariants, no ROM):
+#[derive(Debug, PartialEq, Eq)]
+enum WfiSite {
+    /// `0x0200712C`: `bl 0x02008D0C` (enable IRQ) then `bl 0x02009118` in a loop.
+    IdleThread,
+    /// `0x02009108`: `bl 0x02008D20` (mask IRQ) then `bl 0x02009118` in a loop.
+    Teardown,
+    /// A one-shot `bl 0x02009118` that returns to its caller.
+    Caller,
+    Other,
+}
+
+/// Classify the code that invoked the WFI helper, from the `lr` the helper sees
+/// (i.e. the `bl` address + 4).
+fn wfi_site(lr: u32) -> WfiSite {
+    match lr {
+        0x0200_7138 => WfiSite::IdleThread, // 0x02007134 bl 0x02009118
+        0x0200_9114 => WfiSite::Teardown,   // 0x02009110 bl 0x02009118
+        0x0200_9110 => WfiSite::Teardown,   // b 0x02009110 back-edge
+        0x0201_0570 => WfiSite::Caller,     // 0x0201056C bl 0x02009118
+        _ => WfiSite::Other,
+    }
+}
+
+#[test]
+fn phase_5bm_the_post_skip_park_is_the_idle_thread_and_the_picture_arrives() {
+    // 1. The loop we measured is the idle thread, and it is not the teardown.
+    assert_eq!(wfi_site(0x0200_7138), WfiSite::IdleThread);
+    assert_eq!(wfi_site(0x0200_9114), WfiSite::Teardown);
+    assert_ne!(wfi_site(0x0200_7138), WfiSite::Teardown,
+               "the 0x0200712C idle thread must never be classified as a teardown");
+
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+
+    // 2. The measurement tool keeps the three checks this phase's gates use.
+    let tool = std::fs::read_to_string(root.join("tools/p5bm_postskip_shots.py"))
+        .expect("tools/p5bm_postskip_shots.py is gone");
+    for needle in ["first-nonblack", "darkband", "corr",
+                   "x0=70, x1=200, y0=88, y1=104", "FSZ = FW * FH * 3 // 2"] {
+        assert!(tool.contains(needle),
+                "the post-skip shot reader lost `{}`", needle);
+    }
+    assert!(tool.contains("'%s.*.%s.ppm' % (base, screen)"),
+            "first-nonblack must stay scoped to ONE run's shot base");
+
+    // 3. The report keeps the measured frame numbers this test cites, so a later
+    //    phase cannot quietly come back to "black to the end of the run".
+    let doc = std::fs::read_to_string(root.join("PHASE5BM.md")).unwrap_or_default();
+    for needle in ["7475", "7500", "6525", "0 hits", "Hey, Oliver"] {
+        assert!(doc.contains(needle),
+                "PHASE5BM.md lost the measured evidence `{}`", needle);
+    }
+}
