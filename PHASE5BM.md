@@ -139,7 +139,23 @@ mean-of-frames table evidently stopped at 7450; the picture was on disk.
 | speed, 600 M steps headless | **59.43 s** (reference ≈ 61 s) — within 10 % |
 | ROM-only | yes — the card image is the only input; `work/` is symlinked, nothing game-derived is committed |
 
-## 6. Honest gaps
+## 6. Interactivity after the skip (the strongest form of "not parked")
+
+A third cold boot with the same script plus A at frames 7600 / 7750 / 7900
+(`work/p5bm/yes_adv.nnk`, 5.6e9 steps) shows the guest taking the input and
+advancing the story:
+
+| frame | bottom screen |
+|---|---|
+| 7500 / 7600 | dialogue box "Hey, Oliver!" (mean 72.7 / 72.3) |
+| 7700 .. 8100 | box gone, black (the speaker change) |
+| 8200 .. 8400 | a new dialogue box, mean 74.1 |
+| 8500 .. 9900+ | next scene, mean 86.0 — **"Mark.: Over here, over here!"** |
+
+So the post-skip machine reads the keypad, advances the dialogue and loads the
+following scene; nothing is stuck.
+
+## 7. Honest gaps
 
 * The **bottom screen is blank from 6450 to 7475** while the top screen already
   shows the map from 6575.  Whether real hardware shows a loading indicator on
