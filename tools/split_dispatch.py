@@ -1010,6 +1010,39 @@ def main():
                      "Phase-5AQ resume PC")
     sys.stderr.write("Phase-5AQ: savestate per-step hook spliced\n")
 
+    # ---- Phase-5BN: event-driven tick scheduling --------------------------
+    # tools/nnk_dma.inc now runs the per-step tick only when it is due
+    # (nnk_tick_due).  A guest store that arms, disables or re-times a modelled
+    # event must be observed by the tick on the NEXT dispatch, so every IO
+    # write reports its address to nnk_io_touch(), and a FIFO drain reports
+    # to nnk_io_touch_read() (it can free the slot a pending reply waits on).
+    # Both are declared in nnk_main.c's prologue below (nnk_dma.inc defines
+    # them after the prelude).
+    #
+    # NOTE: the line is inserted INTO the matched prelude element instead of
+    # replacing it — the Phase-4M splices above already extended io_read32's
+    # definition line into a multi-line element, and replacing the element
+    # would silently drop them (inject's _vrc_modern fallback skips its own
+    # anchor when it is gone, so the loss would only show up in the audit).
+    def _entry_hook(lines_, sig, call, what):
+        hits = [i for i, l in enumerate(lines_) if sig in l]
+        if len(hits) != 1:
+            die("Phase-5BN: %s anchor %r matched %d lines"
+                % (what, sig, len(hits)))
+        out = list(lines_)
+        out[hits[0]] = out[hits[0]].replace(sig, sig + "\n    " + call, 1)
+        return out
+
+    for _w in (32, 16, 8):
+        prelude = _entry_hook(prelude,
+                              "static void io_write%d(uint32_t a, uint32_t v) {" % _w,
+                              "nnk_io_touch(a);",
+                              "Phase-5BN IO write hook (io_write%d)" % _w)
+    prelude = _entry_hook(prelude, "static uint32_t io_read32(uint32_t a) {",
+                          "nnk_io_touch_read(a);",
+                          "Phase-5BN IO read hook (io_read32)")
+    sys.stderr.write("Phase-5BN: IO touch hooks spliced (write32/16/8, read32)\n")
+
     # ---- main TU: prelude + band table + dispatch + tail
     prelude = list(prelude)          # un-static'd copy
     tf_idx = next((i for i, l in enumerate(prelude)
@@ -1022,6 +1055,10 @@ def main():
         fh.write("static void nnk_boot_firmware(void);\n")
         fh.write("static int nnk_input_ioread16(uint32_t a, uint32_t *out);\n")
         fh.write("static void nnk_input_tick(void);\n")
+        # Phase-5BN: defined in nnk_dma.inc (included below), called from the
+        # prelude's IO entry points above their definitions.
+        fh.write("static void nnk_io_touch(uint32_t a);\n")
+        fh.write("static void nnk_io_touch_read(uint32_t a);\n")
         fh.writelines(prelude[:tf_idx])
         fh.write('#include "nnk_boot.inc"\n\n')
         # Phase-4L: DMA completion/timing shim (tools/nnk_dma.inc) — included
@@ -1058,7 +1095,7 @@ def main():
         fh.write("            /* Phase-4J: SMC — if a guest store changed the word this PC\n")
         fh.write("             * dispatches, the compiled case is from a stale image generation:\n")
         fh.write("             * re-decode it from live RAM and skip the band switch. */\n")
-        fh.write("            nnk_dma_tick();\n")
+        fh.write("            if (cycles >= nnk_tick_due) nnk_dma_tick();\n")
         fh.write("            nnk_input_tick();\n")
         fh.write("            if (pc >= 0x02900000u && pc < 0x02A00000u && p4x_band_log < 24u) {\n")
         fh.write("                p4x_band_log++;\n")
@@ -1110,7 +1147,9 @@ def main():
         if len(tail_repl) != 1:
             die("Phase-4M: run-summary anchor matched %d lines" % len(tail_repl))
         tail = inject(tail, 'fprintf(stderr, "done steps=',
-                      "    nnk_vrc_report();\n" + tail_repl[0], "vramcnt report call")
+                      "    nnk_vrc_report();\n"
+                      "    nnk_tick_report();\n" + tail_repl[0],
+                      "vramcnt report call")
         # Phase-5AQ: arm the savestate subsystem after the display exists (the
         # display model is part of the state) and load NNK_SAVESTATE=<path> if
         # the operator asked to boot straight from a state.
