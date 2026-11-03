@@ -410,6 +410,32 @@ static void nnk_regwatch(uint32_t pc)
  * them.  File scope so the savestate field table sees it like other globals. */
 static int nnk_probes_on = -1;
 
+/* ---- Phase-5BN: event-driven tick scheduling ------------------------------
+ * MEASURED (Phase-5BN): calling nnk_dma_tick() on EVERY guest step cost about
+ * half the wall time of a 200M-step run (18.2 s, and the same run with the
+ * tick restricted to every 64th step took 9.8 s while still presenting 362
+ * frames with 167,955 io writes) — the work is not the DMA engine, it is
+ * running the whole chain (VBlank edge, timer overflow, IPC tick,
+ * nnk_card_stall, the 4-channel DMA loop, vcount()) 200M times.
+ *
+ * The tick is therefore SCHEDULED: nnk_tick_due holds the next `cycles` value
+ * at which it has anything to do, the dispatch loop calls it only when
+ * `cycles >= nnk_tick_due`, and nnk_tick_deadline() (end of every tick)
+ * recomputes the deadline from the live model state.
+ *
+ * Nothing is approximated: every deadline is the exact cycle at which the
+ * tick's own `>=` test first becomes true, so the tick runs on the same
+ * dispatch the per-step version would have run it on.  States that cannot be
+ * scheduled exactly (a delivery blocked on a free FIFO slot, the opt-in
+ * NNK_PROBES / NNK_IPC_PROBE per-step probes) pull the deadline back to
+ * `cycles`, i.e. they keep the old once-per-step behaviour and nothing else.
+ */
+static uint64_t nnk_tick_due;              /* next cycle the tick is due      */
+static unsigned long long nnk_tick_n;      /* ticks taken (NNK_TICK_PROBE)    */
+static void nnk_tick_deadline(void);
+static void nnk_io_touch(uint32_t a);      /* IO write re-times the model     */
+static void nnk_io_touch_read(uint32_t a); /* FIFO drain frees a blocked slot */
+
 void nnk_dma_tick(void) {
     /* Phase-5BN (perf): the per-step DEBUG PROBES below cost ~6% of a whole run
      * (measured 20.0 s -> 18.5 s per 200M steps) and are useless in a shipped
@@ -528,6 +554,9 @@ void nnk_dma_tick(void) {
             nnk_dma_copy(i);
         }
     }
+    /* Phase-5BN: schedule the next cycle at which this tick has work. */
+    nnk_tick_n++;
+    nnk_tick_deadline();
 }
 
 /* ---- Phase-4Q: ARM7 IPC-FIFO responder (measured request -> reply) -------
@@ -1017,4 +1046,138 @@ static void nnk_p4s_tick(void) {
         memmove(nnk_p4s_at, nnk_p4s_at + 1,
                 (--nnk_p4s_n) * sizeof nnk_p4s_at[0]);
     }
+}
+
+/* ==== Phase-5BN: event-driven tick scheduling ============================
+ * (state + contract in the block comment next to nnk_tick_due, above.)
+ *
+ * nnk_io_touch() is called by the generated IO write entry points
+ * (io_write32/16/8, spliced by tools/split_dispatch.py) for every guest store
+ * to the IO window.  A store that arms, disables or re-times a modelled event
+ * must be seen by the tick on the NEXT dispatch, so the deadline is pulled
+ * back to `cycles`; everything else (palette/VRAM/OAM/GX-FIFO writes, which
+ * are the overwhelming majority) is left alone.
+ *
+ * The register list is the tick's own dependency set, found in the tick body:
+ *   DMAxSAD/DAD/CNT  -> the 4-channel loop, io_do_dma (immediate modes)
+ *   TMxCNT_L/H       -> p4u_timer_tick (reload + enable + IRQ enable)
+ *   DISPSTAT         -> p4x_vblank_tick / io_dispstat_read
+ *   ROMCTRL/AUXSPICNT/card CMD -> io_card_start, nnk_card_stall
+ *   IPCSYNC/IPCFIFOCNT/IPCFIFO -> nnk_ipc_send, the recv FIFO
+ *   IME/IE/IF        -> IRQ delivery (checked in the dispatch loop)
+ *   KEYINPUT/KEYCNT  -> nnk_input_tick's key state
+ */
+static void nnk_io_touch(uint32_t a)
+{
+    if ((a >= 0x040000B0u && a < 0x040000E0u) ||     /* DMA SAD/DAD/CNT  */
+        (a >= 0x04000100u && a < 0x04000110u) ||     /* TMxCNT_L/H       */
+        (a >= 0x04000180u && a < 0x0400018Cu) ||     /* IPCSYNC/FIFO     */
+        (a >= 0x040001A0u && a < 0x040001B0u) ||     /* AUXSPICNT/ROMCTL */
+        a == 0x04000004u ||                          /* DISPSTAT         */
+        a == 0x04000130u || a == 0x04000132u ||      /* KEYINPUT/KEYCNT  */
+        a == 0x04000208u || a == 0x04000210u || a == 0x04000214u) {
+        nnk_tick_due = cycles;                       /* due next dispatch */
+    }
+}
+
+/* A FIFO drain can free the slot a pending reply/queued word is blocked on. */
+static void nnk_io_touch_read(uint32_t a)
+{
+    if (a == 0x04100000u || a == 0x04100004u || a == 0x04100010u)
+        nnk_tick_due = cycles;
+}
+
+#define NNK_TICK_FAR 0x40000000ull      /* no event armed: stay asleep        */
+
+static void nnk_tick_deadline(void)
+{
+    uint64_t due = cycles + NNK_TICK_FAR;
+    int i;
+
+    /* Per-step observers keep the pre-Phase-5BN call rate: the debug probes
+     * (NNK_PROBES=1) watch `last_pc` on every dispatch, and the Phase-5AI
+     * drain probe (NNK_IPC_PROBE=1) measures the FIFO depth per dispatch.
+     * nnk_probes_on/p4r_probe_init are read lazily inside the tick, so the
+     * first deadline is also forced to `cycles` until each flag is known. */
+    if (nnk_probes_on < 0 || nnk_probes_on) due = cycles;
+    if (!p4r_probe_init || p4r_probe == 1) due = cycles;
+
+    /* VCOUNT: the next scanline edge (hblank/vblank DMA trigger, VBlank IRQ,
+     * DISPSTAT VCOUNT-match).  vcount() = (cycles / 2130) % 263, so the edge
+     * is the next multiple of CYCLES_PER_SCANLINE. */
+    {
+        uint64_t edge = (cycles / CYCLES_PER_SCANLINE + 1u) * CYCLES_PER_SCANLINE;
+        if (edge < due) due = edge;
+    }
+
+    /* Timers: the next overflow of an enabled IRQ timer.  Same arithmetic as
+     * p4u_timer_tick: ticks = (cycles - base) >> shift, overflow when
+     * ticks >= (ovf+1) * period, i.e. cycles >= base + ((ovf+1)*period)<<shift. */
+    if (steps > 9097800u) {
+        for (i = 0; i < 4; i++) {
+            uint32_t ctrl = tm_ctrl[i], period;
+            unsigned shift;
+            uint64_t next;
+            if (!(ctrl & 0x80u)) continue;          /* timer disabled      */
+            if (!p4u_tm_on[i]) { due = cycles; continue; }  /* latch the base */
+            if (!(ctrl & 0x40u)) continue;          /* no IRQ: raises nothing */
+            shift = (ctrl & 3u) == 0 ? 0u
+                  : ((ctrl & 3u) == 1 ? 6u
+                  : ((ctrl & 3u) == 2 ? 8u : 10u));
+            period = 0x10000u - tm_reload[i];
+            if (!period) period = 0x10000u;
+            next = p4u_tm_base[i]
+                 + (((uint64_t)(p4u_tm_ovf[i] + 1u) * (uint64_t)period) << shift);
+            if (next < due) due = next;
+        }
+    }
+
+    /* Phase-4Q reply / Phase-4X handshake / Phase-4R producer / Phase-4S
+     * completion: deliver at the modelled cycle; retry every dispatch only
+     * while the recv FIFO (16 words) leaves no room. */
+    if (nnk_ipc_reply_pend) {
+        if (arm9_recv_n >= 16u) due = cycles;
+        else if (nnk_ipc_reply_at < due) due = nnk_ipc_reply_at;
+    }
+    if (nnk_p4b_pend) {
+        if (arm9_recv_n >= 16u) due = cycles;
+        else if (nnk_p4b_at < due) due = nnk_p4b_at;
+    }
+    if (nnk_p4r_armed) {
+        for (i = 0; i < 3; i++)
+            if (nnk_p4r_stream[i].next < due) due = nnk_p4r_stream[i].next;
+        if (nnk_p4r_qn) {
+            if (arm9_recv_n >= 16u) due = cycles;
+            else if (nnk_p4r_q[0].at < due) due = nnk_p4r_q[0].at;
+            if (nnk_p4r_qn >= NNK_P4R_QMAX) due = cycles;  /* back-pressure */
+        }
+    }
+    if (nnk_p4s_n && nnk_p4s_at[0] < due) due = nnk_p4s_at[0];
+
+    /* Cart/DMA: a mode-5 channel only moves while the card engine has a word
+     * due (CPU halted: nnk_card_stall drains it in one call) or a word is
+     * already waiting; a still-armed mode 0/7 channel is a shim transfer that
+     * has not run yet.  Timed modes (1/2) ride the VCOUNT edge above. */
+    if ((romcnt & 0x80000000u) && nnk_dma_mode5_ch() >= 0) due = cycles;
+    for (i = 0; i < 4; i++) {
+        uint32_t cnt = dma_cnt[i];
+        uint32_t mode;
+        if (!(cnt & 0x80000000u)) continue;
+        mode = (cnt >> 27) & 7u;
+        if (mode == 0u || mode == 7u) due = cycles;
+        else if (mode == 5u && card_drq) due = cycles;
+    }
+
+    nnk_tick_due = due;
+}
+
+/* Phase-5BN: NNK_TICK_PROBE=1 -> how often the scheduled tick actually ran.
+ * Diagnostic only (no emulated state is touched); called from main()'s tail. */
+static void nnk_tick_report(void)
+{
+    if (getenv("NNK_TICK_PROBE"))
+        fprintf(stderr, "tick: %llu ticks for %llu cycles (%.1f%% of steps), "
+                "next due=%llu\n", nnk_tick_n, (unsigned long long)cycles,
+                cycles ? 100.0 * (double)nnk_tick_n / (double)cycles : 0.0,
+                (unsigned long long)nnk_tick_due);
 }
