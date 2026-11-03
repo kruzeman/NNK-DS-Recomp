@@ -468,6 +468,12 @@ def main():
     # carries every runtime static the effective prelude actually has.
     shutil.copyfile(os.path.join(here, "nnk_state.inc"),
                     os.path.join(outdir, "nnk_state.inc"))
+    # Phase-5BH: the pure container/format layer nnk_state.inc #includes (the
+    # header, region records, field directory, identity check and the tolerant
+    # field matching).  It has no machine dependency, so the same file is
+    # compiled by tools/nnks_selftest.c for the class test.
+    shutil.copyfile(os.path.join(here, "nnks_container.inc"),
+                    os.path.join(outdir, "nnks_container.inc"))
     # Phase-5AP: the ROM-derived `pc -> form` map (tools/gen_pcform.py).  It is
     # a build artifact under work/ and never committed, so the build names it
     # with NNK_PCFORM_MAP; without it an EMPTY map is written and the runtime

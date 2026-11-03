@@ -3960,3 +3960,307 @@ fn phase_5be_irq_spsr_uses_the_interworking_carrier() {
     assert!(rs.contains("nnk_smc_note_resume(*pc, spsr_bank[MODE_IRQ]);"),
             "the BIOS IRQ return must hand the resumed pc the SPSR state");
 }
+
+// ---------------------------------------------------------------------------
+// Phase-5BH: a savestate written by ANY earlier build must LOAD (best-effort,
+// with a per-region/per-field report) instead of being refused and silently
+// replaced by a cold boot.
+//
+// The defect (measured on master e395fb4, the operator's own F5 state):
+//     state: REFUSED ...: region 'io' is 68660 bytes, this build writes 85192
+//     state: boot from ... failed — replaying the boot
+// i.e. every rebuild invalidated every state (io = the concatenation of every
+// generated field row), and every later measurement was silently a 6-minute
+// cold boot while looking like "the state loaded but nothing happened".
+//
+// The class is pinned three ways:
+//   (1) the CONTAINER CODE THAT SHIPS (tools/nnks_container.inc, included by
+//       tools/nnk_state.inc) is compiled by tools/nnks_selftest.c and run:
+//       exact restore, partial restore across an INSERTED field, identity
+//       refusals, and "a partial restore is never a cold boot";
+//   (2) the operator's one-command classifier tools/nnks_inspect.py is run on
+//       synthetic v1/v2 files and must say EXACT / PARTIAL / INCOMPATIBLE;
+//   (3) the runtime's load policy (tolerant default, STRICT opt-in, loud
+//       PARTIAL/REFUSED banners) and the build wiring are asserted in source.
+// ---------------------------------------------------------------------------
+
+fn p5bh_crc32(b: &[u8]) -> u32 {
+    let mut c: u32 = 0xFFFF_FFFF;
+    for &x in b {
+        c ^= x as u32;
+        for _ in 0..8 {
+            c = (c >> 1) ^ (0xEDB8_8320 & (0u32.wrapping_sub(c & 1)));
+        }
+    }
+    !c
+}
+
+#[derive(Clone)]
+struct P5bhRegion {
+    id: u32,
+    version: u32,
+    name: &'static str,
+    /// (field name, field length) — the layout this file describes
+    fields: Vec<(&'static str, u32)>,
+    /// the stored bytes for the region
+    data: Vec<u8>,
+}
+
+impl P5bhRegion {
+    fn len(&self) -> u32 {
+        self.data.len() as u32
+    }
+}
+
+/// Write a synthetic NNKS state.  `ver` 2 writes the Phase-5BH region records
+/// {id,version,offset,length,crc,nfields} + the field directory; `ver` 1 writes
+/// the old {name,offset,length,crc} table with no directory.
+fn p5bh_write_state(path: &std::path::Path, ver: u32, regs: &[P5bhRegion],
+                    rom_hdr_crc: u32, bad_magic: bool, break_header: bool) {
+    let mut payload = Vec::new();
+    let mut table = Vec::new();
+    let mut dirs = Vec::new();
+    for r in regs {
+        let off = payload.len() as u64;
+        payload.extend_from_slice(&r.data);
+        if ver == 1 {
+            let mut name = [0u8; 16];
+            name[..r.name.len()].copy_from_slice(r.name.as_bytes());
+            table.extend_from_slice(&name);
+            table.extend_from_slice(&off.to_le_bytes());
+            table.extend_from_slice(&(r.len() as u64).to_le_bytes());
+            table.extend_from_slice(&p5bh_crc32(&r.data).to_le_bytes());
+            table.extend_from_slice(&0u32.to_le_bytes());
+        } else {
+            table.extend_from_slice(&r.id.to_le_bytes());
+            table.extend_from_slice(&r.version.to_le_bytes());
+            table.extend_from_slice(&off.to_le_bytes());
+            table.extend_from_slice(&(r.len() as u64).to_le_bytes());
+            table.extend_from_slice(&p5bh_crc32(&r.data).to_le_bytes());
+            table.extend_from_slice(&(r.fields.len() as u32).to_le_bytes());
+            let mut name = [0u8; 16];
+            name[..r.name.len()].copy_from_slice(r.name.as_bytes());
+            table.extend_from_slice(&name);
+            let mut foff = 0u32;
+            for (fname, flen) in &r.fields {
+                let mut fnm = [0u8; 24];
+                fnm[..fname.len()].copy_from_slice(fname.as_bytes());
+                dirs.extend_from_slice(&fnm);
+                dirs.extend_from_slice(&foff.to_le_bytes());
+                dirs.extend_from_slice(&flen.to_le_bytes());
+                foff += *flen;
+            }
+        }
+    }
+    let hsize = 72 + table.len() + if ver == 1 { 0 } else { dirs.len() };
+    let magic: &[u8; 4] = if bad_magic { b"XNKS" } else { b"NNKS" };
+    let mut h = Vec::new();
+    h.extend_from_slice(magic);
+    h.extend_from_slice(&ver.to_le_bytes());
+    h.extend_from_slice(&(hsize as u32).to_le_bytes());
+    h.extend_from_slice(&(regs.len() as u32).to_le_bytes());
+    h.extend_from_slice(&0x1234_5678u32.to_le_bytes());       // build_fp
+    h.extend_from_slice(&(if ver == 1 { 0u32 } else { 1u32 }).to_le_bytes()); // flags
+    h.extend_from_slice(&0x2000_0000u64.to_le_bytes());        // rom_size
+    h.extend_from_slice(&rom_hdr_crc.to_le_bytes());
+    h.extend_from_slice(&0xABCD_EF01u32.to_le_bytes());        // arm9_crc
+    h.extend_from_slice(&5000u64.to_le_bytes());               // record_step
+    h.extend_from_slice(&7u64.to_le_bytes());                  // record_frames
+    h.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+    h.extend_from_slice(&p5bh_crc32(&payload).to_le_bytes());
+    let mut hcrc = p5bh_crc32(&h);
+    if break_header {
+        hcrc ^= 0xFFFF_FFFF;
+    }
+    h.extend_from_slice(&hcrc.to_le_bytes());
+    assert_eq!(h.len(), 72, "the NNKS header is 72 bytes");
+    let mut file = h;
+    file.extend_from_slice(&table);
+    if ver != 1 {
+        file.extend_from_slice(&dirs);
+    }
+    file.extend_from_slice(&payload);
+    std::fs::write(path, file).expect("cannot write the synthetic state");
+}
+
+/// The runtime's layout dump (tools/nnk_state.inc: nnks_write_layout).
+fn p5bh_write_layout(path: &std::path::Path, regs: &[P5bhRegion], build: u32) {
+    let mut s = format!("NNKLAYOUT 2\nbuild 0x{build:08X}\nregions {}\n", regs.len());
+    for r in regs {
+        // a layout describes lengths, not bytes: the region length is the sum
+        // of its fields (the same rule the runtime uses in nnks_region_len)
+        let len: u32 = r.fields.iter().map(|(_n, l)| *l).sum();
+        s += &format!("region {} 0x{:08X} {} {} {}\n",
+                      r.id, r.version, len, r.fields.len(), r.name);
+        let mut off = 0u32;
+        for (fname, flen) in &r.fields {
+            s += &format!("field {fname} {off} {flen}\n");
+            off += *flen;
+        }
+    }
+    s += "end\n";
+    std::fs::write(path, s).expect("cannot write the synthetic layout");
+}
+
+fn p5bh_inspect(root: &std::path::Path, state: &std::path::Path,
+                layout: &std::path::Path) -> (i32, String) {
+    let out = std::process::Command::new("python3")
+        .arg(root.join("tools/nnks_inspect.py"))
+        .arg(state)
+        .arg(layout)
+        .output()
+        .expect("cannot run tools/nnks_inspect.py");
+    (out.status.code().unwrap_or(-1),
+     format!("{}{}", String::from_utf8_lossy(&out.stdout),
+             String::from_utf8_lossy(&out.stderr)))
+}
+
+#[test]
+fn phase_5bh_savestate_tolerates_an_older_region_layout() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let tmp = std::env::temp_dir().join(format!("nnk_p5bh_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).expect("cannot create the p5bh temp dir");
+
+    // ---- (1) the shipped container code, compiled and run ----
+    let src = root.join("tools/nnks_selftest.c");
+    assert!(src.is_file(), "missing tools/nnks_selftest.c");
+    let exe = tmp.join("nnks_selftest");
+    let build = std::process::Command::new("cc")
+        .arg("-O2").arg("-std=c11")
+        .arg(format!("-I{}", root.join("tools").display()))
+        .arg(&src).arg("-o").arg(&exe)
+        .output().expect("cannot run cc");
+    assert!(build.status.success(),
+            "cc cannot build tools/nnks_selftest.c (the shipped container): {}",
+            String::from_utf8_lossy(&build.stderr));
+    let run = std::process::Command::new(&exe).output().expect("cannot run the harness");
+    let txt = String::from_utf8_lossy(&run.stdout).into_owned();
+    assert!(run.status.success(), "the container harness failed:\n{txt}");
+    for want in [
+        "PARTIAL: three fields restored by name, one defaulted",
+        "PARTIAL: the defaulted field is named",
+        "PARTIAL: a, b and c hold the saved values across an insertion",
+        "PARTIAL: the new field keeps the build's default",
+        "PREFIX (v1 policy): an insertion shifts every later field (measured)",
+        "STRICT: an identical region is exact",
+        "STRICT: a resized region is NOT exact",
+        "identity: bad magic is refused",
+        "identity: a different ROM size is refused",
+        "identity: a different ROM header is refused",
+        "identity: a different ARM9 blob is refused",
+        "identity: a build/layout change is NOT a refusal",
+        "partial restore != cold boot (the machine really moved)",
+    ] {
+        assert!(txt.contains(want), "the container harness lost the check {want:?}:\n{txt}");
+    }
+
+    // ---- (2) the operator's classifier, on synthetic v1 and v2 files ----
+    let io = P5bhRegion {
+        id: 1,
+        version: 0x0A0A_0001,
+        name: "io",
+        fields: vec![("steps", 4), ("gxd_frames", 4)],
+        data: 11u32.to_le_bytes().into_iter()
+            .chain(7u32.to_le_bytes()).collect(),
+    };
+    let ram = P5bhRegion {
+        id: 9,
+        version: 0x0A0A_0009,
+        name: "ram",
+        fields: vec![("gmem", 8)],
+        data: vec![0xAAu8; 8],
+    };
+    let exact_state = tmp.join("exact.nnks");
+    p5bh_write_state(&exact_state, 2, &[io.clone(), ram.clone()], 0x77, false, false);
+
+    // The same file against the layout that wrote it: EXACT.
+    let layout_same = tmp.join("same.layout");
+    p5bh_write_layout(&layout_same, &[
+        P5bhRegion { id: 1, version: 0x0A0A_0001, name: "io",
+                     fields: vec![("steps", 4), ("gxd_frames", 4)], data: vec![] },
+        P5bhRegion { id: 9, version: 0x0A0A_0009, name: "ram",
+                     fields: vec![("gmem", 8)], data: vec![] },
+    ], 0x1234_5678);
+    let (rc, out) = p5bh_inspect(&root, &exact_state, &layout_same);
+    assert_eq!(rc, 0, "an exact state must classify EXACT (rc={rc}):\n{out}");
+    assert!(out.contains("verdict: EXACT"), "missing the EXACT verdict:\n{out}");
+
+    // A NEWER build (one extra io field) must see PARTIAL and be told which
+    // field it would default — never "refused", never a silent cold boot.
+    let layout_newer = tmp.join("newer.layout");
+    p5bh_write_layout(&layout_newer, &[
+        P5bhRegion { id: 1, version: 0x0A0A_0002, name: "io",
+                     fields: vec![("steps", 4), ("new_field", 4), ("gxd_frames", 4)],
+                     data: vec![] },
+        P5bhRegion { id: 9, version: 0x0A0A_0009, name: "ram",
+                     fields: vec![("gmem", 8)], data: vec![] },
+    ], 0x9999_9999);
+    let (rc, out) = p5bh_inspect(&root, &exact_state, &layout_newer);
+    assert_eq!(rc, 1, "a changed layout must classify PARTIAL (rc={rc}):\n{out}");
+    assert!(out.contains("verdict: PARTIAL"), "missing the PARTIAL verdict:\n{out}");
+    assert!(out.contains("new_field"),
+            "the classifier must NAME the field this build would default:\n{out}");
+    assert!(out.contains("note: the file was written by build 0x12345678"),
+            "the classifier must report the build difference:\n{out}");
+
+    // A v1 file (no field directory) against a newer build: still PARTIAL.
+    let v1_state = tmp.join("old.nnks");
+    p5bh_write_state(&v1_state, 1, &[
+        P5bhRegion { id: 1, version: 0, name: "io",
+                     fields: vec![("steps", 4), ("gxd_frames", 4)],
+                     data: 11u32.to_le_bytes().into_iter()
+                         .chain(7u32.to_le_bytes()).collect() },
+        P5bhRegion { id: 9, version: 0, name: "ram", fields: vec![("gmem", 8)],
+                     data: vec![0xAAu8; 8] },
+    ], 0x77, false, false);
+    let (rc, out) = p5bh_inspect(&root, &v1_state, &layout_newer);
+    assert_eq!(rc, 1, "a v1 file with a newer build must classify PARTIAL (rc={rc}):\n{out}");
+    assert!(out.contains("v1, matched by NAME"), "the v1 table must be read:\n{out}");
+    assert!(out.contains("DEFAULTED"), "the v1 field gap must be reported:\n{out}");
+
+    // Corrupt/incompatible: bad magic, and a header CRC that does not match.
+    let bad_magic = tmp.join("badmagic.nnks");
+    p5bh_write_state(&bad_magic, 2, &[io.clone(), ram.clone()], 0x77, true, false);
+    let (rc, out) = p5bh_inspect(&root, &bad_magic, &layout_same);
+    assert_eq!(rc, 2, "bad magic must be INCOMPATIBLE (rc={rc}):\n{out}");
+    assert!(out.contains("INCOMPATIBLE: bad magic"), "missing the magic refusal:\n{out}");
+    let bad_hdr = tmp.join("badhdr.nnks");
+    p5bh_write_state(&bad_hdr, 2, &[io.clone(), ram.clone()], 0x77, false, true);
+    let (rc, out) = p5bh_inspect(&root, &bad_hdr, &layout_same);
+    assert_eq!(rc, 2, "a corrupt header must be INCOMPATIBLE (rc={rc}):\n{out}");
+    assert!(out.contains("MISMATCH") && out.contains("INCOMPATIBLE"),
+            "the corrupt header must name the CRC and the verdict:\n{out}");
+
+    // ---- (3) the runtime load policy and the build wiring ----
+    let st = std::fs::read_to_string(root.join("tools/nnk_state.inc")).expect("nnk_state.inc");
+    assert!(st.contains("NNK_SAVESTATE_STRICT"), "the STRICT opt-in is gone");
+    assert!(st.contains("NNK_SAVESTATE_IGNORE_BUILD"),
+            "the legacy IGNORE_BUILD switch must be explained, not silently dropped");
+    assert!(st.contains("PARTIAL SAVESTATE"), "the partial banner is gone");
+    assert!(st.contains("the run REPLAYS THE COLD BOOT"),
+            "a refused boot state must still announce the cold-boot replay");
+    assert!(!st.contains("region '%s' is %llu bytes"),
+            "the old unconditional region-length refusal is back");
+    // region IDs are part of the file format: they must be in the table
+    for id in ["{ 1,  \"io\"", "{ 6,  \"moviestreams\"", "{ 11, \"dtcm\""] {
+        assert!(st.contains(id), "the region id table lost {id:?}");
+    }
+    let sd = std::fs::read_to_string(root.join("tools/split_dispatch.py")).expect("split_dispatch.py");
+    assert!(sd.contains("\"nnks_container.inc\""),
+            "split_dispatch must copy the container next to the split TU (nnk_state.inc includes it)");
+    let bs = std::fs::read_to_string(root.join("tools/build_split.sh")).expect("build_split.sh");
+    let hdr_line = bs.lines().find(|l| l.starts_with("HDR_HASH="))
+        .expect("build_split.sh has no HDR_HASH line");
+    assert!(hdr_line.contains("nnks_container.inc"),
+            "build_split.sh must hash the container, or editing it leaves a stale runtime object");
+    let cont = std::fs::read_to_string(root.join("tools/nnks_container.inc"))
+        .expect("nnks_container.inc");
+    assert!(cont.contains("#define NNKS_VERSION      2u") || cont.contains("#define NNKS_VERSION 2u")
+            || cont.contains("NNKS_VERSION      2u"),
+            "the container must write version 2");
+    assert!(cont.contains("NNKS_VERSION_MIN"),
+            "the container must still READ v1 files (the operator's reproducers)");
+    assert!(cont.contains("NNKS_ID_ROMSIZE") && cont.contains("NNKS_ID_ARM9"),
+            "the ROM identity must stay a refusal condition");
+}
