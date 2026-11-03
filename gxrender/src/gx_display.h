@@ -69,7 +69,8 @@ void gxd_close(Gxd *g);
  *   0x04000400-0x0400043F  GXFIFO (same as gxd_gx_fifo_write)
  *   0x04000440-0x040005CB  GX direct command ports (cmd = (addr&0x1FC)>>2,
  *                          melonDS GPU3D::Write32)
- *   0x04000600              GXSTAT (stack-reset side effect; value ignored)
+ *   0x04000600              GXSTAT (CPU-owned bits latched; FIFO flags and
+ *                          matrix stack pointers derived, see below)
  *   0x04000610              ZeroDotWLimit
  *   0x05000000-0x050007FF  palette RAM
  *   0x06000000-0x061FFFFF  VRAM window: engine A BG (routed per VRAMCNT)
@@ -87,8 +88,20 @@ void gxd_io_write(Gxd *g, uint32_t addr, uint32_t val, int width);
  *               10-15 read 0; bits 16-17 mirror the lid/debug mask bits)
  *   0x04000132  KEYCNT    (last written value)
  *   0x0400024E  VRAMSTAT  (bit0 = VRAM_C mapped to ARM7, bit1 = VRAM_D)
+ *   0x04000600..0x04000603  GXSTAT  (Phase-5BL: melonDS GPU3D::Read8/16/32
+ *               composition — CPU-owned bits, matrix stack pointers, the
+ *               command-FIFO level from this renderer's own decoder, bit 25
+ *               "less than half full", bit 26 "empty"; widths 1/2/4)
  * Everything else returns 0. */
 uint32_t gxd_io_read(Gxd *g, uint32_t addr, int width);
+
+/* Phase-5BL: melonDS GPU3D::CheckFIFOIRQ — nonzero when the GXFIFO IRQ line
+ * is asserted for the condition the guest selected in GXSTAT bits 30-31
+ * (1 = command FIFO less than half full, 2 = FIFO empty, 0 = off).  The
+ * caller mirrors this into IF bit 21 (IRQ_GXFIFO).  Level-sensitive: call it
+ * after every GXFIFO/GXSTAT write and after every IF acknowledge, as melonDS
+ * does. */
+int gxd_gxfifo_irq(const Gxd *g);
 
 /* ---- GX stream (also reachable via io_write; see above) ---- */
 

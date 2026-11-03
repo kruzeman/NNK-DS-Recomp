@@ -317,6 +317,30 @@ if [[ -f "$IMAGE" ]] && ! grep -q 'Phase-5BJ dsp-multiply splice applied' "$IMAG
   fi
 fi
 
+# Phase-5BL: the frozen image has no GXSTAT (0x04000600) read path, so the
+# guest's "wait until the GX command FIFO is less than half full" poll
+# (0x0200985C..6C) never ended and answering "Yes" at the skip prompt left both
+# screens black (Phase-5BK 3).  The canonical fix is nnktool/src/recompile.rs
+# plus the live register/FIFO model in gxrender/src/{gx_display.c,gx_fifo.c};
+# this transform applies the identical prelude change to the frozen image.  It
+# also installs gxd_gxfifo_irq()'s IF-bit-21 hook, which melonDS calls from
+# WriteToGXFIFO / the GXSTAT write / the IF acknowledge.  No-op when the marker
+# is already there; NNK_PRELUDE_DISABLE_SPLICE=5bl_gxstat is the negative
+# control.
+if [[ -f "$IMAGE" ]] && ! grep -q 'Phase-5BL GXSTAT splice applied' "$IMAGE"; then
+  if splice_disabled 5bl_gxstat; then
+    echo "== prelude splice DISABLED by NNK_PRELUDE_DISABLE_SPLICE: Phase-5BL GXSTAT (negative control) =="
+  else
+    SPLICED_IMAGE10="$(dirname "$SPLIT")/$(basename "$IMAGE" .c).p5bl.c"
+    mkdir -p "$(dirname "$SPLICED_IMAGE10")"
+    echo "== splice (Phase-5BL): GXSTAT read path + GXFIFO IRQ line -> $SPLICED_IMAGE10 =="
+    python3 tools/p5bl_gxstat_splice.py "$IMAGE" "$SPLICED_IMAGE10" || {
+      echo "phase-5bl: GXSTAT splice failed" >&2; exit 2; }
+    IMAGE=$SPLICED_IMAGE10
+    SPLICED_FEATURES+=(5bl_gxstat_read 5bl_gxfifo_irq_line)
+  fi
+fi
+
 if [[ "$GX" == "1" ]]; then
   [[ -f "$GXDIR/Makefile" ]] || { echo "NNK_GX=1 but $GXDIR/Makefile missing" >&2; exit 2; }
   echo "== gxrender: building libgxrender.a + gx_display.o + gx_gl.o =="

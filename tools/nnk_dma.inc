@@ -147,6 +147,13 @@ static void nnk_dma_copy(int i) {
                 word ? "word" : "half", dma_sad[i], dma_dad[i], last_pc);
         nnk_dma_shim_n++;
     }
+    /* Phase-5BL: melonDS DMA::End raises IRQ_DMA0+Num when Cnt bit30 is set
+     * ("IRQ on completion").  Without it the SDK's async-DMA queue never
+     * retires: the guest's queue flag at 0x02074EB4, set before a >256-byte
+     * GXFIFO submission, is cleared only by the completion callback the guest
+     * registers on this IRQ (Phase-5BK 5 measured 0 writes to it in 100 M
+     * steps and the submission path parked at 0x020363BC). */
+    if (cnt & (1u << 30)) iflags |= 1u << (8 + i);
     /* bit25 = repeat: keep the enable bit for timed modes, clear otherwise */
     dma_cnt[i] = (((cnt >> 27) & 7u) != 0u && (cnt & (1u << 25)))
                      ? cnt : (cnt & ~0x80000000u);
@@ -488,6 +495,17 @@ void nnk_dma_tick(void) {
         if (!(cnt & 0x80000000u)) continue;
         uint32_t mode = (cnt >> 27) & 7u;
         if (mode == 0u) { nnk_dma_copy(i); continue; }
+        /* Phase-5BL: mode 7 = "GXFIFO" (melonDS DMA::WriteCnt start mode 7,
+         * DMA::Start: IterCount = 112 entries per round, CheckFIFODMA chains
+         * the next round while CmdFIFO.Level() < 128).  The SDK's async
+         * submission path starts every >256-byte block this way through the
+         * ITCM helper 0x01FF845C with Cnt = 0xFC000000|(len>>2) (bit31 enable,
+         * bit30 IRQ on completion, bits 27-29 = 7, bit26 = 32-bit).  Our
+         * renderer consumes a GX command the moment its last parameter word
+         * arrives, so the FIFO never stalls the CPU: one round delivers the
+         * whole block, exactly as the hardware would once the geometry engine
+         * has drained it. */
+        if (mode == 7u) { nnk_dma_copy(i); continue; }
         /* Phase-4O: mode 5 = game card DRQ (ARM9 CNT bits 27-29; melonDS
          * CheckDMA -> CheckDMAs(0, 0x05)).  Phase-4N's mode-3 guess never
          * matched any measured arm and is replaced. */

@@ -903,6 +903,41 @@ static void gx_exec(Gx *gx, uint8_t cmd, uint32_t param)
     }
 }
 
+/* Phase-5BL: FIFO occupancy and GXSTAT bookkeeping, both derived from the
+ * decoder state above (never stored as a constant).  melonDS's GPU3D keeps
+ * these in GXStat/CmdFIFO; ours must follow OUR FIFO, otherwise a status read
+ * makes the guest's poll pass once and then lie. */
+uint32_t gx_fifo_level(const Gx *gx)
+{
+    uint32_t lvl = 0;
+    if (gx->num_commands > 0) lvl += (uint32_t)gx->num_commands;
+    if (gx->total_params > 0 && gx->param_count < gx->total_params) lvl += 1u;
+    return lvl;
+}
+
+static void gx_fifo_sync_gxstat(Gx *gx)
+{
+    uint32_t pend = 0, test = 0;
+    uint32_t lvl = gx_fifo_level(gx);
+    uint32_t c = gx->cur_command;
+    int i;
+
+    if (gx->total_params > 0 && gx->param_count < gx->total_params) {
+        uint8_t cmd = (uint8_t)(c & 0xFF);
+        if (cmd == 0x11 || cmd == 0x12) pend = 1;
+        if (cmd == 0x70 || cmd == 0x71 || cmd == 0x72) test = 1;
+    }
+    for (i = 0; i < gx->num_commands; i++) {
+        uint8_t cmd = (uint8_t)(c >> (8 * i));
+        if (cmd == 0x11 || cmd == 0x12) pend = 1;
+        if (cmd == 0x70 || cmd == 0x71 || cmd == 0x72) test = 1;
+    }
+    gx->gxstat = (gx->gxstat & ~0x08004001u)
+               | (lvl ? 0x08000000u : 0u)    /* bit27: commands still queued */
+               | (pend ? 0x00004000u : 0u)   /* bit14: push/pop pending */
+               | (test ? 0x00000001u : 0u);  /* bit0:  pos/vec test pending */
+}
+
 /* GXFIFO word state machine (mirrors melonDS GPU3D::WriteToGXFIFO):
  * a fresh word holds up to 4 packed command bytes; each command then
  * consumes its parameters from the following words. */
@@ -913,8 +948,10 @@ void gx_fifo_write(Gx *gx, uint32_t val)
         gx->cur_command = val;
         gx->param_count = 0;
         gx->total_params = gx_cmd_num_params[val & 0xFF];
-        if (gx->total_params > 0)
+        if (gx->total_params > 0) {
+            gx_fifo_sync_gxstat(gx);
             return;
+        }
     } else {
         gx->param_count++;
     }
@@ -936,6 +973,7 @@ void gx_fifo_write(Gx *gx, uint32_t val)
         if (gx->param_count < gx->total_params)
             break;
     }
+    gx_fifo_sync_gxstat(gx);
 }
 
 void gx_fifo_write_block(Gx *gx, const uint32_t *words, size_t n)
@@ -948,4 +986,5 @@ void gx_fifo_write_block(Gx *gx, const uint32_t *words, size_t n)
 void gx_cmd_entry(Gx *gx, uint8_t cmd, uint32_t param)
 {
     gx_exec(gx, cmd, param);
+    gx_fifo_sync_gxstat(gx);
 }
