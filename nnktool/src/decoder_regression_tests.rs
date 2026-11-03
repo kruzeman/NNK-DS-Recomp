@@ -3904,3 +3904,59 @@ fn phase_5bd_movie_binds_by_guest_identity_not_by_ordinal() {
     assert!(smc.contains("movie: trace codec=0x%08X guest-hdr@0x%08X nf=%d %dx%d payload=0x%08X"));
     assert!(smc.contains("path=%s frame=%ld/%ld ycrc=%08X"));
 }
+
+// ===========================================================================
+// Phase-5BE — the IRQ entry's SPSR T bit must come from the one-step CARRIER
+// before the compiled pc-form map, because an interworking branch target is a
+// NON-SEQUENTIAL successor: neither stride rule can classify it and the map
+// only knows the pcs the recovery rooted, so a live-decoded callee answers
+// "ARM" by default.
+//
+// Measured (work/repro_5bb/st3400.nnks, ROM-only, run to step 4,467,284,179):
+// the movie player's ARM `blx 0x02137C28` at 0x0207DD78 is LIVE-decoded and
+// stamps Thumb for 0x02137C28, an IRQ is taken at that target, the synthesised
+// SPSR was 0x2000001F (T=0), the guest's thread switcher saved that CPSR into
+// the thread context, and the exception return at 0x0200729C (`subs pc,lr,#4`)
+// resumed 0x02137C28 in ARM state.  Its Thumb prologue `push {r4,r5,r6,lr}` /
+// `sub sp,#16` (0x84B070B5 as ARM = a plain `ldr`) stored nothing and moved no
+// sp, so every nested call re-used sp=0x027E3B18, the epilogue
+// `pop {r4,r5,r6,pc}` at 0x02137CDE popped the wrong slots, returned to the
+// ov17 data word 0x02143158 and the ARM walk of that data reached 0x02143186
+// whose bytes 0x7F2C0001 decode as `svc #0x2C0001` — the "unimplemented SWI
+// 0x2C" is a decode of DATA, not a service call.
+#[test]
+fn phase_5be_irq_spsr_uses_the_interworking_carrier() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let smc = std::fs::read_to_string(root.join("../tools/nnk_smc.inc")).expect("nnk_smc.inc");
+
+    // 1. The witness order: the carrier answers first, the compiled map last.
+    let start = smc.find("static int nnk_state_of_next(uint32_t next, uint32_t prev)")
+        .expect("nnk_state_of_next is gone");
+    let body = &smc[start..];
+    let end = body.find("\n}").expect("function end");
+    let body = &body[..end];
+    let i_carrier = body.find("if (smc_carried_thumb(next, &st)) return st;")
+        .expect("the IRQ-entry state witness must consult the branch carrier (Phase-5BE)");
+    let i_stride = body.find("if (next == prev + 2u) return 1;").expect("stride rule");
+    let i_map = body.find("nnk_pc_is_thumb(next)").expect("compiled map fallback");
+    assert!(i_carrier < i_stride && i_stride < i_map,
+            "witness order must be carrier -> stride -> compiled map: {}", body);
+
+    // 2. The carrier is produced by the interworking branches that need it:
+    //    ARM `blx imm` (Thumb target, bit0 set), the live `bx/blx Rm`, and the
+    //    exception return (SPSR bit 5).
+    assert!(smc.contains("smc_branch_mode(*npc | 1u);"),
+            "ARM blx-immediate must still carry the Thumb target state");
+    assert!(smc.contains("smc_branch_mode((target & ~1u) | ((spsr >> 5) & 1u));"),
+            "the exception-return carrier must take the resumed state from SPSR bit 5");
+
+    // 3. The single consumer is still the IRQ entry, and it still asks this
+    //    function (not cpsr_ctl, which is deliberately state-free).
+    let rs = std::fs::read_to_string(root.join("../nnktool/src/recompile.rs"))
+        .or_else(|_| std::fs::read_to_string(root.join("src/recompile.rs")))
+        .expect("recompile.rs");
+    assert!(rs.contains("nnk_state_of_next(resume, last_pc)"),
+            "irq_enter must classify the interrupted pc with nnk_state_of_next");
+    assert!(rs.contains("nnk_smc_note_resume(*pc, spsr_bank[MODE_IRQ]);"),
+            "the BIOS IRQ return must hand the resumed pc the SPSR state");
+}

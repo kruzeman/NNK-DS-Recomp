@@ -257,6 +257,22 @@ static inline int nnk_pc_is_thumb(uint32_t pc) { (void)pc; return 0; }
  * The runtime resolves the state per dispatch and never stores it in
  * cpsr_ctl, so an exception entry has to ask the same witnesses the dispatch
  * uses, in the same order:
+ *   0. the one-step CARRIER (Phase-5BE): the branching instruction that landed
+ *      on this pc stamped its target's state (nnk_smc_note_branch /
+ *      smc_branch_mode / nnk_smc_note_exc_return).  A taken interworking
+ *      branch is a NON-SEQUENTIAL successor, so neither stride rule below can
+ *      classify it and the compiled map only knows the pcs the recovery
+ *      rooted — for a live-decoded callee it answers "ARM" by default.
+ *      Measured: ARM `blx 0x02137C28` at 0x0207DD78 (live-decoded, the movie
+ *      player's per-frame update) stamped Thumb for 0x02137C28; the IRQ taken
+ *      at the target synthesised SPSR 0x2000001F (T=0), the guest's thread
+ *      switcher saved that CPSR, and the exception return at 0x0200729C
+ *      resumed 0x02137C28 in ARM state — its Thumb `push {r4,r5,r6,lr}` /
+ *      `sub sp,#16` (0xB084B570) ran as an ARM `ldr`, so no frame was pushed,
+ *      every nested call re-used sp=0x027E3B18, the epilogue's
+ *      `pop {r4,r5,r6,pc}` at 0x02137CDE read the wrong slots and returned to
+ *      the ov17 data word 0x02143158 (walked as ARM to 0x02143186, whose
+ *      bytes 0x7F2C0001 decode as `svc #0x2C0001` — the fake SWI 0x2C).
  *   1. the stream stride: a 2-byte successor is Thumb, a 4-byte one is ARM
  *      (the rule Phase-5AO measured and tools/split_dispatch.py uses to build
  *      nnk_pc_is_thumb from the emitted fall-throughs);
@@ -265,6 +281,8 @@ static inline int nnk_pc_is_thumb(uint32_t pc) { (void)pc; return 0; }
  * Called once per IRQ, so the binary search in (2) costs nothing. */
 static int nnk_state_of_next(uint32_t next, uint32_t prev)
 {
+    int st;
+    if (smc_carried_thumb(next, &st)) return st;
     if (next == prev + 2u) return 1;
     if (next == prev + 4u) return 0;
     return nnk_pc_is_thumb(next) ? 1 : 0;
