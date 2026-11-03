@@ -525,6 +525,7 @@ def main():
         "static uint32_t nnk_vrc_read(uint32_t a, int width);\n"
         "static uint32_t nnk_vrc_stat(void);\n"
         "static void nnk_vrc_mem(uint32_t a);\n"
+        "static void nnk_aobj_note(uint32_t a, uint32_t v, int w);\n"
         "static void nnk_vrc_set_dispcnt(int n, uint32_t v);\n"
         "static void nnk_vrc_powcnt(uint32_t v);\n"
         "static void nnk_sh_write(uint32_t a, uint32_t v, int width);\n"
@@ -573,8 +574,58 @@ def main():
         prelude = inject(
             prelude,
             "    if (gxd && gxd_mem_io(a)) { gxd_io_write(gxd, a, v, %d); return; }" % _w,
-            "    if (gxd && gxd_mem_io(a)) { nnk_vrc_mem(a); gxd_io_write(gxd, a, v, %d); return; }" % _w,
+            "    if (gxd && gxd_mem_io(a)) { nnk_vrc_mem(a); nnk_aobj_note(a, v, %d); gxd_io_write(gxd, a, v, %d); return; }" % (_w, _w),
             "st%d window accounting" % (_w * 8))
+    # ---- Phase-5BF: ARM9 immediate-DMA model: transfer size + count width +
+    #      address control + a per-transfer log.  The pre-5BF image read the
+    #      ARM9 "32-bit transfer" bit as bit30 (that is the ARM7 layout; the
+    #      ARM9 field is bit26), the count as 15 bits (ARM9: 21) and advanced
+    #      src/dst with a fixed +step.  Measured at the "Skip the cutscene?"
+    #      prompt (see PHASE5BF.md §2): every DMA whose Cnt has bit26 set was
+    #      copied as 16-bit units, so each transfer wrote exactly HALF its
+    #      bytes and the tail of every block vanished — the missing 128-byte
+    #      groups of the AOBJ tile upload.  recompile.rs carries the same fix
+    #      for the next image regeneration.
+    _dma_old = any("uint32_t count = cnt & 0x7FFFu;" in l for l in prelude)
+    if _dma_old:
+        if any("uint32_t timing = (cnt >> 24) & 3u;" in l for l in prelude):
+            prelude = inject(prelude,
+                             "    uint32_t timing = (cnt >> 24) & 3u;",
+                             "    uint32_t timing = (cnt >> 27) & 7u;   /* Phase-4L: ARM9 StartMode = bits 27..29 */\n"
+                             "    if (!getenv(\"NNK_DMA_FIX\")) timing = (cnt >> 24) & 3u;   /* shipped 5BF behaviour, see PHASE5BF.md §5 */",
+                             "DMA start-timing field (ARM9: bits 27..29)")
+        prelude = inject(prelude,
+                         "    uint32_t count = cnt & 0x7FFFu; if (!count) count = 0x8000u;",
+                         "    uint32_t count = cnt & 0x001FFFFFu; if (!count) count = 0x00200000u;",
+                         "DMA count width (ARM9: 21 bits)")
+        prelude = inject(prelude,
+                         "    int words = (cnt & (1u << 30)) != 0u;",
+                         "    int words = (cnt & (1u << 26)) != 0u;   /* ARM9 bit26 = 32-bit units */\n"
+                         "    uint32_t sadir = (cnt >> 23) & 3u, dadir = (cnt >> 21) & 3u;\n"
+                         "    /* Phase-5BF: the per-melonDS model above is the CORRECT one, but\n"
+                         "     * enabling it by default diverges the boot (see PHASE5BF.md §5:\n"
+                         "     * the guest's VRAMCNT layout at frame 6182 changes and the\n"
+                         "     * prompt frame renders black), so it is OPT-IN until that\n"
+                         "     * regression is understood.  NNK_DMA_LEGACY_SIZE=1 keeps the\n"
+                         "     * shipped behaviour explicitly. */\n"
+                         "    if (!getenv(\"NNK_DMA_FIX\") || getenv(\"NNK_DMA_LEGACY_SIZE\")) {\n"
+                         "        words = (cnt & (1u << 30)) != 0u; sadir = 0; dadir = 0;\n"
+                         "    }",
+                         "DMA transfer-size bit (ARM9: bit26, not bit30)")
+        prelude = inject(prelude,
+                         "        s += step; d += step;",
+                         "        if (sadir == 1u) s -= step; else if (sadir != 2u) s += step;\n"
+                         "        if (dadir == 1u) d -= step; else if (dadir != 2u) d += step;",
+                         "DMA source/destination address control")
+        prelude = inject(prelude,
+                         '    fprintf(stderr, "io: DMA%d immediate count=%u words=%d\\n", i, count, words);',
+                         '    if (getenv("NNK_DMA_TRACE"))\n'
+                         '        fprintf(stderr, "io: DMA%d immediate cnt=0x%08X count=%u words=%d src=0x%08X dst=0x%08X\\n",\n'
+                         '                i, cnt, count, words, dma_sad[i], dma_dad[i]);',
+                         "immediate-DMA log (NNK_DMA_TRACE, with src/dst/cnt)")
+        sys.stderr.write("Phase-5BF: ARM9 immediate-DMA size/count/address-control "
+                         "fixed in the prelude (4 hooks)\n")
+
     # Phase-4M: the 2D register-block readback shadow.  Hooked at the io_*
     # ENTRY points (not the *_sw models) so the shadow always sees the guest's
     # exact address and width — the *_sw 8-bit path funnels through the
