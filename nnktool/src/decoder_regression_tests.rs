@@ -101,7 +101,12 @@ fn long_multiply_maps_rdlo_to_low_destination() {
             // rd = RdLo (low half), rn = RdHi (high half) — the codegen's
             // convention, see the comment block in decode.rs.
             Kind::Mul { kind, rd, rn, rm, ra, .. } => {
-                assert_eq!(*kind as u8, want as u8, "{} kind", name);
+                assert_eq!(
+                    std::mem::discriminant(kind),
+                    std::mem::discriminant(&want),
+                    "{} kind",
+                    name
+                );
                 // NEGATIVE guard: the old swap signature for this exact word.
                 assert_eq!((*rd, *rn), (1, 0), "{} destination order (rd=lo, rn=hi)", name);
                 assert_ne!(
@@ -4263,4 +4268,75 @@ fn phase_5bh_savestate_tolerates_an_older_region_layout() {
             "the container must still READ v1 files (the operator's reproducers)");
     assert!(cont.contains("NNKS_ID_ROMSIZE") && cont.contains("NNKS_ID_ARM9"),
             "the ROM identity must stay a refusal condition");
+}
+
+/// Phase-5BJ: ARMv5TE DSP multiplies.  `smulbb r1, r1, r5` is 0xE1610581, and
+/// the data-processing decoder reads exactly the same word as `cmn r1, r1, lsl
+/// #11` — bit 7 (set here, always clear in both shifted data-processing forms)
+/// is the only discriminator.  Before the fix every member of the family ran
+/// as a flag-only CMN, i.e. as a NO-OP on its destination; the guest's glyph
+/// blitter computes its 1-bpp source row stride with that multiply and got 1
+/// (the multiplicand) instead of 11, which cost the prompt text ~6/7 of its
+/// ink and shifted the survivors.  Encoding/operand pairs below were produced
+/// by `arm-none-eabi-as -march=armv5te` and checked against objdump.
+#[test]
+fn phase_5bj_dsp_halfword_multiplies_are_not_flag_only_cmn() {
+    let cases: [(u32, &str, Kind); 12] = [
+        (0xE161_0581, "smulbb r1, r1, r5", Kind::Mul { kind: MulKind::Smulxy { x: false, y: false }, s: false, rd: 1, rn: 0, rm: 1, ra: 5 }),
+        (0xE161_03C2, "smulbt r1, r2, r3", Kind::Mul { kind: MulKind::Smulxy { x: false, y: true }, s: false, rd: 1, rn: 0, rm: 2, ra: 3 }),
+        (0xE161_03A2, "smultb r1, r2, r3", Kind::Mul { kind: MulKind::Smulxy { x: true, y: false }, s: false, rd: 1, rn: 0, rm: 2, ra: 3 }),
+        (0xE161_03E2, "smultt r1, r2, r3", Kind::Mul { kind: MulKind::Smulxy { x: true, y: true }, s: false, rd: 1, rn: 0, rm: 2, ra: 3 }),
+        (0xE101_4382, "smlabb r1, r2, r3, r4", Kind::Mul { kind: MulKind::Smlaxy { x: false, y: false }, s: false, rd: 1, rn: 4, rm: 2, ra: 3 }),
+        (0xE101_43C2, "smlabt r1, r2, r3, r4", Kind::Mul { kind: MulKind::Smlaxy { x: false, y: true }, s: false, rd: 1, rn: 4, rm: 2, ra: 3 }),
+        (0xE101_43A2, "smlatb r1, r2, r3, r4", Kind::Mul { kind: MulKind::Smlaxy { x: true, y: false }, s: false, rd: 1, rn: 4, rm: 2, ra: 3 }),
+        (0xE101_43E2, "smlatt r1, r2, r3, r4", Kind::Mul { kind: MulKind::Smlaxy { x: true, y: true }, s: false, rd: 1, rn: 4, rm: 2, ra: 3 }),
+        (0xE121_03A2, "smulwb r1, r2, r3", Kind::Mul { kind: MulKind::Smulwx { y: false }, s: false, rd: 1, rn: 0, rm: 2, ra: 3 }),
+        (0xE121_03E2, "smulwt r1, r2, r3", Kind::Mul { kind: MulKind::Smulwx { y: true }, s: false, rd: 1, rn: 0, rm: 2, ra: 3 }),
+        (0xE121_4382, "smlawb r1, r2, r3, r4", Kind::Mul { kind: MulKind::Smlawx { y: false }, s: false, rd: 1, rn: 4, rm: 2, ra: 3 }),
+        (0xE121_43C2, "smlawt r1, r2, r3, r4", Kind::Mul { kind: MulKind::Smlawx { y: true }, s: false, rd: 1, rn: 4, rm: 2, ra: 3 }),
+    ];
+    for (w, text, want) in cases {
+        let insn = decode_arm(w, 0x0203_0784);
+        assert_eq!(insn.text, text, "0x{:08X} must decode as {}", w, text);
+        assert_eq!(
+            std::mem::discriminant(&insn.kind),
+            std::mem::discriminant(&want),
+            "0x{:08X} must not stay a data-processing instruction",
+            w
+        );
+    }
+
+    // 2. The emitter must multiply the two HALFWORDS (x/y select the top half
+    //    of Rm/Rs) and add the accumulator for the SMLA/SMLAW forms.
+    let insn = decode_arm(0xE161_0581, 0x0203_0784); // smulbb r1, r1, r5
+    let mut out = Vec::new();
+    let e = super::emit_insn(&insn, 0x0203_0784, false, false, String::new(), &mut out, true);
+    let body = body_of(&e);
+    assert!(body.contains("(int16_t)(r[1] >> 0) * (int32_t)(int16_t)(r[5] >> 0)"),
+            "smulbb must multiply the bottom halfwords: {}", body);
+    assert!(!body.contains("cmn"), "a DSP multiply must never emit a flag-only CMN: {}", body);
+
+    let insn = decode_arm(0xE101_43C2, 0x0205_69F0); // smlabt r1, r2, r3, r4
+    let mut out = Vec::new();
+    let e = super::emit_insn(&insn, 0x0205_69F0, false, false, String::new(), &mut out, true);
+    let body = body_of(&e);
+    assert!(body.contains("(int16_t)(r[2] >> 0)") && body.contains("(int16_t)(r[3] >> 16)"),
+            "smlabt takes Rm's bottom and Rs's TOP halfword: {}", body);
+    assert!(body.contains("+ (int32_t)r[4]"), "smlabt accumulates Rn: {}", body);
+
+    // 3. The runtime's live decoder (overlay pages, ITCM re-decodes) must carry
+    //    the same rule: bit 7 as the discriminator, bits 5/6 as the selector.
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let smc = std::fs::read_to_string(root.join("../tools/nnk_smc.inc")).unwrap();
+    assert!(smc.contains("0x0FF00090u) == 0x01600080u"),
+            "the live decoder must decode SMULxy/SMLAxy");
+    assert!(smc.contains("0x0FF000B0u) == 0x012000A0u"),
+            "the live decoder must decode SMULWx/SMLAWx");
+    assert!(smc.contains("(w & 0x20u) ? (uint32_t)a >> 16") && smc.contains("(w & 0x40u) ?"),
+            "the halfword selectors are bit5 (Rm/x) and bit6 (Rs/y)");
+
+    // 4. The frozen image is corrected by the splice for exactly this site.
+    let splice = std::fs::read_to_string(root.join("../tools/p5bj_dsp_mul_splice.py")).unwrap();
+    assert!(splice.contains("(0x02030784, \"smulbb\", \"r1, r1, r5\")"),
+            "the splice must re-emit the glyph blitter's row-stride multiply");
 }

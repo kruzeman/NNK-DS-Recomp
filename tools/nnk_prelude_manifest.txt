@@ -113,3 +113,4 @@ smc_store_note	required	smc_note	tools/nnk_smc.inc	Phase-5N/5P: store hook (watc
 # ---------------------------------------------------------------- obsolete
 5r_pred_probe	obsolete	static void pred_probe(uint32_t pc)	nnktool/src/recompile.rs	Phase-5R intra-predictor probe, removed from the tree (superseded by 5Q itcm_dump_at_pc)
 5s_dc_probe	obsolete	static void dc_probe(uint32_t pc)	nnktool/src/recompile.rs	Phase-5S DC-dequant probe, removed from the tree
+5bj_dsp_mul	required	Phase-5BJ dsp-multiply splice applied	tools/p5bj_dsp_mul_splice.py	Phase-5BJ: the frozen image carried no ARMv5TE DSP-multiply rule, so `smulbb r1, r1, r5` (0x02030784) ran as the flag-only CMN its encoding also spells; the glyph blitter's 1-bpp row stride stayed 1 instead of 11 and the prompt text lost ~6/7 of its ink at shifted positions.  tools/p5bj_dsp_mul_splice.py re-emits the 21 affected cases from the fixed recompiler.
