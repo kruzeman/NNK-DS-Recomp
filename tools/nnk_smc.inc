@@ -121,6 +121,25 @@ static int smc_force_state = -1;
  * ARM block.  smc_branch_mode() is called by the live decoders (live = 1);
  * nnk_smc_note_branch() is the compiled cases' entry point (live = 0). */
 static int smc_t_live;
+/* Phase-5BG diagnostic: NNK_CARRIER_TRACE=1 logs every carrier stamp and every
+ * consume attempt against the pc it is asked about, with the one-step
+ * staleness test spelled out, so "the branch promised Thumb but the dispatch
+ * ran ARM" can be attributed to a stamp that never happened, a stamp that was
+ * overwritten, or a staleness step that did not line up. */
+static int smc_ctrace = -1;
+static unsigned long long smc_ctrace_from;
+static uint32_t smc_ctrace_at;
+static void smc_ctrace_init(void)
+{
+    if (smc_ctrace < 0) {
+        const char *p = getenv("NNK_CARRIER_TRACE");
+        smc_ctrace = (p && p[0] == '1');
+        p = getenv("NNK_CARRIER_FROM");
+        if (p && p[0]) smc_ctrace_from = strtoull(p, NULL, 0);
+        p = getenv("NNK_CARRIER_AT_PC");
+        if (p && p[0]) smc_ctrace_at = (uint32_t)strtoul(p, NULL, 0);
+    }
+}
 static void smc_branch_mode(uint32_t raw_target) {
     smc_t_pc = raw_target & ~1u;
     smc_t_val = (int)(raw_target & 1u);
@@ -128,7 +147,20 @@ static void smc_branch_mode(uint32_t raw_target) {
     smc_t_live = 1;
 }
 static int smc_carried_thumb(uint32_t pc, int *state) {
-    if (smc_t_val < 0 || smc_t_pc != pc || steps != smc_t_step + 1ull) return 0;
+    smc_ctrace_init();
+    if (smc_t_val < 0 || smc_t_pc != pc || steps != smc_t_step + 1ull) {
+        if (smc_ctrace && (smc_t_pc == pc || smc_t_pc == (pc & ~1u)
+                           || pc == smc_ctrace_at))
+            fprintf(stderr, "carrier MISS step=%llu pc=0x%08X tpc=0x%08X tval=%d "
+                    "tstep=%llu (want %llu) live=%d\n",
+                    (unsigned long long)steps, pc, smc_t_pc, smc_t_val,
+                    (unsigned long long)smc_t_step,
+                    (unsigned long long)(smc_t_step + 1ull), smc_t_live);
+        return 0;
+    }
+    if (smc_ctrace)
+        fprintf(stderr, "carrier HIT  step=%llu pc=0x%08X thumb=%d live=%d\n",
+                (unsigned long long)steps, pc, smc_t_val, smc_t_live);
     *state = smc_t_val;
     return 1;
 }
@@ -235,6 +267,12 @@ void nnk_smc_note_resume(uint32_t target, uint32_t spsr) {
     smc_branch_mode((target & ~1u) | ((spsr >> 5) & 1u));
     smc_t_step = steps ? steps - 1ull : 0ull;
     smc_t_live = 1;
+    smc_ctrace_init();
+    if (smc_ctrace && steps >= smc_ctrace_from)
+        fprintf(stderr, "carrier STAMP (irq resume) step=%llu target=0x%08X "
+                "spsr=0x%08X thumb=%u -> tpc=0x%08X tval=%d tstep=%llu live=%d\n",
+                (unsigned long long)steps, target, spsr, (spsr >> 5) & 1u,
+                smc_t_pc, smc_t_val, (unsigned long long)smc_t_step, smc_t_live);
 }
 
 /* Emitted next to the dispatch image by tools/split_dispatch.py.  A mono
@@ -1192,6 +1230,11 @@ static int smc_exec_arm(uint32_t pc, uint32_t w, uint32_t *npc, uint32_t *costp)
         int32_t so = (int32_t)(bo << 6) >> 6;
         if (w & 0x01000000u) r[14] = pc + 4u;
         *npc = (pc + 8u + (uint32_t)so) & ~3u;
+        /* Phase-5BG: a taken ARM direct branch keeps the processor in ARM
+         * state (no interworking on ARMv5T), so it stamps the one-step carrier
+         * for its target exactly like the Thumb branches above.  Reachable only
+         * after the condition check, i.e. always taken. */
+        smc_branch_mode(*npc);
         *costp = 3;
         return 1;
     }
@@ -1602,6 +1645,25 @@ static int smc_exec_thumb(uint32_t pc, uint32_t *npc, uint32_t *costp) {
         if (smc_cond((unsigned)((hw >> 8) & 0xFu))) {  /* format 15: cond branch */
             int32_t bo = (int32_t)((hw & 0xFFu) << 1);
             *npc = pc + 4u + (uint32_t)((bo << 23) >> 23);
+            /* Phase-5BG: a TAKEN direct branch NAMES its target's state.  On
+             * ARMv5T a direct B/BL is not an interworking transfer — the
+             * target executes in the branch's own state — so the one-step
+             * carrier must be stamped here exactly like `blx rM`/`pop {..,pc}`
+             * do.  Without it the successor pc had NO witness at all when the
+             * branch is the last instruction before an IRQ: Phase-5BE's
+             * nnk_state_of_next() asks the carrier, then the 2/4-byte stride
+             * (impossible for a taken branch), then the compiled pc-form map
+             * (a hole for a live-decoded band, and its default is ARM).
+             * MEASURED (Phase-5BG): the Thumb loop 0x020D8402..0x020D841C in
+             * overlay 17 (no compiled case anywhere in 0x020D8402..0x020D841C)
+             * was interrupted exactly at the `blt.n 0x020D8402` back-edge;
+             * SPSR_irq was synthesised as 0x8000001F (T=0, ARM) and the BIOS
+             * return therefore resumed 0x020D8402 in ARM state.  The ARM
+             * reading of `lsls r3,r1,#2` etc. ran five 4-byte steps, corrupted
+             * r0 (0x508 instead of the object 0x0228F078) and reached
+             * 0x020DA118 `blx r3` with r3=[r1] loaded from that garbage —
+             * `untranslated pc=0xe3a02000`. */
+            smc_branch_mode(*npc | 1u);
             *costp = 3;
         }
         return 1;
@@ -1621,6 +1683,10 @@ static int smc_exec_thumb(uint32_t pc, uint32_t *npc, uint32_t *costp) {
          * derived live decoder was wrong. */
         int32_t bo = (int32_t)((hw & 0x7FFu) << 1);
         *npc = pc + 4u + (uint32_t)((bo << 20) >> 20);
+        /* Phase-5BG: the same witness as format 15 — a taken Thumb `b` runs
+         * its target in Thumb state, and nothing else says so for a
+         * live-decoded band that the compiled/RAM maps do not carry. */
+        smc_branch_mode(*npc | 1u);
         *costp = 3;
         return 1;
     }

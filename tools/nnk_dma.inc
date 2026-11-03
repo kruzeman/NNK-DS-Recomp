@@ -310,6 +310,65 @@ static void p4x_vblank_tick(void) {
     p4x_last_vc = vc;
 }
 
+/* Phase-5BG diagnostic — NNK_REGWATCH=<reg>[,<reg>...]
+ *
+ * The dispatch loop calls this once per instruction, with `r[]` holding the
+ * state AFTER the previous instruction and BEFORE the one at `pc`, and
+ * `last_pc` naming that previous instruction.  So a register that differs
+ * from the value latched at the previous call was written by `last_pc`, and
+ * the line names it: "prev=<pc of the writer>".  A callee-saved register
+ * that changes value across a call tree therefore names the exact
+ * instruction that clobbered it, without a full per-step register dump.
+ *
+ *   NNK_REGWATCH=4            watch r4
+ *   NNK_REGWATCH=4,13,14      watch several
+ *   NNK_REGWATCH_FROM=<step>  only report from this step on
+ */
+static int nnk_rw_state = -1;           /* -1 = not read yet, 0 = off, 1 = on */
+static int nnk_rw_reg[8];
+static int nnk_rw_n;
+static uint32_t nnk_rw_last[16];
+static unsigned long long nnk_rw_from;
+
+static void nnk_regwatch(uint32_t pc)
+{
+    int i;
+    if (nnk_rw_state < 0) {
+        const char *s = getenv("NNK_REGWATCH");
+        nnk_rw_state = 0;
+        if (s && s[0]) {
+            const char *q = s;
+            while (*q && nnk_rw_n < 8) {
+                int v;
+                while (*q == ' ' || *q == ',') q++;
+                if (!*q) break;
+                v = (int)strtol(q, (char **)&q, 0);
+                if (v >= 0 && v < 16) nnk_rw_reg[nnk_rw_n++] = v;
+            }
+            s = getenv("NNK_REGWATCH_FROM");
+            if (s && s[0]) nnk_rw_from = strtoull(s, NULL, 0);
+            for (i = 0; i < 16; i++) nnk_rw_last[i] = r[i];
+            if (nnk_rw_n) {
+                nnk_rw_state = 1;
+                fprintf(stderr, "regwatch: watching %d register(s) from step %llu\n",
+                        nnk_rw_n, nnk_rw_from);
+            }
+        }
+        if (!nnk_rw_state) return;
+    }
+    if (steps < nnk_rw_from) return;
+    for (i = 0; i < nnk_rw_n; i++) {
+        int k = nnk_rw_reg[i];
+        if (r[k] != nnk_rw_last[k]) {
+            fprintf(stderr, "regwatch step=%llu pc=0x%08X r%d 0x%08X -> 0x%08X "
+                    "writer=0x%08X\n",
+                    (unsigned long long)steps, pc, k, nnk_rw_last[k], r[k],
+                    last_pc);
+            nnk_rw_last[k] = r[k];
+        }
+    }
+}
+
 void nnk_dma_tick(void) {
     /* Phase-4X: VBlank IF raise (edge into vc==192) before the delivery check. */
     p4x_vblank_tick();

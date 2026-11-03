@@ -995,6 +995,9 @@ def main():
         # otherwise the mono default branch, verbatim in effect.
         fh.write("        {\n")
         fh.write("            int rc = 0;\n")
+        # Phase-5BG diagnostic: per-instruction register watch (tools/nnk_dma.inc
+        # nnk_regwatch).  Off unless NNK_REGWATCH names registers.
+        fh.write("            nnk_regwatch(pc);\n")
         fh.write("            /* Phase-4J: SMC — if a guest store changed the word this PC\n")
         fh.write("             * dispatches, the compiled case is from a stale image generation:\n")
         fh.write("             * re-decode it from live RAM and skip the band switch. */\n")
