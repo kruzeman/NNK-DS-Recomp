@@ -1774,6 +1774,10 @@ typedef struct {
     long frames, presents, shortr;
     FILE *fp;            /* yuv override mode */
     int  rom;            /* 1 = decode the .mods container from the card */
+    int  bound;          /* Phase-5BD: 1 = the source is the guest's container */
+    uint8_t hdr[NNK_MODS_IDENT]; /* the guest's own MODS header (identity) */
+    uint32_t hdr_at;     /* where that header copy lives in guest RAM */
+    char path[80];       /* bound container path ("" until bound) */
     NnkMobiDec dec;
     NnkMods    mods;
 } P5tStream;
@@ -1836,10 +1840,160 @@ static void p5t_init(void) {
             m2 ? P5T_ROM_SRC2 : "(missing)", n2, P5T_W, P5T_H);
 }
 
-/* Register a codec and open its frame source.  ROM mode: stream 1 decodes
- * op_u.mods (top screen), stream 2 op_d.mods (bottom); NNK_MOVIE_MODS /
- * NNK_MOVIE_MODS2 name other containers inside the card.  YUV mode keeps the
- * Phase-5AA behaviour (stream 1 = NNK_MOVIE_YUV, stream 2 = NNK_MOVIE_YUV2,
+/* ==========================================================================
+ * Phase-5BD — bind the stream to the container the GUEST opened.
+ *
+ * THE DEFECT (measured, Phase-5BC): `p5t_stream()` chose the container from the
+ * registration ORDER (`p5t_nstr == 1 ? op_d : op_u`).  The in-game cutscene
+ * registers its codec third, so the run logged
+ *     movie: stream 2 codec=0x022C9F38 source=rom:data/movie/op_u.mods frames=1317
+ * while the guest had opened `data/movie/s01.mods` (581 frames, the count its
+ * own player object carries at 0x022C9E50+0x0C).  Every presented frame came
+ * from the wrong film.
+ *
+ * THE IDENTITY: the MobiClip player object holds a verbatim copy of the
+ * container's 48-byte MODS header (`MODS`, `N3\n\0`, frames, width, height,
+ * payload words) at player+4 = codec-0xE4.  Measured in the 5BC cutscene state
+ * and in the melonDS reference: 458/256x192/0x36a8/0x12301c/1, which is
+ * data/movie/s01.mods byte for byte, and which no other container matches
+ * (op_u/op_d share frames and size but differ at header+0x20/+0x28/+0x2C).
+ * So the binding is by IDENTITY: the guest's own header is matched against
+ * every `.mods` the card image really contains under `data/movie/`, through
+ * the Nitro FNT (case-insensitive, the same 8.3 table the filesystem uses).
+ *
+ * The ordinal mapping survives only as a REPORTED fallback (a guest object
+ * with no header copy, or a header that matches two containers), and a miss is
+ * loud: no other movie is ever substituted silently.
+ * ======================================================================== */
+static int p5t_trace_on(void) {
+    const char *e = getenv("NNK_MOVIE_TRACE");
+    return (e && e[0]) ? 1 : 0;
+}
+
+/* Read guest main RAM directly (the decoder's inputs are plain buffers). */
+static int p5t_peek(uint32_t a, uint8_t *dst, uint32_t n) {
+    uint32_t o;
+    if ((a & 0xFF000000u) != GBASE) return 0;
+    o = a & 0x3FFFFFu;
+    if (o + n > GSIZE) return 0;
+    memcpy(dst, gmem + o, n);
+    return 1;
+}
+
+/* The guest's own container header, searched in the window below the codec
+ * struct (player = codec - 0xE8, header at player + 4; the window tolerates a
+ * layout shift, the header validation does not). */
+static int p5t_guest_hdr(uint32_t codec, uint8_t out[NNK_MODS_IDENT], uint32_t *where) {
+    uint32_t a;
+    for (a = codec - 0x140u; a + NNK_MODS_IDENT <= codec; a += 4u) {
+        uint8_t b[NNK_MODS_IDENT];
+        int nf, w, h;
+        if (!p5t_peek(a, b, NNK_MODS_IDENT)) continue;
+        if (memcmp(b, "MODS", 4) != 0) continue;
+        if (nnk_mobi_rd32(b + 4) != 0x000A334Eu) continue;   /* "N3\n\0" */
+        nf = (int)nnk_mobi_rd32(b + 8);
+        w  = (int)nnk_mobi_rd32(b + 12);
+        h  = (int)nnk_mobi_rd32(b + 16);
+        if (nf <= 0 || nf > 100000 || w <= 0 || h <= 0) continue;
+        if (w > 512 || h > 512 || (w & 15) || (h & 15)) continue;
+        memcpy(out, b, NNK_MODS_IDENT);
+        if (where) *where = a;
+        return 1;
+    }
+    return 0;
+}
+
+static void p5t_close(P5tStream *s) {
+    if (s->fp) { fclose(s->fp); s->fp = NULL; }
+    if (s->rom) { nnk_mobi_close(&s->dec); nnk_mods_free(&s->mods); s->rom = 0; }
+    s->bound = 0;
+    s->index = -1;
+    s->frames = 0;
+    s->path[0] = 0;
+}
+
+/* Open one container of the card image as this stream's source. */
+static int p5t_open(P5tStream *s, const char *path, const char *why) {
+    const uint8_t *img = NULL;
+    size_t ilen = 0;
+    int ord = (int)(s - p5t_str);
+    if (nnk_rom_file(rom, rom_len, path, &img, &ilen) < 0) {
+        fprintf(stderr, "hle: movie path '%s' not found in the card image (stream %d, %s)\n",
+                path, ord, why);
+        return 0;
+    }
+    if (nnk_mods_parse(&s->mods, img, ilen) < 0) {
+        fprintf(stderr, "movie: stream %d: %s is not a MODS container\n", ord, path);
+        return 0;
+    }
+    if (nnk_mobi_open(&s->dec, s->mods.width, s->mods.height) < 0) {
+        fprintf(stderr, "movie: stream %d: decoder init failed for %s\n", ord, path);
+        nnk_mods_free(&s->mods);
+        return 0;
+    }
+    s->rom = 1;
+    s->bound = 1;
+    s->index = -1;
+    s->frames = s->mods.nframes;
+    snprintf(s->path, sizeof s->path, "%s", path);
+    fprintf(stderr, "movie: stream %d codec=0x%08X source=rom:%s frames=%ld %dx%d via %s step=%llu\n",
+            ord, s->codec, path, s->frames, s->mods.width, s->mods.height, why,
+            (unsigned long long)steps);
+    return 1;
+}
+
+/* Resolve this stream's source.  Priority: an explicit NNK_MOVIE_MODS override
+ * (a reviewer's A/B knob), then the guest's own container identity, then — only
+ * when identity is unavailable or ambiguous — the reported ordinal fallback. */
+static int p5t_bind(P5tStream *s) {
+    int ord = (int)(s - p5t_str);
+    const char *ordp = (ord == 1) ? P5T_ROM_SRC2 : P5T_ROM_SRC1;
+    const char *env = (ord == 1) ? getenv("NNK_MOVIE_MODS2") : getenv("NNK_MOVIE_MODS");
+    uint8_t hdr[NNK_MODS_IDENT];
+    char path[96];
+    int nf = 0, nm;
+
+    if (env && env[0]) {
+        fprintf(stderr, "movie: stream %d: NNK_MOVIE_MODS* override -> %s (guest identity bypassed)\n",
+                ord, env);
+        /* Still record the guest's header, so the "guest container changed"
+         * check in p5t_present() cannot mistake the bypass for a new session
+         * and re-open the override container on every decode step. */
+        p5t_guest_hdr(s->codec, s->hdr, &s->hdr_at);  /* best effort only */
+        return p5t_open(s, env, "env override");
+    }
+    if (!p5t_guest_hdr(s->codec, hdr, &s->hdr_at)) {
+        fprintf(stderr, "movie: stream %d codec=0x%08X: NO guest MODS header in the player object"
+                        " — ORDINAL FALLBACK -> %s (this is a guess, not the guest's identity)\n",
+                ord, s->codec, ordp);
+        return p5t_open(s, ordp, "ordinal fallback");
+    }
+    memcpy(s->hdr, hdr, NNK_MODS_IDENT);
+    nm = nnk_rom_movie_match(rom, rom_len, hdr, path, sizeof path, &nf);
+    if (p5t_trace_on())
+        fprintf(stderr, "movie: trace codec=0x%08X guest-hdr@0x%08X nf=%d %dx%d payload=0x%08X"
+                        " crc=%08X -> %s\n",
+                s->codec, s->hdr_at, nf,
+                (int)nnk_mobi_rd32(hdr + 12), (int)nnk_mobi_rd32(hdr + 16),
+                nnk_mobi_rd32(hdr + 0x28), nnk_mobi_crc32(hdr, NNK_MODS_IDENT),
+                nm == 1 ? path : "(no unique container)");
+    if (nm == 1) return p5t_open(s, path, "guest header identity");
+    if (nm == 0) {
+        fprintf(stderr, "hle: movie path '<guest container frames=%d %dx%d hdr-crc=%08X>' not found"
+                        " under data/movie/ — NOT substituting another movie\n",
+                (int)nnk_mobi_rd32(hdr + 8), (int)nnk_mobi_rd32(hdr + 12),
+                (int)nnk_mobi_rd32(hdr + 16), nnk_mobi_crc32(hdr, NNK_MODS_IDENT));
+        return 0;
+    }
+    fprintf(stderr, "movie: stream %d codec=0x%08X: guest header matches %d containers — ambiguous;"
+                    " ORDINAL FALLBACK -> %s\n", ord, s->codec, nm, ordp);
+    return p5t_open(s, ordp, "ordinal fallback (ambiguous header)");
+}
+
+/* Register a codec.  The source is NOT chosen here: at registration time the
+ * guest may not have filled its player object yet, and choosing by order is the
+ * 5BC defect.  p5t_present() binds at the first decode step.  YUV mode keeps
+ * the Phase-5AA behaviour (stream 1 = NNK_MOVIE_YUV, stream 2 = NNK_MOVIE_YUV2,
  * falling back to stream 1's file). */
 static P5tStream *p5t_stream(uint32_t codec) {
     P5tStream *s;
@@ -1856,29 +2010,8 @@ static P5tStream *p5t_stream(uint32_t codec) {
     s->codec = codec;
     s->index = -1;
     if (p5t_state == 3) {
-        const uint8_t *img = NULL;
-        size_t ilen = 0;
-        const char *env = (p5t_nstr == 1) ? getenv("NNK_MOVIE_MODS2") : getenv("NNK_MOVIE_MODS");
-        const char *path = (env && env[0]) ? env
-                         : (p5t_nstr == 1) ? P5T_ROM_SRC2 : P5T_ROM_SRC1;
-        if (nnk_rom_file(rom, rom_len, path, &img, &ilen) < 0) {
-            fprintf(stderr, "movie: stream %d: %s not found in the card image\n", p5t_nstr, path);
-            return NULL;
-        }
-        if (nnk_mods_parse(&s->mods, img, ilen) < 0) {
-            fprintf(stderr, "movie: stream %d: %s is not a MODS container\n", p5t_nstr, path);
-            return NULL;
-        }
-        if (nnk_mobi_open(&s->dec, s->mods.width, s->mods.height) < 0) {
-            fprintf(stderr, "movie: stream %d: decoder init failed\n", p5t_nstr);
-            nnk_mods_free(&s->mods);
-            return NULL;
-        }
-        s->rom = 1;
-        s->frames = s->mods.nframes;
-        fprintf(stderr, "movie: stream %d codec=0x%08X source=rom:%s frames=%ld %dx%d step=%llu\n",
-                p5t_nstr, codec, path, s->frames, s->mods.width, s->mods.height,
-                (unsigned long long)steps);
+        fprintf(stderr, "movie: stream %d codec=0x%08X registered (source by guest identity) step=%llu\n",
+                p5t_nstr, codec, (unsigned long long)steps);
         p5t_nstr++;
         return s;
     }
@@ -1965,7 +2098,27 @@ static void p5t_present(void) {
     if (p5t_state < 2) return;
     for (i = 0; i < p5t_nstr; i++)
         if (p5t_str[i].codec == p5t_codec) s = &p5t_str[i];
-    if (!s || (!s->fp && !s->rom)) return;
+    if (!s) return;
+    /* Phase-5BD: bind at the first decode step — by now the guest's player
+     * object carries the container header it opened.  A same-object session
+     * change (a different MODS header) rebinds instead of continuing the old
+     * film, so stale ring slots can never belong to the previous movie. */
+    if (p5t_state == 3) {
+        if (!s->bound) {
+            if (!p5t_bind(s)) return;
+        } else {
+            uint8_t hdr[NNK_MODS_IDENT];
+            uint32_t at;
+            if (p5t_guest_hdr(p5t_codec, hdr, &at) && memcmp(hdr, s->hdr, NNK_MODS_IDENT) != 0) {
+                fprintf(stderr, "movie: stream %d codec=0x%08X: guest container changed"
+                                " (new session) — rebinding\n",
+                        (int)(s - p5t_str), p5t_codec);
+                p5t_close(s);
+                if (!p5t_bind(s)) return;
+            }
+        }
+    }
+    if (!s->fp && !s->rom) return;
     cur = ld32(p5t_codec);
     /* One source frame per decode step (measured: melonDS's ring holds
      * consecutive op_u/op_d frames 125..130 at f130).  The stream cursor
@@ -2012,6 +2165,10 @@ static void p5t_present(void) {
                         " cursor=0x%08X player=0x%08X slot0=0x%08X step=%llu\n",
                 (int)(s - p5t_str), p5t_codec, s->presents, s->index, cur,
                 player, ld32(p5t_codec + 0x0Cu), (unsigned long long)steps);
+    if (p5t_trace_on())
+        fprintf(stderr, "movie: trace present codec=0x%08X path=%s frame=%ld/%ld ycrc=%08X step=%llu\n",
+                s->codec, s->path[0] ? s->path : "(yuv)", s->index, s->frames,
+                nnk_mobi_crc32(p5t_buf, P5T_YSZ), (unsigned long long)steps);
     fflush(stderr);
 }
 

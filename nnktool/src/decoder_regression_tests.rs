@@ -3742,3 +3742,165 @@ fn phase_5az_a_direct_branch_inherits_the_predecessor_state() {
         "state inference order changed: register < stride < branch < sticky"
     );
 }
+
+// ===========================================================================
+// Phase-5BD, class: a movie stream is bound to the container the GUEST opened.
+//
+// Measured (Phase-5BC): the in-game cutscene opens data/movie/s01.mods (581
+// frames — the count its own player object carries), but p5t_stream() bound by
+// REGISTRATION ORDER (`p5t_nstr == 1 ? op_d : op_u`), so the third stream was
+// fed op_u.mods (1317 frames) and every presented frame came from the wrong
+// film.  The guest's player object embeds the first 48 bytes of the container's
+// MODS header (measured at 0x022C9E54 = codec-0xE4: "MODS","N3\n\0",581,
+// 256x192, payload words 0x36a8/0x12301c/1 == s01.mods byte for byte; the
+// 52-byte header's last word is the first frame-record length, which the object
+// overwrites with its codec pointer, hence IDENT = 48).  That header is the
+// identity the binding must use; the ordinal mapping survives only as a
+// REPORTED fallback and a miss must never be papered over with another movie.
+//
+// Negative guards pin the shape of the old behaviour: p5t_stream() may not
+// mention the ordinal container macros at all, every ordinal open must sit
+// behind a loud "ORDINAL FALLBACK" report, and p5t_present() must resolve the
+// source before it decodes (and rebind when the guest's header changes, so a
+// ring slot can never carry the previous film).
+#[derive(Debug, PartialEq)]
+enum P5bdBind {
+    Unique(&'static str),
+    Ambiguous(usize),
+    Missing,
+}
+
+/// Mirror of `nnk_rom_movie_match()` + `p5t_bind()`: match the guest's 48-byte
+/// header against the containers the card really has.  The rule has NO
+/// index/ordinal argument, so it cannot fall back to "the Nth registration".
+fn p5bd_bind_rule(cands: &[(&'static str, [u8; 48])], guest: &[u8; 48]) -> P5bdBind {
+    let hits: Vec<&'static str> = cands
+        .iter()
+        .filter(|(_, h)| h == guest)
+        .map(|(p, _)| *p)
+        .collect();
+    match hits.len() {
+        1 => P5bdBind::Unique(hits[0]),
+        0 => P5bdBind::Missing,
+        n => P5bdBind::Ambiguous(n),
+    }
+}
+
+fn p5bd_hdr(tag: u8) -> [u8; 48] {
+    let mut h = [0u8; 48];
+    h[0] = b'M';
+    h[1] = b'O';
+    h[2] = b'D';
+    h[3] = b'S';
+    h[4] = 0x4E; // "N3\n\0" version, little endian 0x000A334E
+    h[5] = 0x33;
+    h[6] = 0x0A;
+    h[7] = 0x00;
+    h[8] = 0x45; // frames 581 (s01) — real values are NOT used, `tag` is
+    h[9] = 0x02;
+    h[32] = tag; // the discriminating payload word (op_u/op_d differ at +0x20)
+    h
+}
+
+#[test]
+fn phase_5bd_movie_binds_by_guest_identity_not_by_ordinal() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let smc = std::fs::read_to_string(root.join("../tools/nnk_smc.inc")).expect("nnk_smc.inc");
+    let mobi =
+        std::fs::read_to_string(root.join("../tools/nnk_mobiclip.inc")).expect("nnk_mobiclip.inc");
+
+    // 1. The rule itself: unique header -> that container; identical headers ->
+    //    ambiguous (never "the first one"); unknown header -> missing (never a
+    //    substitute).  No argument of the rule can order the candidates.
+    let a = p5bd_hdr(0x70);
+    let b = p5bd_hdr(0xD4);
+    let cands = [("data/movie/op_u.mods", a), ("data/movie/op_d.mods", b)];
+    assert_eq!(p5bd_bind_rule(&cands, &a), P5bdBind::Unique("data/movie/op_u.mods"));
+    assert_eq!(p5bd_bind_rule(&cands, &b), P5bdBind::Unique("data/movie/op_d.mods"));
+    assert_eq!(p5bd_bind_rule(&cands, &p5bd_hdr(0x36)), P5bdBind::Missing);
+    let twins = [("data/movie/x.mods", a), ("data/movie/y.mods", a)];
+    assert_eq!(
+        p5bd_bind_rule(&twins, &a),
+        P5bdBind::Ambiguous(2),
+        "two containers with the same header must be reported as ambiguous, not silently picked"
+    );
+
+    // 2. The runtime rule: the source is chosen at BIND time from the guest's
+    //    own header through the Nitro FNT, and p5t_stream() no longer knows any
+    //    container name at all (the 5BC defect was exactly that mapping).
+    let stream_fn = &smc[smc.find("static P5tStream *p5t_stream(uint32_t codec)").expect("p5t_stream")
+        ..smc.find("static void p5t_note_codec").expect("p5t_note_codec")];
+    assert!(
+        !stream_fn.contains("P5T_ROM_SRC"),
+        "p5t_stream() must not bind a container by registration order (Phase-5BC defect)"
+    );
+    let bind_fn = &smc[smc.find("static int p5t_bind(P5tStream *s)").expect("p5t_bind")
+        ..smc.find("static P5tStream *p5t_stream").expect("p5t_stream")];
+    assert!(
+        bind_fn.contains("nnk_rom_movie_match(rom, rom_len, hdr, path, sizeof path, &nf)"),
+        "the binding must match the guest's header against the card's own containers"
+    );
+    assert!(
+        bind_fn.contains("if (nm == 1) return p5t_open(s, path, \"guest header identity\");"),
+        "a UNIQUE identity match must be what opens the container"
+    );
+    let i_unique = bind_fn.find("if (nm == 1)").expect("unique branch");
+    let i_ambig = bind_fn.find("— ambiguous;").expect("ambiguous branch");
+    assert!(
+        i_unique < i_ambig,
+        "identity must be resolved before the ambiguous-header fallback"
+    );
+    assert_eq!(
+        bind_fn.matches("ORDINAL FALLBACK").count(),
+        2,
+        "only two ordinal fallbacks are allowed: no guest header, or an ambiguous header"
+    );
+    assert_eq!(
+        bind_fn.matches("p5t_open(s, ordp,").count(),
+        2,
+        "every ordinal open must be one of the two reported fallbacks"
+    );
+    assert!(
+        bind_fn.contains("not found") && bind_fn.contains("NOT substituting another movie"),
+        "a header no container matches must be loud and must not substitute"
+    );
+    assert!(
+        bind_fn.contains("NNK_MOVIE_MODS* override"),
+        "the explicit NNK_MOVIE_MODS A/B override must announce that it bypasses identity"
+    );
+
+    // 3. The identity data: the player object's 48-byte header copy, validated
+    //    against the container version, enumerated through the Nitro FNT with
+    //    the same case-insensitive rules the filesystem uses.
+    assert!(mobi.contains("#define NNK_MODS_IDENT 48"), "identity is the 48-byte header prefix");
+    assert!(
+        mobi.contains("memcmp(rom + a, hdr, NNK_MODS_IDENT) != 0"),
+        "the comparison must be the 48-byte identity, not the 52-byte header \
+         (its last word is the player's codec pointer in guest memory)"
+    );
+    assert!(mobi.contains("nnk_fnt_dir_find(rom, fnt_off, fnt_size, \"data/movie\", &did)"));
+    assert!(mobi.contains("nnk_fnt_dir_at(rom, fnt_off, fnt_size, did, idx, name, sizeof name,"));
+    assert!(mobi.contains("nnk_mobi_ends_ieq(name, \".mods\")"));
+    assert!(
+        smc.contains("if (nnk_mobi_rd32(b + 4) != 0x000A334Eu) continue;"),
+        "the guest header copy is validated by the container version word"
+    );
+
+    // 4. Length is the bound container's: no padding from another file.
+    assert!(smc.contains("s->frames = s->mods.nframes;"));
+    assert!(smc.contains("if (s->index >= s->frames) {           /* past EOF: hold the last frame */"));
+
+    // 5. The present path resolves/rebinds before decoding, so a new film in the
+    //    same player object cannot inherit the previous ring slots.
+    let present_fn = &smc[smc.find("static void p5t_present(void)").expect("p5t_present")..];
+    let i_bind = present_fn.find("if (!p5t_bind(s)) return;").expect("bind before decode");
+    let i_decode = present_fn.find("nnk_mobi_frame(").expect("decode");
+    assert!(i_bind < i_decode, "binding must happen before the first frame decode");
+    assert!(present_fn.contains("if (p5t_guest_hdr(p5t_codec, hdr, &at) && memcmp(hdr, s->hdr, NNK_MODS_IDENT) != 0)"));
+    assert!(present_fn.contains("p5t_close(s);"), "a changed guest header must close the old source");
+
+    // 6. The diagnostic the card asks for: requested -> bound, frames, CRC.
+    assert!(smc.contains("getenv(\"NNK_MOVIE_TRACE\")"));
+    assert!(smc.contains("movie: trace codec=0x%08X guest-hdr@0x%08X nf=%d %dx%d payload=0x%08X"));
+    assert!(smc.contains("path=%s frame=%ld/%ld ycrc=%08X"));
+}

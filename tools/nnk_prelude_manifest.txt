@@ -97,6 +97,8 @@ smc_store_note	required	smc_note	tools/nnk_smc.inc	Phase-5N/5P: store hook (watc
 5aq_state_f5f9	required	nnk_state_ui_key	tools/nnk_input.inc	Phase-5AQ: F5 save / F9 load from the SDL event filter (host keys, never guest keys)
 5bb_irq_state	required	nnk_state_of_next(resume, last_pc)	tools/p5bb_irq_state_splice.py	Phase-5BB: SPSR_irq carries the interrupted instruction state (the T bit), so a Thumb thread restored by the guest scheduler resumes Thumb instead of executing its bytes as ARM and walking into the heap
 5bb_irq_resume	required	nnk_smc_note_resume(*pc, spsr_bank[MODE_IRQ])	tools/p5bb_irq_state_splice.py	Phase-5BB: the BIOS IRQ return resumes the interrupted pc in the state the SPSR names (the 5AZ predecessor rule would run Thumb bytes as ARM)
+5bd_movie_identity	required	nnk_rom_movie_match	tools/nnk_mobiclip.inc	Phase-5BD: the movie HLE binds a stream to the container the guest opened — the 48-byte MODS header copy in the guest's player object matched against data/movie/*.mods through the Nitro FNT, instead of the registration ordinal
+5bd_movie_bind	required	p5t_guest_hdr	tools/nnk_smc.inc	Phase-5BD: the stream source is resolved at the first decode step from the guest's own container identity; p5t_stream() no longer names a container, and the ordinal mapping is a loud, reported fallback only
 
 # --------------------------------------------------------------- divergent
 # Tree ahead of the frozen image, deliberately NOT enforced this phase: each
