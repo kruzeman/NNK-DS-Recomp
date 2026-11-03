@@ -2651,7 +2651,7 @@ static void io_do_dma(int i) {
                                               * 0x85000018 (immediate, 32-bit, fixed
                                               * source) as a timed transfer. */
     if (timing != 0u) return;                /* vblank/hblank: tools/nnk_dma.inc */
-    uint32_t count = cnt & 0x7FFFu; if (!count) count = 0x8000u;
+    uint32_t count = cnt & 0x001FFFFFu; if (!count) count = 0x00200000u;  /* ARM9: 21 bits */
     /* Phase-5BF (READ THIS BEFORE "FIXING" IT): the ARM9 transfer-size bit is
      * bit26 and the count field is 21 bits (melonDS DMA::Run9 / Start), so the
      * two lines below are WRONG — every 32-bit DMA is executed as a 16-bit
@@ -2665,7 +2665,7 @@ static void io_do_dma(int i) {
      * 81 82 89 91 00 85 00 00 00 and the prompt frame renders black
      * (PHASE5BF.md §5).  The corrected model is therefore kept OPT-IN in the
      * split splice (NNK_DMA_FIX=1) until the divergence is understood. */
-    int words = (cnt & (1u << 30)) != 0u;    /* bit30: word(1)/half(0) — approximate */
+    int words = (cnt & (1u << 26)) != 0u;    /* ARM9: bit26 = 32-bit units (bit30 is the ARM7 layout) */
     uint32_t s = dma_sad[i], d = dma_dad[i];
     uint32_t step = words ? 4u : 2u;
     for (uint32_t k = 0; k < count; k++) {

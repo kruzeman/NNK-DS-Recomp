@@ -46,3 +46,11 @@ worktrees/
 
 # Screenshots of guest content (operator review only — never committed)
 shots/
+
+# never commit emulator states or decoded media (game data)
+.worktrees/
+*.ml8
+*.mln
+*.mods
+*.yuv
+*.nnks

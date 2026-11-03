@@ -592,7 +592,7 @@ def main():
             prelude = inject(prelude,
                              "    uint32_t timing = (cnt >> 24) & 3u;",
                              "    uint32_t timing = (cnt >> 27) & 7u;   /* Phase-4L: ARM9 StartMode = bits 27..29 */\n"
-                             "    if (!getenv(\"NNK_DMA_FIX\")) timing = (cnt >> 24) & 3u;   /* shipped 5BF behaviour, see PHASE5BF.md §5 */",
+                             "    if (getenv(\"NNK_DMA_LEGACY_SIZE\")) timing = (cnt >> 24) & 3u;   /* legacy A/B only, see PHASE5BF.md §5 */",
                              "DMA start-timing field (ARM9: bits 27..29)")
         prelude = inject(prelude,
                          "    uint32_t count = cnt & 0x7FFFu; if (!count) count = 0x8000u;",
@@ -608,7 +608,7 @@ def main():
                          "     * prompt frame renders black), so it is OPT-IN until that\n"
                          "     * regression is understood.  NNK_DMA_LEGACY_SIZE=1 keeps the\n"
                          "     * shipped behaviour explicitly. */\n"
-                         "    if (!getenv(\"NNK_DMA_FIX\") || getenv(\"NNK_DMA_LEGACY_SIZE\")) {\n"
+                         "    if (getenv(\"NNK_DMA_LEGACY_SIZE\")) {\n"
                          "        words = (cnt & (1u << 30)) != 0u; sadir = 0; dadir = 0;\n"
                          "    }",
                          "DMA transfer-size bit (ARM9: bit26, not bit30)")
