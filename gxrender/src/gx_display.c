@@ -1960,6 +1960,9 @@ void gxd_advance(Gxd *g)
 
 void gxd_frame(Gxd *g)
 {
+    /* 0. Phase-5BU: report the polygon counters of the frame that just ended */
+    gx_dbg_pstat_dump();
+
     /* 1. frame model: SWAP_BUFFERS latch + retained-set swap */
     latch_unit(g);
 
