@@ -121,7 +121,7 @@ locals in both cases, exactly as before.)
 | gate | result |
 |---|---|
 | `cd nnktool && cargo test --release` | **65 passed, 0 failed** |
-| `SKIP_MELONDS=1 sh tools/verify_phase2a.sh` | see PHASE5BV_REVIEW notes — sections A-C reproduce (identical outputs to 5BU); the melonDS prefix comparison needs `SKIP_MELONDS=0` and its trace |
+| `SKIP_MELONDS=1 sh tools/verify_phase2a.sh` | **1000/1000** melonDS PCs on all three comparisons (strict prefix, window-filtered, in-order after resync), `rc=0` |
 | intro corr (top screen vs `work/p5t/op_u.yuv`) | f4200 → f27 **0.9978**, f4300 → f40 **0.9983** (≥ 0.99) |
 | prompt text, cold boot | frame 6400 dark band (x70..200, y88..104) **219 px** |
 | savestate 30 M → 32 M, `NNK_SAVESTATE_STRICT=1` | `fnv=0x10BE72AC crc=0xF7CEDCBE` **both** runs, `identity OK`; the 10 post-save frames byte-identical |
