@@ -1726,6 +1726,38 @@ static void dbg_gxlog(const Gxd *g)
     pp = g->gx.n_polys; pd = g->gx.n_polys_drawn; pv = g->gx.n_verts;
 }
 
+/* Phase-5BO: per-frame resolved 2D layer dump.  NNK_GX_2DINFO=<frame>[,<frame>]
+ * prints the engine/BG model (see gx2d_diag_dump) at the listed presented
+ * frames; "NNK_GX_2DINFO=3350" is the operator-save frame. */
+static void dbg_2dinfo(Gxd *g, const Gx2DState *st)
+{
+    static int parsed;
+    static long frames[8];
+    static int nframes;
+    const char *e;
+    int i;
+    if (!parsed)
+    {
+        parsed = 1;
+        e = getenv("NNK_GX_2DINFO");
+        if (e && e[0])
+        {
+            const char *p = e;
+            while (*p && nframes < 8)
+            {
+                frames[nframes++] = strtol(p, (char **)&p, 0);
+                if (*p == ',') p++;
+            }
+        }
+    }
+    for (i = 0; i < nframes; i++)
+        if ((long)g->frames == frames[i])
+        {
+            gx2d_diag_dump(st, g->frames);
+            return;
+        }
+}
+
 static void latch_unit(Gxd *g)
 {
     /* SWAP_BUFFERS latches the env and swaps the retained polygon set
@@ -1792,6 +1824,7 @@ void gxd_frame(Gxd *g)
         else
             fb = g->colorbuf;
         gx2d_render_frame(&st, fb, g->screen[0], g->screen[1]);
+        dbg_2dinfo(g, &st);
     }
 
     /* 5. present + input */

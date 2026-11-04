@@ -36,6 +36,13 @@ static inline uint16_t rd16(const uint8_t *p)
     return v;
 }
 
+/* Phase-5BO: per-engine, per-layer coverage counters for the NNK_GX_2DINFO
+ * diagnostic.  dbg_on is set once from the environment (never per pixel) so
+ * the render path is unchanged unless the diagnostic was requested. */
+static int dbg_on;
+static int dbg_eng;
+static unsigned long dbg_cov[2][6];   /* [0..3]=BG0..3, [4]=OBJ, [5]=3D */
+
 static inline uint32_t rd32(const uint8_t *p)
 {
     uint32_t v;
@@ -142,6 +149,7 @@ static void eng_init(Gx2DEng *en, const Gx2DState *st, int num)
     en->st = st;
     en->e = &st->eng[num];
     en->num = num;
+    dbg_eng = num;
     for (int m = 0; m < 16; m++)
         for (int x = 0; x < 256; x++)
             en->bgxmosaictable[m][x] = (uint8_t)(x % (m + 1));
@@ -286,6 +294,15 @@ static void draw_pixel(uint32_t *dst, uint16_t color, uint32_t flag)
     uint8_t r = (uint8_t)((color & 0x001F) << 1);
     uint8_t g = (uint8_t)(((color & 0x03E0) >> 4) | ((color & 0x8000) >> 15));
     uint8_t b = (uint8_t)((color & 0x7C00) >> 9);
+
+    if (dbg_on)
+    {
+        unsigned f = flag >> 24;
+        int s = 4;                       /* OBJ (sprite flags live below 24) */
+        if (f & 0x40u)      s = 5;       /* 3D layer */
+        else if (f & 0x0Fu) s = (f & 1) ? 0 : (f & 2) ? 1 : (f & 4) ? 2 : 3;
+        dbg_cov[dbg_eng][s]++;
+    }
 
     *(dst + 256) = *dst;
     *dst = (uint32_t)r | ((uint32_t)g << 8) | ((uint32_t)b << 16) | flag;
@@ -1748,9 +1765,108 @@ void gx2d_render_screen(const Gx2DState *st, int engine, const uint32_t *fb3d,
     free(line6);
 }
 
+/* ---- Phase-5BO: resolved-layer diagnostic --------------------------------
+ * gx2d_diag_dump() prints, for one presented frame, per engine and per BG:
+ * the enable bit, text/affine/bitmap mode, priority, the char/screen base the
+ * renderer computes, colour depth, size, the BGxCNT bit-13 extended-palette
+ * slot, the VRAM banks that back the engine's BG window (decoded from the
+ * VRAMCNT copy in the state) with the absolute LCDC addresses, the first
+ * tilemap words, the scroll registers and the pixels the layer actually wrote
+ * in this frame.  That separates the three cases that all look like a black
+ * field: the layer is not enabled, it is enabled but draws nothing (0 px), or
+ * it draws from the wrong bank (px > 0, wrong content).
+ * Armed by NNK_GX_2DINFO=<frame>[,<frame>...] in gx_display.c. */
+
+static void dbg_banks(const Gx2DState *st, int eng, char *out, int cap)
+{
+    int b, n = 0;
+    out[0] = 0;
+    for (b = 0; b < 9; b++)
+    {
+        uint8_t cnt = st->vramcnt[b];
+        int mst, hit = 0;
+        if (!(cnt & 0x80)) continue;
+        mst = cnt & 0x7;
+        if (eng == 0)
+            hit = (mst == 1);                 /* A/B/C/D/E/F/G -> engine A BG */
+        else if (b == 2)      hit = (mst == 4);   /* C/D MST 4: C=BBG, D=BOBJ */
+        else if (b == 7 || b == 8) hit = (mst == 1);   /* H/I MST 1 -> BBG */
+        if (hit && n < cap - 2) out[n++] = "ABCDEFGHI"[b];
+    }
+    out[n] = 0;
+}
+
+void gx2d_diag_dump(const Gx2DState *st, unsigned frame)
+{
+    int n, b;
+    for (n = 0; n < 2; n++)
+    {
+        const Gx2DEngine *e = &st->eng[n];
+        uint32_t dc = e->dispcnt;
+        int mode = n ? (int)((dc >> 16) & 1) : (int)((dc >> 16) & 3);
+        uint32_t wbase = n ? 0x06200000u : 0x06000000u;
+        char banks[16];
+        int screen = st->screen_swap ? n : 1 - n;   /* melonDS routing */
+        dbg_banks(st, n, banks, (int)sizeof banks);
+        fprintf(stderr,
+                "2dinfo frame=%u engine=%c -> screen%d(%s) DISPCNT=0x%08x mode=%d "
+                "bg_en=0x%02x obj_en=%d win0=%d win1=%d objwin=%d extpal_bit30=%d "
+                "bgwin_abs=0x%08x bgwin_banks=%s\n",
+                frame, n ? 'B' : 'A', screen, screen ? "bottom" : "top",
+                dc, mode, (unsigned)((dc >> 8) & 0x1F), (int)((dc >> 12) & 1),
+                (int)((dc >> 13) & 1), (int)((dc >> 14) & 1), (int)((dc >> 15) & 1),
+                (int)((dc >> 30) & 1), wbase,
+                banks[0] ? banks : "-");
+        for (b = 0; b < 4; b++)
+        {
+            uint16_t cnt = e->bgcnt[b];
+            int en = (int)((dc >> (8 + b)) & 1);
+            int aff = 0, bmp = 0, extpal_on;
+            uint32_t tilebase = 0, mapbase;
+            int depth = (cnt & 0x80) ? 256 : 16;
+            int extpal = (dc >> 30) & 1;
+            int slot = ((b < 2) && (cnt & 0x2000)) ? 2 + b : b;
+            if (mode == 1 && b == 3) aff = 1;
+            if (mode == 2 && b >= 2) aff = 1;
+            if (mode >= 3) bmp = 1;
+            mapbase = n ? (uint32_t)((cnt & 0x1F00) << 3)
+                        : (uint32_t)(((dc & 0x38000000) >> 11) + ((cnt & 0x1F00) << 3));
+            if (!bmp)
+                tilebase = n ? (uint32_t)((cnt & 0x003C) << 12)
+                             : (uint32_t)(((dc & 0x07000000) >> 8) + ((cnt & 0x003C) << 12));
+            extpal_on = extpal && !bmp;
+            fprintf(stderr,
+                    "2dinfo   BG%d en=%d %s prio=%d char=0x%05x screen=0x%05x depth=%d "
+                    "size=%dx%d extpal_bit13=%d extpal_slot=%d -> char@0x%08x map@0x%08x "
+                    "scroll=%d,%d map[0..3]=%04x %04x %04x %04x px=%lu\n",
+                    b, en, bmp ? "bitmap" : aff ? "affine" : "text",
+                    (int)(cnt & 3), tilebase, mapbase, bmp ? 0 : depth,
+                    (cnt & (1 << 14)) ? 512 : 256, (cnt & (1 << 15)) ? 512 : 256,
+                    (int)((cnt >> 13) & 1), extpal_on ? slot : -1,
+                    wbase + tilebase, wbase + mapbase,
+                    e->bgxpos[b], e->bgypos[b],
+                    rd16(st->bgvram[n] + ((mapbase) & (n ? 0x1FFFF : 0x7FFFF))),
+                    rd16(st->bgvram[n] + ((mapbase + 2) & (n ? 0x1FFFF : 0x7FFFF))),
+                    rd16(st->bgvram[n] + ((mapbase + 4) & (n ? 0x1FFFF : 0x7FFFF))),
+                    rd16(st->bgvram[n] + ((mapbase + 6) & (n ? 0x1FFFF : 0x7FFFF))),
+                    dbg_cov[n][b]);
+        }
+        fprintf(stderr, "2dinfo   OBJ px=%lu  3D-layer px=%lu\n",
+                dbg_cov[n][4], dbg_cov[n][5]);
+    }
+}
+
 void gx2d_render_frame(const Gx2DState *st, const uint32_t *fb3d,
                        uint32_t *out0, uint32_t *out1)
 {
+    static int dbg_init;
+    if (!dbg_init)
+    {
+        dbg_init = 1;
+        dbg_on = getenv("NNK_GX_2DINFO") != NULL;
+    }
+    if (dbg_on) memset(dbg_cov, 0, sizeof dbg_cov);
+
     if (!st->screens_enabled)
     {
         for (int i = 0; i < 256 * 192; i++)
