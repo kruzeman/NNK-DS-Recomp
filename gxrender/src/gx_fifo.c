@@ -2,6 +2,8 @@
  * Command semantics follow melonDS src/GPU3D.cpp (see GX_COVERAGE.md for the
  * implemented/stubbed command table).  All arithmetic is integer.
  */
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "gx_fifo.h"
 
@@ -183,6 +185,11 @@ static void calculate_lighting(Gx *gx)
 /* vertex / polygon submission                                        */
 
 static void submit_polygon(Gx *gx);
+
+/* Phase-5BO diagnostic: count of polygons printed by NNK_GX_CLIPDBG (static:
+ * it must not enter struct Gx, whose size is hashed into the savestate
+ * layout fingerprint). */
+static unsigned dbg_clip_n;
 
 static void submit_vertex(Gx *gx)
 {
@@ -488,6 +495,27 @@ static void submit_polygon(Gx *gx)
 
     for (i = 0; i < nv; i++)
         clipped[i] = v[i];
+    {
+        static unsigned dbg_zero3 = 0, dbg_seen = 0;
+        const char *e = getenv("NNK_GX_CLIPDBG");
+        if (e && e[0]) {
+            int k, zero3 = 1;
+            for (k = 0; k < 12; k++) if (gx->clip_mat[k]) { zero3 = 0; break; }
+            dbg_seen++;
+            if (zero3) dbg_zero3++;
+            if (dbg_seen % 200 == 1) {
+                fprintf(stderr, "clipdbg seen=%u zero3x3=%u nv=%d v0=(%d,%d,%d) w=%d "
+                                "m=%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d attr=%08x\n",
+                        dbg_seen, dbg_zero3, nv,
+                        v[0].clip[0], v[0].clip[1], v[0].clip[2], v[0].clip[3],
+                        gx->clip_mat[0], gx->clip_mat[1], gx->clip_mat[2], gx->clip_mat[3],
+                        gx->clip_mat[4], gx->clip_mat[5], gx->clip_mat[6], gx->clip_mat[7],
+                        gx->clip_mat[8], gx->clip_mat[9], gx->clip_mat[10], gx->clip_mat[11],
+                        gx->clip_mat[12], gx->clip_mat[13], gx->clip_mat[14], gx->clip_mat[15],
+                        gx->cur_polygon_attr);
+            }
+        }
+    }
     n = clip_polygon(gx, clipped, nv, temp);
     if (n < 3) {
         gx->n_drop_clip++;
