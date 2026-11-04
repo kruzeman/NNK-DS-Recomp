@@ -2873,6 +2873,25 @@ static uint32_t io_read32(uint32_t a) {
     if (vrc_in(a)) return vrc_read(a, 4);
     if (a == 0x0400024Eu) return vrc_stat();
     if ((a & ~3u) == 0x04000304u) return powerctl & 0xFFFFu;
+    /* Phase-5BV: GX matrix readback (melonDS GPU3D::Read32 0x04000640 and
+     * 0x04000680).  The SDK's GX_GetPosMatrix leaf 0x02003360 busy-checks
+     * GXSTAT and then copies the sixteen words at 0x04000640 into the caller's
+     * buffer (its vector twin 0x02003390 copies twelve words at 0x04000680);
+     * the hardware answers with its CURRENT matrix, i.e. ClipMatrix =
+     * ProjMatrix * PosMatrix.  io_read32 had no case for either window, so the
+     * copy produced zeros, every node matrix rebuilt from the hardware was
+     * zero (0x02009C64 copies the clip matrix into 0x020735B0 + node*100), and
+     * the guest then sent MTX_LOAD_4x3 with nine zero basis words (Phase-5BU:
+     * pcs 0x02035808/0x0203581C under the copy leaf 0x02005CB0), collapsing
+     * those strips' clip to the projection's translation column -- the blue
+     * band.  melonDS has no Read8/Read16 case for this window and answers 0,
+     * hence the 32-bit-only condition. */
+    if (a >= 0x04000640u && a < 0x040006A4u && (a & 3u) == 0u) {
+#ifdef NNK_GX
+        if (gxd) return gxd_io_read(gxd, a, 4);
+#endif
+        return 0;
+    }
     switch (a) {
     case 0x04000130: case 0x04000132: return io_read16(a);
     case 0x04000000: return dispcnt;

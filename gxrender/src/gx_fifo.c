@@ -104,6 +104,37 @@ static void update_clip_matrix(Gx *gx)
     gx_mat_mult4x4(gx->clip_mat, gx->pos);
 }
 
+/* Phase-5BV: GX matrix readback (melonDS GPU3D::Read32).  Address layout and
+ * element selection are copied from melonDS src/GPU3D.cpp:
+ *
+ *   0x04000640..0x0400067F   UpdateClipMatrix(); ClipMatrix[(addr & 0x3C) >> 2]
+ *   0x04000680..0x040006A0   VecMatrix[0,1,2,4,5,6,8,9,10] per word
+ *
+ * i.e. the position readback is the COMBINED projection*position matrix (GBATEK
+ * "Current Matrix"), and the vector readback exposes the 3x3 of the 4x4 with
+ * the fourth column skipped.  melonDS's Read8/Read16 return 0 for these
+ * addresses (no case in GPU3D::Read8/Read16), so callers should only consult
+ * this for 32-bit reads. */
+uint32_t gx_matrix_read32(Gx *gx, uint32_t addr)
+{
+    if (addr >= 0x04000640u && addr < 0x04000680u) {
+        update_clip_matrix(gx);
+        return (uint32_t)gx->clip_mat[(addr & 0x3Cu) >> 2];
+    }
+    switch (addr) {
+    case 0x04000680: return (uint32_t)gx->vec[0];
+    case 0x04000684: return (uint32_t)gx->vec[1];
+    case 0x04000688: return (uint32_t)gx->vec[2];
+    case 0x0400068C: return (uint32_t)gx->vec[4];
+    case 0x04000690: return (uint32_t)gx->vec[5];
+    case 0x04000694: return (uint32_t)gx->vec[6];
+    case 0x04000698: return (uint32_t)gx->vec[8];
+    case 0x0400069C: return (uint32_t)gx->vec[9];
+    case 0x040006A0: return (uint32_t)gx->vec[10];
+    }
+    return 0;
+}
+
 /* ------------------------------------------------------------------ */
 /* lighting (melonDS GPU3D::CalculateLighting arithmetic)              */
 
