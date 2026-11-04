@@ -23,6 +23,11 @@
 #include <string.h>
 #include "gx_raster.h"
 
+/* Phase-5BR: cumulative color-buffer stores and the last polygon's count.
+ * Plain globals (not Gxd state) so the savestate layout is untouched. */
+unsigned long long gx_ras_pixels_total;
+unsigned long long gx_ras_last_pixels;
+
 void gx_surface_clear(GxSurface *sf, uint32_t color6, uint32_t depth,
                       uint32_t attr0)
 {
@@ -577,6 +582,7 @@ static void plot_translucent(uint32_t *pcolor, uint32_t *pdepth,
         pdepth[pixeladdr] = (uint32_t)z;
 
     pcolor[pixeladdr] = color;
+    gx_ras_pixels_total++;
     if (pattr)
         pattr[pixeladdr] = attr;
 }
@@ -851,6 +857,7 @@ static void render_polygon_scanline(GxSurface *sf, GxRPoly *rp, int32_t y,
             gx_tr_log("opq1", x, y, layer2 + 1, color, attr, z);
             pdepth[pixeladdr] = (uint32_t)z;
             pcolor[pixeladdr] = color;
+            gx_ras_pixels_total++;
             if (pattr)
                 pattr[pixeladdr] = attr;
         } else {
@@ -936,6 +943,7 @@ static void render_polygon_scanline(GxSurface *sf, GxRPoly *rp, int32_t y,
             gx_tr_log("opq2", x, y, layer2 + 1, color, attr, z);
             pdepth[pixeladdr] = (uint32_t)z;
             pcolor[pixeladdr] = color;
+            gx_ras_pixels_total++;
             if (pattr)
                 pattr[pixeladdr] = attr;
         } else {
@@ -1026,6 +1034,7 @@ static void render_polygon_scanline(GxSurface *sf, GxRPoly *rp, int32_t y,
             gx_tr_log("opq3", x, y, layer2 + 1, color, attr, z);
             pdepth[pixeladdr] = (uint32_t)z;
             pcolor[pixeladdr] = color;
+            gx_ras_pixels_total++;
             if (pattr)
                 pattr[pixeladdr] = attr;
         } else {
@@ -1049,10 +1058,12 @@ void gx_raster_polygon(GxSurface *sf, const GxPolygon *poly,
 {
     GxRPoly rp;
     int32_t y;
+    unsigned long long px0 = gx_ras_pixels_total;
 
     setup_polygon(&rp, poly);
     if (rp.ytop == rp.ybot) {
         render_polygon_scanline(sf, &rp, rp.ytop, env);
+        gx_ras_last_pixels = gx_ras_pixels_total - px0;
         return;
     }
     for (y = rp.ytop; y < rp.ybot; y++) {
@@ -1060,6 +1071,7 @@ void gx_raster_polygon(GxSurface *sf, const GxPolygon *poly,
         rp.XL = slope_step(&rp.slope_l);
         rp.XR = slope_step(&rp.slope_r);
     }
+    gx_ras_last_pixels = gx_ras_pixels_total - px0;
 }
 
 /* ---- span parameter recorder for GPU backends (see gx_raster.h) ----

@@ -146,4 +146,13 @@ uint32_t gx_fog_density(const uint8_t density[34], uint32_t fog_offset,
 /* Binary PPM (P6) dump of the surface; 6-bit channels expanded to 8-bit. */
 int gx_write_ppm(const char *path, const GxSurface *sf);
 
+/* Phase-5BR per-polygon pixel accounting (diagnostic only, no behaviour):
+ * number of color-buffer stores performed since start-up, and the number
+ * performed by the last gx_raster_polygon() call.  Lets a caller separate
+ * "the polygon was submitted to the rasteriser and clipped away" from
+ * "the polygon was submitted and wrote pixels" and from "the polygon was
+ * submitted, produced spans, but every pixel failed depth/alpha". */
+extern unsigned long long gx_ras_pixels_total;
+extern unsigned long long gx_ras_last_pixels;
+
 #endif /* GX_RASTER_H */
