@@ -107,6 +107,13 @@ int gxd_gxfifo_irq(const Gxd *g);
 
 /* One raw GXFIFO word (up to 4 packed command bytes + parameter words). */
 void gxd_gx_fifo_write(Gxd *g, uint32_t word);
+/* Phase-5BQ: stamp the producing guest pc (runtime `last_pc`) so the FIFO
+ * producer ring can name the store that fed each word.  Called from the
+ * prelude's io_write32/16/8 right before gxd_io_write; a no-op cost of one
+ * store when the diagnostic is off. */
+void gxd_note_pc(uint32_t pc);
+/* Dump the last up-to-64 (pc, word) producer entries. */
+void gxd_fifo_prod_dump(void);
 /* One direct command-port entry (cmd + one parameter). */
 void gxd_gx_cmd(Gxd *g, uint8_t cmd, uint32_t param);
 
