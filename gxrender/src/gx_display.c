@@ -1002,13 +1002,22 @@ int gxd_gxfifo_irq(const Gxd *g)
     }
 }
 
+static unsigned long dbg_fifo_widths[4];
 static void gfx_write(Gxd *g, uint32_t addr, uint32_t val, int width)
 {
     if (addr >= 0x04000400 && addr < 0x04000440) {
+        dbg_fifo_widths[width & 3]++;
+        if (width != 4 && dbg_fifo_widths[width & 3] < 12)
+            fprintf(stderr, "gxdbg: FIFO write width=%d addr=%08x val=%08x\n",
+                    width, addr, val);
         gxd_gx_fifo_write(g, val);
         return;
     }
     if (addr >= 0x04000440 && addr < 0x040005CC) {
+        dbg_fifo_widths[width & 3]++;
+        if (width != 4 && dbg_fifo_widths[width & 3] < 12)
+            fprintf(stderr, "gxdbg: CMD write width=%d addr=%08x val=%08x\n",
+                    width, addr, val);
         gxd_gx_cmd(g, (uint8_t)((addr & 0x1FC) >> 2), val);
         return;
     }
@@ -1699,6 +1708,21 @@ static void dbg_fb3d(const Gxd *g)
             g->latched.disp_cnt, g->latched.clear_attr1, g->latched.clear_attr2,
             g->latched.fog_color, (int)g->latched.fog_offset,
             (int)g->latched.alpha_ref_val, g->latched.zero_dot_w);
+    fprintf(stderr,
+            "gx: fifo-write widths w1=%lu w2=%lu w4=%lu zeromult_skipped=%u\n",
+            dbg_fifo_widths[1], dbg_fifo_widths[2], dbg_fifo_widths[0],
+            gx_dbg_zero_mult());
+    {
+        int c, first = 1;
+        fprintf(stderr, "gx: unknown-cmd histogram:");
+        for (c = 0; c < 256; c++) {
+            int n = gx_dbg_unknown_hist((unsigned)c);
+            if (!n) continue;
+            fprintf(stderr, "%s %02x=%d", first ? "" : ",", c, n);
+            first = 0;
+        }
+        fprintf(stderr, "\n");
+    }
 }
 
 /* Phase-5BO: per-frame GX submission log (diagnostic, static counters only --
