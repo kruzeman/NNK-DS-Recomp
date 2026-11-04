@@ -212,6 +212,31 @@ unsigned gx_dbg_zero_mult(void) { return dbg_zero_mult; }
  * layout fingerprint). */
 static unsigned dbg_clip_n;
 
+/* Phase-5BT diagnostic: frame tag for the NNK_GX_VD clip-space dump.  Kept
+ * file-static so struct Gx (whose size is hashed into the savestate layout
+ * fingerprint) does not change. */
+static unsigned dbg_frame;
+void gx_dbg_frame_set(unsigned f) { dbg_frame = f; }
+
+/* Phase-5BT: NNK_GX_VD=<frame>[:<frame>] clip/vertex diagnostic state. */
+static int vd_on = -1;
+static unsigned long vd_lo, vd_hi;
+static int vd_cur;
+
+static void vd_check(void)
+{
+    if (vd_on < 0) {
+        const char *e = getenv("NNK_GX_VD");
+        vd_on = (e && e[0]) ? 1 : 0;
+        if (vd_on) {
+            char *end;
+            vd_lo = strtoul(e, &end, 0);
+            vd_hi = (*end == ':') ? strtoul(end + 1, NULL, 0) : vd_lo;
+        }
+    }
+    vd_cur = vd_on && dbg_frame >= vd_lo && dbg_frame <= vd_hi;
+}
+
 static void submit_vertex(Gx *gx)
 {
     GxClipVertex *v;
@@ -222,10 +247,25 @@ static void submit_vertex(Gx *gx)
     m = gx->clip_mat;
     v = &gx->temp_vtx[gx->vtx_in_poly];
 
+    /* Phase-5BT: model-space vertex stream (NNK_GX_VD) — shows whether a strip
+     * mixes vertices from different models or is a smooth run. */
+    vd_check();
+    if (vd_cur)
+        fprintf(stderr, "gxv f=%u mode=%d slot=%d vtx=(%d,%d,%d) "
+                        "col=%u,%u,%u st=%d,%d\n",
+                dbg_frame, gx->polygon_mode, gx->vtx_in_poly,
+                gx->cur_vtx[0], gx->cur_vtx[1], gx->cur_vtx[2],
+                gx->vtx_color[0], gx->vtx_color[1], gx->vtx_color[2],
+                gx->cur_s, gx->cur_t);
+
     v->clip[0] = (int32_t)((p[0] * m[0] + p[1] * m[4] + p[2] * m[8] + (int64_t)GX_FX_ONE * m[12]) >> 12);
     v->clip[1] = (int32_t)((p[0] * m[1] + p[1] * m[5] + p[2] * m[9] + (int64_t)GX_FX_ONE * m[13]) >> 12);
     v->clip[2] = (int32_t)((p[0] * m[2] + p[1] * m[6] + p[2] * m[10] + (int64_t)GX_FX_ONE * m[14]) >> 12);
     v->clip[3] = (int32_t)((p[0] * m[3] + p[1] * m[7] + p[2] * m[11] + (int64_t)GX_FX_ONE * m[15]) >> 12);
+
+    if (vd_cur)
+        fprintf(stderr, "gxv f=%u clip=(%d,%d,%d|w=%d)\n",
+                dbg_frame, v->clip[0], v->clip[1], v->clip[2], v->clip[3]);
 
     v->col20[0] = (uint32_t)gx->vtx_color[0] << 12 | 0xFFF;
     v->col20[1] = (uint32_t)gx->vtx_color[1] << 12 | 0xFFF;
@@ -583,6 +623,47 @@ static void submit_polygon(Gx *gx)
 
     for (i = 0; i < n; i++)
         fill_ras_vertex(gx, &clipped[i], &rv[i], wsize);
+
+    /* Phase-5BT diagnostic (NNK_GX_VD=<frame>[:<frame>]): per-polygon clip-space
+     * dump.  Shows the RAW clip coordinates the guest's matrices produced, the
+     * post-clip coordinates and the final screen vertices, so a polygon that
+     * reaches the rasteriser with a vertex outside |x|>w is visible as such.
+     * Off the savestate layout: file-static, not in struct Gx. */
+    {
+        vd_check();
+        if (vd_cur) {
+            static unsigned vd_first;
+            if (vd_first != dbg_frame) {
+                int k;
+                vd_first = dbg_frame;
+                fprintf(stderr, "gxvdframe f=%u proj:", dbg_frame);
+                for (k = 0; k < 16; k++) fprintf(stderr, " %d", gx->proj[k]);
+                fprintf(stderr, "\ngxvdframe f=%u pos :", dbg_frame);
+                for (k = 0; k < 16; k++) fprintf(stderr, " %d", gx->pos[k]);
+                fprintf(stderr, "\ngxvdframe f=%u clip:", dbg_frame);
+                for (k = 0; k < 16; k++) fprintf(stderr, " %d", gx->clip_mat[k]);
+                fprintf(stderr, "\n");
+            }
+            fprintf(stderr, "gxvd f=%u attr=%08x tex=%08x pal=%08x wbuf=%d "
+                            "nv=%d->%d wsize=%d vp=%d,%d,%d,%d\n",
+                    dbg_frame, gx->cur_polygon_attr, gx->tex_param,
+                    gx->tex_palette, gx->wbuffer, nv, n, wsize,
+                    gx->vp_x0, gx->vp_y0, gx->vp_w, gx->vp_h);
+            for (i = 0; i < nv; i++)
+                fprintf(stderr, "  raw%d=(%d,%d,%d|w=%d) col=%u,%u,%u st=%d,%d\n",
+                        i, v[i].clip[0], v[i].clip[1], v[i].clip[2], v[i].clip[3],
+                        v[i].col20[0] >> 12, v[i].col20[1] >> 12,
+                        v[i].col20[2] >> 12, v[i].s, v[i].t);
+            for (i = 0; i < n; i++)
+                fprintf(stderr, "  clp%d=(%d,%d,%d|w=%d)\n",
+                        i, clipped[i].clip[0], clipped[i].clip[1],
+                        clipped[i].clip[2], clipped[i].clip[3]);
+            for (i = 0; i < n; i++)
+                fprintf(stderr, "  scr%d=(%d,%d|z=%d,w=%d|c=%d,%d,%d|st=%d,%d)\n",
+                        i, rv[i].sx, rv[i].sy, rv[i].depth, rv[i].wnorm,
+                        rv[i].cr, rv[i].cg, rv[i].cb, rv[i].s, rv[i].t);
+        }
+    }
 
     /* zero-dot W check (melonDS GPU3D.cpp:1357-1390): a polygon whose
      * vertices all land on the same screen pixel is rejected when every W
