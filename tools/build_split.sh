@@ -341,6 +341,32 @@ if [[ -f "$IMAGE" ]] && ! grep -q 'Phase-5BL GXSTAT splice applied' "$IMAGE"; th
   fi
 fi
 
+# Phase-5BQ: the frozen image's DIV unit keeps only the LOW word of the 64-bit
+# quotient/remainder and has no 0x040002A4 / 0x040002AC read path at all.  The
+# SDK's 1.19.12 Vec3 normalise (0x02002604) divides 2^56 by |v|^2 and
+# multiplies the SQRT result by the FULL 64-bit quotient, so with the high word
+# read as 0 every normalised basis vector came out zero -- measured: the camera
+# basis builder 0x0200172C wrote an all-zero 3x3 into the staging matrix at
+# 0x02071F94 and the guest submitted MTX_MULT_4x3 with twelve zero operands
+# once per object.  This transform applies the canonical prelude change from
+# nnktool/src/recompile.rs to the frozen image, and installs the Phase-5BQ
+# producer-pc tag (gxd_note_pc(last_pc)) on the guest store path.
+# No-op when the marker is already there; NNK_PRELUDE_DISABLE_SPLICE=5bq_div64
+# is the negative control.
+if [[ -f "$IMAGE" ]] && ! grep -q 'Phase-5BQ DIV64 splice applied' "$IMAGE"; then
+  if splice_disabled 5bq_div64; then
+    echo "== prelude splice DISABLED by NNK_PRELUDE_DISABLE_SPLICE: Phase-5BQ DIV64 (negative control) =="
+  else
+    SPLICED_IMAGE11="$(dirname "$SPLIT")/$(basename "$IMAGE" .c).p5bq.c"
+    mkdir -p "$(dirname "$SPLICED_IMAGE11")"
+    echo "== splice (Phase-5BQ): 64-bit DIV result + FIFO producer tag -> $SPLICED_IMAGE11 =="
+    python3 tools/p5bq_runtime_splice.py "$IMAGE" "$SPLICED_IMAGE11" || {
+      echo "phase-5bq: DIV64 splice failed" >&2; exit 2; }
+    IMAGE=$SPLICED_IMAGE11
+    SPLICED_FEATURES+=(5bq_div64_result 5bq_fifo_producer_pc)
+  fi
+fi
+
 if [[ "$GX" == "1" ]]; then
   [[ -f "$GXDIR/Makefile" ]] || { echo "NNK_GX=1 but $GXDIR/Makefile missing" >&2; exit 2; }
   echo "== gxrender: building libgxrender.a + gx_display.o + gx_gl.o =="

@@ -1855,6 +1855,8 @@ static void nnk_display_close(void) {
     gxd = NULL;
 }
 #else
+/* no display bridge: the Phase-5BQ FIFO producer tag has nowhere to go */
+#define gxd_note_pc(pc) ((void)0)
 #define nnk_display_tick() 0
 #define nnk_display_open() 0
 #define nnk_display_close() ((void)0)
@@ -2022,6 +2024,18 @@ static uint32_t exmemcnt = 0xE880u, powerctl = 0; static uint8_t postflg = 1;
  * GBA-slot open-bus decay derived from bits 3..2 matches at every read. */
 static uint32_t div_num_lo = 0, div_num_hi = 0, div_den_lo = 0, div_den_hi = 0;
 static uint32_t div_ctrl = 0, div_quot = 0, div_rem = 0;
+/* Phase-5BQ: the DS divider produces a FULL 64-bit signed quotient and
+ * remainder.  melonDS NDS::DivDone writes `*(s64*)&DivQuotient[0]` and
+ * `*(s64*)&DivRemainder[0]`, and Read32 exposes DivQuotient[1] at
+ * 0x040002A4 and DivRemainder[1] at 0x040002AC (NDS.cpp:3117-3120,
+ * 3339-3342).  The runtime only kept the low words, so every guest that
+ * builds a 64-bit fixed-point reciprocal out of the DIV unit -- exactly the
+ * SDK's Vec3 1.19.12 normalise at 0x02002604, which computes
+ * 2^56/|v|^2 and multiplies by the SQRT result -- silently lost the high
+ * half.  Measured on the operator save: the camera basis builder
+ * 0x0200172C then produced an all-zero 3x3, and the projection 4x3 handed to
+ * the GX FIFO was twelve zero words. */
+static uint32_t div_quot_hi = 0, div_rem_hi = 0;
 static uint32_t sqrt_in_lo = 0, sqrt_in_hi = 0, sqrt_ctrl = 0, sqrt_res = 0;
 static uint32_t vramcnt[9]; static uint32_t wramcnt_map = 0;
 
@@ -2125,11 +2139,22 @@ static void io_div_do(void) {
     uint32_t mode = div_ctrl & 3u;
     int64_t num, den; int64_t q, rm;
     if (mode == 0) { num = (int32_t)div_num_lo; den = (int32_t)div_den_lo; }
-    else if (mode == 1) { num = (int64_t)(((uint64_t)div_num_hi << 32) | div_num_lo); den = (int32_t)div_den_lo; }
+    else if (mode == 1 || mode == 3) { num = (int64_t)(((uint64_t)div_num_hi << 32) | div_num_lo); den = (int32_t)div_den_lo; }
     else { num = (int64_t)(((uint64_t)div_num_hi << 32) | div_num_lo); den = (int64_t)(((uint64_t)div_den_hi << 32) | div_den_lo); }
-    if (den == 0) { div_ctrl |= 0x4000u; div_quot = 0; div_rem = 0; return; }
-    q = num / den; rm = num % den;
-    div_quot = (uint32_t)q; div_rem = (uint32_t)rm;
+    div_ctrl &= ~0x4000u;
+    if (den == 0) {
+        /* melonDS NDS::DivDone: divide-by-zero answers quotient 1/-1 by the
+         * numerator's sign and remainder = numerator, then sets bit14. */
+        q = (num < 0) ? 1 : -1;
+        rm = num;
+        div_ctrl |= 0x4000u;
+    } else if ((uint64_t)num == 0x8000000000000000ull && den == -1) {
+        q = (int64_t)0x8000000000000000ull; rm = 0;
+    } else {
+        q = num / den; rm = num % den;
+    }
+    div_quot = (uint32_t)(uint64_t)q; div_quot_hi = (uint32_t)((uint64_t)q >> 32);
+    div_rem  = (uint32_t)(uint64_t)rm; div_rem_hi = (uint32_t)((uint64_t)rm >> 32);
     div_ctrl |= 0x8000u;   /* busy then immediately clear (approximation) */
     div_ctrl &= ~0x8000u;
 }
@@ -2602,7 +2627,9 @@ static inline void st32(uint32_t a, uint32_t v) {
         p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
         return;
     }
-    if (a >= IO_LO && a < IO_HI) { io_write32(a, v); return; }
+    if (a >= IO_LO && a < IO_HI) {            /* Phase-5BQ: tag the FIFO producer */
+        gxd_note_pc(last_pc);
+        io_write32(a, v); return; }
     { uint32_t o; if (win_off(a, 4u, &o)) { uint8_t *p = gmem + o;
       p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24); } }
 }
@@ -2643,7 +2670,9 @@ static inline void st16(uint32_t a, uint16_t v) {
         p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8);
         return;
     }
-    if (a >= IO_LO && a < IO_HI) { io_write16(a, v); return; }
+    if (a >= IO_LO && a < IO_HI) {            /* Phase-5BQ: tag the FIFO producer */
+        gxd_note_pc(last_pc);
+        io_write16(a, v); return; }
     { uint32_t o; if (win_off(a, 2u, &o)) { uint8_t *p = gmem + o;
       p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); } }
 }
@@ -2667,7 +2696,9 @@ static inline void st8(uint32_t a, uint32_t v) {
     smc_note(a, 1u);
     if (a < itcm_size) { itcm[a & (ITCM_PHYS - 1u)] = (uint8_t)v; return; }
     if ((a & dtcm_mask) == dtcm_base) { dtcm[a & (DTCM_PHYS - 1u)] = (uint8_t)v; return; }
-    if (a >= IO_LO && a < IO_HI) { io_write8(a, v); return; }
+    if (a >= IO_LO && a < IO_HI) {            /* Phase-5BQ: tag the FIFO producer */
+        gxd_note_pc(last_pc);
+        io_write8(a, v); return; }
     { uint32_t o; if (win_off(a, 1u, &o)) gmem[o] = (uint8_t)v; }
 }
 
@@ -2868,7 +2899,9 @@ static uint32_t io_read32(uint32_t a) {
     case 0x04000298: return div_den_lo;
     case 0x0400029C: return div_den_hi;
     case 0x040002A0: return div_quot;
+    case 0x040002A4: return div_quot_hi;
     case 0x040002A8: return div_rem;
+    case 0x040002AC: return div_rem_hi;
     case 0x040002B0: return sqrt_ctrl;
     case 0x040002B4: return sqrt_res;
     case 0x040002B8: return sqrt_in_lo;

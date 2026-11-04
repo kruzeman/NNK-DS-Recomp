@@ -914,9 +914,61 @@ static void gxd_write_3d(Gxd *g, uint32_t addr, uint32_t val, int width)
     g->gx.zero_dot_w = g->live.zero_dot_w;
 }
 
+/* ---- Phase-5BQ: GXFIFO producer tag ------------------------------------
+ * Phase-5BP proved the renderer faithful and the *operand words* wrong: the
+ * guest submits MTX_MULT_4x3 (0x19, matrix mode 0) with twelve all-zero
+ * parameter words once per object.  To decide whether the guest computes the
+ * zeros, or the store/DMA path drops them, every FIFO word is stamped with
+ * the guest pc that produced it (the runtime's `last_pc`, injected through
+ * gxd_note_pc from the prelude's io_write32/16/8).  Statics only: the Gxd
+ * struct (which the savestate layout hashes) is untouched.
+ *
+ *   NNK_GX_FIFOPC=n          print the first n FIFO words of a frame
+ *   NNK_GX_FIFOPC_FRAME=f    ... only for frame f (unset: every frame)
+ */
+static uint32_t gx_prod_pc;
+static uint32_t prod_ring_pc[64];
+static uint32_t prod_ring_word[64];
+static unsigned prod_ring_n;
+static long prod_lim = -1;      /* NNK_GX_FIFOPC, -1 = not read yet */
+static long prod_frame = -2;    /* NNK_GX_FIFOPC_FRAME, -2 = not read yet */
+static unsigned prod_printed;
+
+void gxd_note_pc(uint32_t pc) { gx_prod_pc = pc; }
+
+void gxd_fifo_prod_dump(void)
+{
+    unsigned i, n = prod_ring_n < 64u ? prod_ring_n : 64u;
+    for (i = 0; i < n; i++) {
+        unsigned k = (prod_ring_n - n + i) & 63u;
+        fprintf(stderr, "fiforing pc=%08x word=%08x\n",
+                prod_ring_pc[k], prod_ring_word[k]);
+    }
+}
+
+static void fifo_prod_note(const Gxd *g, uint32_t word)
+{
+    if (prod_lim < 0) {
+        const char *e = getenv("NNK_GX_FIFOPC");
+        const char *f = getenv("NNK_GX_FIFOPC_FRAME");
+        prod_lim = (e && e[0]) ? (long)strtoul(e, NULL, 0) : 0;
+        prod_frame = (f && f[0]) ? (long)strtoul(f, NULL, 0) : -1;
+    }
+    prod_ring_pc[prod_ring_n & 63u] = gx_prod_pc;
+    prod_ring_word[prod_ring_n & 63u] = word;
+    prod_ring_n++;
+    if (prod_lim > 0 && (prod_frame < 0 || (long)g->frames == prod_frame) &&
+        prod_printed < (unsigned)prod_lim) {
+        prod_printed++;
+        fprintf(stderr, "fifopc frame=%u #%u pc=%08x word=%08x\n",
+                g->frames, prod_printed, gx_prod_pc, word);
+    }
+}
+
 void gxd_gx_fifo_write(Gxd *g, uint32_t word)
 {
     dbg_fifo_words++;
+    fifo_prod_note(g, word);
     tracker_word(&g->tracker, word);
     gx_fifo_write(&g->gx, word);
 }
