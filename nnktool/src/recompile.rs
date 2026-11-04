@@ -1769,6 +1769,8 @@ static uint32_t vcount(void) {
  *   NNK_GX=window|headless   create the gxd instance (SDL2 window / headless)
  *   NNK_GX_SHOT=<base>       dump <base>.<frame>.top.ppm / .bot.ppm
  *   NNK_GX_SHOT_EVERY=<n>    dump every n-th frame (default 1)
+ *   NNK_GX_POLYDBG=<f[:f2]>  per-polygon dump + "which polygon wrote this
+ *                            pixel" row map for the 3D layer (gx_display.c)
  */
 #ifdef NNK_GX
 #include "gx_display.h"
