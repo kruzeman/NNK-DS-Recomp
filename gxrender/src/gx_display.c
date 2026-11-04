@@ -1303,6 +1303,14 @@ uint32_t gxd_io_read(Gxd *g, uint32_t addr, int width)
         return (w >> (off * 8)) & 0xFFu;
     }
     }
+    /* Phase-5BV: GX matrix readback, 0x04000640 (current/clip matrix) and
+     * 0x04000680 (vector matrix 3x3).  melonDS GPU3D::Read32 fills both from
+     * the live matrix state; Read8/Read16 have no case and answer 0, so only
+     * 32-bit reads are served here. */
+    if (addr >= 0x04000640u && addr < 0x040006A4u) {
+        if (width != 4) { g->unhandled++; return 0; }
+        return gx_matrix_read32(&g->gx, addr);
+    }
     g->unhandled++;
     return 0;
 }

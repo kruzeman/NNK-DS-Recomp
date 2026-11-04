@@ -367,6 +367,30 @@ if [[ -f "$IMAGE" ]] && ! grep -q 'Phase-5BQ DIV64 splice applied' "$IMAGE"; the
   fi
 fi
 
+# Phase-5BV: the frozen image's io_read32 has no case for the GX matrix
+# READBACK windows 0x04000640..0x0400067F (the hardware's CURRENT matrix =
+# ProjMatrix*PosMatrix) and 0x04000680..0x040006A0 (the vector matrix 3x3).
+# The SDK helpers 0x02003360 / 0x02003390 busy-check GXSTAT and then copy those
+# windows into a caller buffer instead of keeping RAM copies; with both reading
+# 0 the guest rebuilt every node matrix from zeros and sent MTX_LOAD_4x3 with
+# nine zero basis words (Phase-5BU), which painted the blue band.  Same policy
+# as the splices above: canonical text in nnktool/src/recompile.rs, identical
+# transform on the frozen artifact.  No-op when already applied;
+# NNK_PRELUDE_DISABLE_SPLICE=5bv_gx_matrix_readback is the negative control.
+if [[ -f "$IMAGE" ]] && ! grep -q 'Phase-5BV matrix-readback splice applied' "$IMAGE"; then
+  if splice_disabled 5bv_gx_matrix_readback; then
+    echo "== prelude splice DISABLED by NNK_PRELUDE_DISABLE_SPLICE: Phase-5BV matrix readback (negative control) =="
+  else
+    SPLICED_IMAGE12="$(dirname "$SPLIT")/$(basename "$IMAGE" .c).p5bv.c"
+    mkdir -p "$(dirname "$SPLICED_IMAGE12")"
+    echo "== splice (Phase-5BV): GX matrix readback -> $SPLICED_IMAGE12 =="
+    python3 tools/p5bv_gx_matrix_readback_splice.py "$IMAGE" "$SPLICED_IMAGE12" || {
+      echo "phase-5bv: GX matrix readback splice failed" >&2; exit 2; }
+    IMAGE=$SPLICED_IMAGE12
+    SPLICED_FEATURES+=(5bv_gx_matrix_readback)
+  fi
+fi
+
 if [[ "$GX" == "1" ]]; then
   [[ -f "$GXDIR/Makefile" ]] || { echo "NNK_GX=1 but $GXDIR/Makefile missing" >&2; exit 2; }
   echo "== gxrender: building libgxrender.a + gx_display.o + gx_gl.o =="

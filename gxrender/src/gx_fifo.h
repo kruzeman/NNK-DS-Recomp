@@ -126,5 +126,14 @@ void gx_dbg_pstat_dump(void);
  * hardware direct command ports (4000440h-40005CCh) do; the parameter
  * accumulation for multi-param commands is shared with gx_fifo_write. */
 void gx_cmd_entry(Gx *gx, uint8_t cmd, uint32_t param);
+/* Phase-5BV: the GX matrix READBACK window.  melonDS GPU3D::Read32 answers
+ * 0x04000640..0x0400067F with the current CLIP matrix (UpdateClipMatrix() =
+ * ProjMatrix * PosMatrix) and 0x04000680..0x040006A0 with nine elements of the
+ * vector matrix (indices 0,1,2,4,5,6,8,9,10; the rest reads 0).  The guest's
+ * GX_GetPosMatrix helper (0x02003360) busy-checks GXSTAT and then copies the
+ * sixteen words at 0x04000640, so with no read path the SDK rebuilt every node
+ * matrix from zeros.  Returns the 32-bit word melonDS's Read32 would answer for
+ * an address in either window, 0 outside them. */
+uint32_t gx_matrix_read32(Gx *gx, uint32_t addr);
 
 #endif /* GX_FIFO_H */
