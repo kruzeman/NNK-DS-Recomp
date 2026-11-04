@@ -2009,6 +2009,7 @@ void gxd_frame(Gxd *g)
         present(g);
     }
     g->frames++;
+    gx_dbg_frame_set(g->frames);   /* Phase-5BT: tag commands of the next frame */
 }
 
 int gxd_should_quit(const Gxd *g) { return g->quit; }

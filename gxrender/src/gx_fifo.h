@@ -117,6 +117,8 @@ int gx_dbg_unknown_hist(unsigned cmd);
 /* Phase-5BP diagnostic: all-zero MTX_MULT_4x3-into-projection multiplies that
  * NNK_GX_SKIPZEROMULT suppressed. */
 unsigned gx_dbg_zero_mult(void);
+/* Phase-5BT diagnostic: tag the current presentation frame for NNK_GX_VD. */
+void gx_dbg_frame_set(unsigned f);
 /* Execute one command entry (command byte + one parameter) directly, as the
  * hardware direct command ports (4000440h-40005CCh) do; the parameter
  * accumulation for multi-param commands is shared with gx_fifo_write. */
