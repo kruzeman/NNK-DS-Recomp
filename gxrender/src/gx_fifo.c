@@ -185,11 +185,27 @@ static void calculate_lighting(Gx *gx)
 /* vertex / polygon submission                                        */
 
 static void submit_polygon(Gx *gx);
+static void dbg_cmdlog(uint8_t cmd, const int32_t *p, int n);
 
 /* Phase-5BO diagnostic: count of polygons printed by NNK_GX_CLIPDBG (static:
  * it must not enter struct Gx, whose size is hashed into the savestate
  * layout fingerprint). */
 static unsigned dbg_clip_n;
+
+/* Phase-5BP diagnostic: ring of the last 32 raw FIFO words, so the first
+ * submitted polygon can show the exact command stream that produced it. */
+static uint32_t dbg_ring[32];
+static int dbg_ring_i;
+
+/* Phase-5BP diagnostic: matrix/geometry command log + unknown-command
+ * histogram (both behind NNK_GX_CMDBG / always-histogram-in-CLIPDBG). */
+static unsigned dbg_cmd_n;
+static unsigned dbg_unknown_hist[256];
+static unsigned dbg_zero_mult;
+int gx_dbg_unknown_hist(unsigned cmd) { return (int)dbg_unknown_hist[cmd & 0xFF]; }
+unsigned gx_dbg_zero_mult(void) { return dbg_zero_mult; }
+
+
 
 static void submit_vertex(Gx *gx)
 {
@@ -514,6 +530,25 @@ static void submit_polygon(Gx *gx)
                         gx->clip_mat[12], gx->clip_mat[13], gx->clip_mat[14], gx->clip_mat[15],
                         gx->cur_polygon_attr);
             }
+            if (dbg_seen == 1) {
+                int j;
+                fprintf(stderr, "clipdbg proj:");
+                for (j = 0; j < 16; j++) fprintf(stderr, " %d", gx->proj[j]);
+                fprintf(stderr, "\nclipdbg pos :");
+                for (j = 0; j < 16; j++) fprintf(stderr, " %d", gx->pos[j]);
+                fprintf(stderr, "\nclipdbg vtx :");
+                for (j = 0; j < nv; j++) fprintf(stderr, " (%d,%d,%d|%d,%d,%d,%d)",
+                        gx->temp_vtx[j].clip[0], gx->temp_vtx[j].clip[1],
+                        gx->temp_vtx[j].clip[2], gx->temp_vtx[j].clip[3],
+                        v[j].clip[0], v[j].clip[1], v[j].clip[2], v[j].clip[3]);
+                fprintf(stderr, "\nclipdbg mode=%d pmode=%d vp=%d,%d,%d,%d wbuf=%d nverts=%u\n",
+                        gx->matrix_mode, gx->polygon_mode, gx->vp_x0, gx->vp_y0,
+                        gx->vp_w, gx->vp_h, gx->wbuffer, gx->n_verts);
+                fprintf(stderr, "clipdbg fifo:");
+                for (j = 0; j < 32; j++)
+                    fprintf(stderr, " %08x", dbg_ring[(dbg_ring_i + j) & 31]);
+                fprintf(stderr, "\n");
+            }
         }
     }
     n = clip_polygon(gx, clipped, nv, temp);
@@ -633,12 +668,22 @@ static void exec_multi(Gx *gx, uint8_t cmd, const uint32_t *params)
 
     for (i = 0; i < n && i < 16; i++)
         p[i] = (int32_t)params[i];
+    dbg_cmdlog(cmd, p, n);
 
     switch (cmd) {
     case 0x16: exec_matrix_load(gx, p, 16); break;
     case 0x17: exec_matrix_load(gx, p, 12); break;
     case 0x18: exec_matrix_mult(gx, p, 16); break;
-    case 0x19: exec_matrix_mult(gx, p, 12); break;
+    case 0x19: /* Phase-5BP diagnostic: measure what happens when the guest's
+                * all-zero 4x3 multiply into the PROJECTION slot is skipped.
+                * Never enabled in a normal run (NNK_GX_SKIPZEROMULT only). */
+        if (gx->matrix_mode == 0 && getenv("NNK_GX_SKIPZEROMULT")) {
+            int k, allzero = 1;
+            for (k = 0; k < 12; k++) if (p[k]) { allzero = 0; break; }
+            if (allzero) { dbg_zero_mult++; break; }
+        }
+        exec_matrix_mult(gx, p, 12);
+        break;
     case 0x1A: exec_matrix_mult(gx, p, 9); break;
 
     case 0x1B: /* MTX_SCALE */
@@ -673,12 +718,16 @@ static void exec_multi(Gx *gx, uint8_t cmd, const uint32_t *params)
 
     default:
         gx->n_unknown_cmds++;
+        dbg_unknown_hist[cmd]++;
         break;
     }
 }
 
 static void exec_single(Gx *gx, uint8_t cmd, uint32_t param)
 {
+    int32_t pp[1];
+    pp[0] = (int32_t)param;
+    dbg_cmdlog(cmd, pp, 1);
     switch (cmd) {
     case 0x10: /* MTX_MODE */
         gx->matrix_mode = (int)(param & 0x3);
@@ -911,8 +960,26 @@ static void exec_single(Gx *gx, uint8_t cmd, uint32_t param)
 
     default:
         gx->n_unknown_cmds++;
+        dbg_unknown_hist[cmd]++;
         break;
     }
+}
+
+/* Phase-5BP: dump the matrix / setup command stream (the words that decide the
+ * 3D transform) for the first N commands, N = NNK_GX_CMDBG. */
+static void dbg_cmdlog(uint8_t cmd, const int32_t *p, int n)
+{
+    const char *e;
+    int i;
+    if (!(cmd <= 0x1F || cmd == 0x40 || cmd == 0x41 || cmd == 0x50 || cmd == 0x60))
+        return;
+    e = getenv("NNK_GX_CMDBG");
+    if (!e || !e[0]) return;
+    if (dbg_cmd_n >= (unsigned)strtoul(e, NULL, 0)) return;
+    dbg_cmd_n++;
+    fprintf(stderr, "cmdbg #%u cmd=%02x n=%d:", dbg_cmd_n, cmd, n);
+    for (i = 0; i < n; i++) fprintf(stderr, " %d(%08x)", p[i], (uint32_t)p[i]);
+    fprintf(stderr, "\n");
 }
 
 static void gx_exec(Gx *gx, uint8_t cmd, uint32_t param)
@@ -971,6 +1038,20 @@ static void gx_fifo_sync_gxstat(Gx *gx)
  * consumes its parameters from the following words. */
 void gx_fifo_write(Gx *gx, uint32_t val)
 {
+    dbg_ring[dbg_ring_i] = val;
+    dbg_ring_i = (dbg_ring_i + 1) & 31;
+    {
+        static long dbg_wn = -1;
+        static unsigned long dbg_lim;
+        if (dbg_wn < 0) {
+            const char *e = getenv("NNK_GX_WORDS");
+            dbg_wn = 0;
+            dbg_lim = (e && e[0]) ? strtoul(e, NULL, 0) : 0;
+        }
+        if (dbg_lim && (unsigned long)dbg_wn < dbg_lim)
+            fprintf(stderr, "word #%ld %08x\n", dbg_wn, val);
+        dbg_wn++;
+    }
     if (gx->num_commands == 0) {
         gx->num_commands = 4;
         gx->cur_command = val;

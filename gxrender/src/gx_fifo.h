@@ -111,7 +111,12 @@ void gx_fifo_write_block(Gx *gx, const uint32_t *words, size_t n);
  * collecting parameters.  It is therefore 0 after a completed submission and
  * small (<= 4) in between -- never a constant, and never >= 128. */
 uint32_t gx_fifo_level(const Gx *gx);
-
+/* Phase-5BP diagnostic: count of decodes that fell into the unknown-command
+ * path for a given command byte (0 = never seen). */
+int gx_dbg_unknown_hist(unsigned cmd);
+/* Phase-5BP diagnostic: all-zero MTX_MULT_4x3-into-projection multiplies that
+ * NNK_GX_SKIPZEROMULT suppressed. */
+unsigned gx_dbg_zero_mult(void);
 /* Execute one command entry (command byte + one parameter) directly, as the
  * hardware direct command ports (4000440h-40005CCh) do; the parameter
  * accumulation for multi-param commands is shared with gx_fifo_write. */
