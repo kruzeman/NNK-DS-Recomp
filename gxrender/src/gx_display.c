@@ -87,6 +87,10 @@
 #define G_CAPCNT       0x14 /* u32 */
 #define G_DISPFIFO     0x18 /* 512 bytes */
 
+/* Phase-5BO diagnostics counter (static: must not change sizeof(Gxd), the
+ * savestate layout fingerprint hashes it). */
+static unsigned long dbg_fifo_words, dbg_gx_cmds, dbg_gx_swaps;
+
 static inline uint16_t rd16(const uint8_t *p)
 {
     return (uint16_t)(p[0] | (p[1] << 8));
@@ -912,12 +916,15 @@ static void gxd_write_3d(Gxd *g, uint32_t addr, uint32_t val, int width)
 
 void gxd_gx_fifo_write(Gxd *g, uint32_t word)
 {
+    dbg_fifo_words++;
     tracker_word(&g->tracker, word);
     gx_fifo_write(&g->gx, word);
 }
 
 void gxd_gx_cmd(Gxd *g, uint8_t cmd, uint32_t param)
 {
+    dbg_gx_cmds++;
+    if (cmd == 0x50) dbg_gx_swaps++;
     tracker_entry(&g->tracker, cmd, param);
     gx_cmd_entry(&g->gx, cmd, param);
 }
@@ -1650,6 +1657,107 @@ static void state_dump(Gxd *g)
             g->vramcnt[7], g->vramcnt[8]);
 }
 
+/* ---- Phase-5BO debug: 3D layer dump ------------------------------------
+ * NNK_GX_FB3D=<path> NNK_GX_FB3D_FRAME=<n>: at presentation frame <n>, after
+ * the 3D render and before the 2D compositor consumes it, write the 3D
+ * color buffer as a PPM plus the latched 3D env and the FIFO/raster stats.
+ * This is the only way to tell "the 3D layer is black" from "the 2D layer
+ * covering it is empty": the composed screens mix both. */
+static void dbg_fb3d(const Gxd *g)
+{
+    static int done;
+    const char *p = getenv("NNK_GX_FB3D");
+    const char *f = getenv("NNK_GX_FB3D_FRAME");
+    FILE *fp;
+    int i;
+    if (done || !p || !p[0]) return;
+    if (f && f[0] && (unsigned)strtoul(f, NULL, 0) != g->frames) return;
+    done = 1;
+    fp = fopen(p, "wb");
+    if (fp) {
+        fprintf(fp, "P6\n%d %d\n255\n", FB_W, FB_H);
+        for (i = 0; i < FB_PIXELS; i++) {
+            uint32_t c = g->colorbuf[i];
+            uint8_t rgb[3] = {
+                (uint8_t)((c & 0x3F) << 2),
+                (uint8_t)(((c >> 8) & 0x3F) << 2),
+                (uint8_t)(((c >> 16) & 0x3F) << 2)
+            };
+            fwrite(rgb, 1, 3, fp);
+        }
+        fclose(fp);
+    }
+    fprintf(stderr,
+            "gx: fb3d frame=%u -> %s saw_swap=%d polys current=%d pending=%d "
+            "submitted=%u drawn=%u verts=%u dropped(clip=%u degen=%u cullf=%u cullb=%u) "
+            "unknown_cmds=%u disp3dcnt=%08x clear=%08x/%08x "
+            "fogcol=%08x fogofs=%d alpharef=%d zerodot=%08x\n",
+            g->frames, p, g->tracker.saw_swap, g->current.n, g->pending.n,
+            g->gx.n_polys, g->gx.n_polys_drawn, g->gx.n_verts,
+            g->gx.n_drop_clip, g->gx.n_drop_degenerate,
+            g->gx.n_culled_front, g->gx.n_culled_back, g->gx.n_unknown_cmds,
+            g->latched.disp_cnt, g->latched.clear_attr1, g->latched.clear_attr2,
+            g->latched.fog_color, (int)g->latched.fog_offset,
+            (int)g->latched.alpha_ref_val, g->latched.zero_dot_w);
+}
+
+/* Phase-5BO: per-frame GX submission log (diagnostic, static counters only --
+ * nothing here may change sizeof(Gxd): the savestate layout fingerprint hashes
+ * it and the operator's state must keep loading). */
+static void dbg_gxlog(const Gxd *g)
+{
+    static long prev_frame = -1;
+    static unsigned long pw, pc, ps, pp, pd, pv;
+    const char *e = getenv("NNK_GX_GXLOG");
+    long from = 0, to = 0;
+    if (!e || !e[0]) return;
+    if (sscanf(e, "%ld:%ld", &from, &to) != 2) return;
+    if ((long)g->frames < from || (long)g->frames > to) return;
+    if (!pw && prev_frame < 0) { pw = pc = ps = pp = pd = pv = 0; }
+    fprintf(stderr, "gxlog f=%u words=%lu cmds=%lu swaps=%lu pending=%d current=%d "
+                    "polys=%lu drawn=%lu verts=%lu\n",
+            g->frames, dbg_fifo_words - pw, dbg_gx_cmds - pc, dbg_gx_swaps - ps,
+            g->pending.n, g->current.n,
+            (unsigned long)g->gx.n_polys - pp,
+            (unsigned long)g->gx.n_polys_drawn - pd,
+            (unsigned long)g->gx.n_verts - pv);
+    prev_frame = (long)g->frames;
+    pw = dbg_fifo_words; pc = dbg_gx_cmds; ps = dbg_gx_swaps;
+    pp = g->gx.n_polys; pd = g->gx.n_polys_drawn; pv = g->gx.n_verts;
+}
+
+/* Phase-5BO: per-frame resolved 2D layer dump.  NNK_GX_2DINFO=<frame>[,<frame>]
+ * prints the engine/BG model (see gx2d_diag_dump) at the listed presented
+ * frames; "NNK_GX_2DINFO=3350" is the operator-save frame. */
+static void dbg_2dinfo(Gxd *g, const Gx2DState *st)
+{
+    static int parsed;
+    static long frames[8];
+    static int nframes;
+    const char *e;
+    int i;
+    if (!parsed)
+    {
+        parsed = 1;
+        e = getenv("NNK_GX_2DINFO");
+        if (e && e[0])
+        {
+            const char *p = e;
+            while (*p && nframes < 8)
+            {
+                frames[nframes++] = strtol(p, (char **)&p, 0);
+                if (*p == ',') p++;
+            }
+        }
+    }
+    for (i = 0; i < nframes; i++)
+        if ((long)g->frames == frames[i])
+        {
+            gx2d_diag_dump(st, g->frames);
+            return;
+        }
+}
+
 static void latch_unit(Gxd *g)
 {
     /* SWAP_BUFFERS latches the env and swaps the retained polygon set
@@ -1685,6 +1793,7 @@ void gxd_frame(Gxd *g)
     else                        render_3d_sw(g);
 
     /* 3. 2D state: flat views + window latch */
+    dbg_fb3d(g);
     if (g->flat_dirty) rebuild_flats(g);
     if (!g->bulk_win) {
         /* melonDS GPU2D::UpdateWindows(0) at scanline 0 (the captured .2d
@@ -1715,9 +1824,11 @@ void gxd_frame(Gxd *g)
         else
             fb = g->colorbuf;
         gx2d_render_frame(&st, fb, g->screen[0], g->screen[1]);
+        dbg_2dinfo(g, &st);
     }
 
     /* 5. present + input */
+    dbg_gxlog(g);
     if (g->windowed) {
         pump_events(g);
         present(g);

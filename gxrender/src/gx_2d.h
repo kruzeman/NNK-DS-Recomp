@@ -106,4 +106,12 @@ void gx2d_render_frame(const Gx2DState *st, const uint32_t *fb3d,
 /* Binary PPM (P6) dump of a 256*192 u32 BGRA buffer (for tests/diffs). */
 int gx2d_write_ppm(const char *path, const uint32_t *buf);
 
+/* Phase-5BO: print the resolved 2D layer model for this frame -- per engine and
+ * per BG: enable, text/affine/bitmap, priority, char/screen base, colour depth,
+ * size, BGxCNT bit-13 ext-palette slot, the VRAM banks backing the engine's BG
+ * window with absolute LCDC addresses, the first tilemap words, the scroll
+ * registers, and the pixels the layer wrote in this frame (0 = it draws
+ * nothing).  Armed from gx_display.c by NNK_GX_2DINFO=<frame>[,<frame>]. */
+void gx2d_diag_dump(const Gx2DState *st, unsigned frame);
+
 #endif /* GX_2D_H */
