@@ -1352,6 +1352,9 @@ static void retain_poly(void *user, const GxPolygon *poly)
     list_push((PolyList *)user, poly);
 }
 
+static int gx_dbg_writer[256 * 192];
+static unsigned gx_dbg_writer_col[256 * 192];
+
 static void render_3d_sw(Gxd *g)
 {
     GxRasterEnv env;
@@ -1389,12 +1392,51 @@ static void render_3d_sw(Gxd *g)
         unsigned long long px0 = gx_ras_pixels_total;
         unsigned zero_px = 0;
         const char *dbg = getenv("NNK_GX_RASTDBG");
+        const char *polydbg = getenv("NNK_GX_POLYDBG");
+        int polydump = 0;
+
+        if (polydbg && polydbg[0]) {
+            unsigned long want = strtoul(polydbg, NULL, 0);
+            unsigned long lo = g->frames, hi = g->frames;
+            const char *colon = strchr(polydbg, ':');
+            if (colon) {
+                lo = want;
+                hi = strtoul(colon + 1, NULL, 0);
+            } else hi = lo = want;
+            if (g->frames >= lo && g->frames <= hi) {
+                polydump = 1;
+                fprintf(stderr, "polydbg f=%u n=%d begin\n", g->frames,
+                        g->scratch.n);
+            }
+        }
 
         for (i = 0; i < g->scratch.n; i++) {
             const GxPolygon *p = &g->scratch.poly[i];
             unsigned long long px;
             gx_raster_polygon(&g->sf, p, &env);
             px = gx_ras_last_pixels;
+            if (polydump) {
+                size_t a;
+                for (a = 0; a < (size_t)g->sf.w * g->sf.h; a++) {
+                    if (g->sf.color[a] != gx_dbg_writer_col[a]) {
+                        gx_dbg_writer_col[a] = g->sf.color[a];
+                        gx_dbg_writer[a] = i;
+                    }
+                }
+            }
+            if (polydump) {
+                int k;
+                fprintf(stderr, "polydbg f=%u i=%d nv=%d facing=%d attr=%08x "
+                                "tex=%08x wbuf=%d px=%llu", g->frames, i,
+                        p->nv, p->facing_view, p->attr, p->texparam,
+                        p->wbuffer, px);
+                for (k = 0; k < p->nv && k < 8; k++)
+                    fprintf(stderr, " v%d=(%d,%d|z=%d,w=%d|c=%d,%d,%d|st=%d,%d)",
+                            k, p->v[k].sx, p->v[k].sy, p->v[k].depth,
+                            p->v[k].wnorm, p->v[k].cr, p->v[k].cg, p->v[k].cb,
+                            p->v[k].s, p->v[k].t);
+                fprintf(stderr, "\n");
+            }
             if (!dbg || !dbg[0] || px) continue;
             zero_px++;
             if (zero_px <= 6) {
@@ -1417,6 +1459,26 @@ static void render_3d_sw(Gxd *g)
                     g->frames, g->scratch.n, zero_px,
                     gx_ras_pixels_total - px0,
                     (gx_ras_pixels_total - px0) ? "yes" : "no");
+    }
+    if (getenv("NNK_GX_POLYDBG") && getenv("NNK_GX_POLYDBG")[0]) {
+        const char *polydbg = getenv("NNK_GX_POLYDBG");
+        unsigned long want = strtoul(polydbg, NULL, 0);
+        unsigned long lo = want, hi = want;
+        const char *colon = strchr(polydbg, ':');
+        if (colon) hi = strtoul(colon + 1, NULL, 0);
+        if (g->frames >= lo && g->frames <= hi) {
+            static const int xs[] = { 0, 2, 5, 10, 20, 40, 60, 80, 100, 150, 200, 250 };
+            int y, k;
+            for (y = 16; y <= 104; y++) {
+                fprintf(stderr, "wmap f=%u y=%3d", g->frames, y);
+                for (k = 0; k < (int)(sizeof xs / sizeof xs[0]); k++) {
+                    size_t a = (size_t)y * g->sf.w + xs[k];
+                    fprintf(stderr, " x%d=%d/%06x", xs[k], gx_dbg_writer[a],
+                            g->sf.color[a] & 0xFFFFFF);
+                }
+                fprintf(stderr, "\n");
+            }
+        }
     }
     gx_post_pass(&g->sf, &post);
 }
