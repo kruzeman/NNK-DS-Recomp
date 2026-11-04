@@ -139,8 +139,9 @@ give for the instant it was written (one matrix, scale 4096, translation
 | gate | result |
 |---|---|
 | `cargo test --release` (nnktool) | **65 passed, 0 failed** |
-| `tools/verify_phase2a.sh` | see run log below |
-| frame 3375 captures | unchanged by the diagnostics (`NNK_GX_VD` is env-gated) |
+| frame 3375 captures | unchanged by the diagnostics (`NNK_GX_VD` is env-gated, off unless set) |
+| 200 M steps, ROM-only, headless | **9.34 s / 10.12 s** (baseline 9.1-9.31 s; +0.3 %/+11 %, the two runs straddle the 10 % band on this 24-core box) |
+| `tools/verify_phase2a.sh` | **still running when the run budget ended** — not claimed as passed |
 
 ## 6. Artifacts (gitignored `work/`, not committed)
 
