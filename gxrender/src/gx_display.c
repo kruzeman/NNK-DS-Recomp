@@ -1386,8 +1386,37 @@ static void render_3d_sw(Gxd *g)
     build_render_order(&g->current, &g->scratch, (int)(g->latched_sort & 1));
     {
         int i;
-        for (i = 0; i < g->scratch.n; i++)
-            gx_raster_polygon(&g->sf, &g->scratch.poly[i], &env);
+        unsigned long long px0 = gx_ras_pixels_total;
+        unsigned zero_px = 0;
+        const char *dbg = getenv("NNK_GX_RASTDBG");
+
+        for (i = 0; i < g->scratch.n; i++) {
+            const GxPolygon *p = &g->scratch.poly[i];
+            unsigned long long px;
+            gx_raster_polygon(&g->sf, p, &env);
+            px = gx_ras_last_pixels;
+            if (!dbg || !dbg[0] || px) continue;
+            zero_px++;
+            if (zero_px <= 6) {
+                int k;
+                fprintf(stderr, "rastdbg f=%u 3dslot=%d/%d submitted to "
+                                "fill_ras_vertex but wrote 0 pixels: attr=%08x "
+                                "nv=%d wbuf=%d facing=%d",
+                        g->frames, i + 1, g->scratch.n, p->attr, p->nv,
+                        p->wbuffer, p->facing_view);
+                for (k = 0; k < p->nv && k < 6; k++)
+                    fprintf(stderr, " v%d=(%d,%d|z=%d,w=%d,c=%d,%d,%d)", k,
+                            p->v[k].sx, p->v[k].sy, p->v[k].depth,
+                            p->v[k].wnorm, p->v[k].cr, p->v[k].cg, p->v[k].cb);
+                fprintf(stderr, "\n");
+            }
+        }
+        if (dbg && dbg[0])
+            fprintf(stderr, "rastdbg f=%u polys=%d zero_px=%u pixels=%llu "
+                            "fb3d_nonblack=%s\n",
+                    g->frames, g->scratch.n, zero_px,
+                    gx_ras_pixels_total - px0,
+                    (gx_ras_pixels_total - px0) ? "yes" : "no");
     }
     gx_post_pass(&g->sf, &post);
 }
@@ -1783,23 +1812,31 @@ static void dbg_fb3d(const Gxd *g)
 static void dbg_gxlog(const Gxd *g)
 {
     static long prev_frame = -1;
-    static unsigned long pw, pc, ps, pp, pd, pv;
+    static unsigned long pw, pc, ps, pp, pd, pv, pcl, pdeg, pcf, pcb;
     const char *e = getenv("NNK_GX_GXLOG");
     long from = 0, to = 0;
     if (!e || !e[0]) return;
     if (sscanf(e, "%ld:%ld", &from, &to) != 2) return;
     if ((long)g->frames < from || (long)g->frames > to) return;
-    if (!pw && prev_frame < 0) { pw = pc = ps = pp = pd = pv = 0; }
+    if (!pw && prev_frame < 0) { pw = pc = ps = pp = pd = pv = 0;
+                                 pcl = pdeg = pcf = pcb = 0; }
     fprintf(stderr, "gxlog f=%u words=%lu cmds=%lu swaps=%lu pending=%d current=%d "
-                    "polys=%lu drawn=%lu verts=%lu\n",
+                    "polys=%lu drawn=%lu verts=%lu dropclip=%lu dropdegen=%lu "
+                    "cullf=%lu cullb=%lu\n",
             g->frames, dbg_fifo_words - pw, dbg_gx_cmds - pc, dbg_gx_swaps - ps,
             g->pending.n, g->current.n,
             (unsigned long)g->gx.n_polys - pp,
             (unsigned long)g->gx.n_polys_drawn - pd,
-            (unsigned long)g->gx.n_verts - pv);
+            (unsigned long)g->gx.n_verts - pv,
+            (unsigned long)(g->gx.n_drop_clip - pcl),
+            (unsigned long)(g->gx.n_drop_degenerate - pdeg),
+            (unsigned long)(g->gx.n_culled_front - pcf),
+            (unsigned long)(g->gx.n_culled_back - pcb));
     prev_frame = (long)g->frames;
     pw = dbg_fifo_words; pc = dbg_gx_cmds; ps = dbg_gx_swaps;
     pp = g->gx.n_polys; pd = g->gx.n_polys_drawn; pv = g->gx.n_verts;
+    pcl = g->gx.n_drop_clip; pdeg = g->gx.n_drop_degenerate;
+    pcf = g->gx.n_culled_front; pcb = g->gx.n_culled_back;
 }
 
 /* Phase-5BO: per-frame resolved 2D layer dump.  NNK_GX_2DINFO=<frame>[,<frame>]
