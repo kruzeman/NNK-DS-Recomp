@@ -223,6 +223,43 @@ static int vd_on = -1;
 static unsigned long vd_lo, vd_hi;
 static int vd_cur;
 
+/* Phase-5BU diagnostic: NNK_GX_PSTAT=<frame>[:<frame>] per-frame polygon
+ * statistics (how many polygons reach the rasteriser, how many touch sx==0,
+ * how many span sx=0..>=256) plus the frame in which each retained strip
+ * vertex slot was last transformed.  The birth tags answer one question:
+ * is a band-sliver vertex a vertex of THIS frame (a mid-strip matrix change)
+ * or a slot left over from an earlier frame (stale retention)?  File-static
+ * like the other diagnostics: struct Gx's size is hashed into the savestate
+ * layout fingerprint and must not change. */
+static int pstat_on = -1;
+static unsigned long pstat_lo, pstat_hi;
+static unsigned ps_total, ps_zero, ps_full, ps_gt255;
+static unsigned vtx_born[4];
+
+static void pstat_check(void)
+{
+    if (pstat_on < 0) {
+        const char *e = getenv("NNK_GX_PSTAT");
+        pstat_on = (e && e[0]) ? 1 : 0;
+        if (pstat_on) {
+            char *end;
+            pstat_lo = strtoul(e, &end, 0);
+            pstat_hi = (*end == ':') ? strtoul(end + 1, NULL, 0) : pstat_lo;
+        }
+    }
+}
+
+/* Print the counters accumulated for the frame that is ending, then clear
+ * them (called once per presented frame from gxd_frame). */
+void gx_dbg_pstat_dump(void)
+{
+    pstat_check();
+    if (pstat_on && dbg_frame >= pstat_lo && dbg_frame <= pstat_hi)
+        fprintf(stderr, "pstat f=%u polys=%u zero=%u full=%u gt255=%u\n",
+                dbg_frame, ps_total, ps_zero, ps_full, ps_gt255);
+    ps_total = ps_zero = ps_full = ps_gt255 = 0;
+}
+
 static void vd_check(void)
 {
     if (vd_on < 0) {
@@ -246,6 +283,34 @@ static void submit_vertex(Gx *gx)
     update_clip_matrix(gx);
     m = gx->clip_mat;
     v = &gx->temp_vtx[gx->vtx_in_poly];
+    vtx_born[gx->vtx_in_poly & 3] = dbg_frame;
+
+    /* Phase-5BU: a clip matrix whose 3x3 part is all zero maps every vertex to
+     * the same point (its translation column), i.e. the model matrix in
+     * effect was empty.  Report the matrices and the last FIFO words so the
+     * command that produced it is visible. */
+    pstat_check();
+    if (pstat_on && dbg_frame >= pstat_lo && dbg_frame <= pstat_hi && !m[0] &&
+        !m[1] && !m[2] && !m[3] && !m[4] && !m[5] && !m[6] && !m[7] &&
+        !m[8] && !m[9] && !m[10] && !m[11]) {
+        static unsigned deg_n;
+        int k;
+        if (deg_n++ < 8) {
+            fprintf(stderr, "clipdeg f=%u slot=%d mode=%d pos_sp=%u vtx=(%d,%d,%d)\n",
+                    dbg_frame, gx->vtx_in_poly, gx->polygon_mode, gx->pos_sp,
+                    gx->cur_vtx[0], gx->cur_vtx[1], gx->cur_vtx[2]);
+            fprintf(stderr, "  pos  :");
+            for (k = 0; k < 16; k++) fprintf(stderr, " %d", gx->pos[k]);
+            fprintf(stderr, "\n  vec  :");
+            for (k = 0; k < 16; k++) fprintf(stderr, " %d", gx->vec[k]);
+            fprintf(stderr, "\n  clip :");
+            for (k = 0; k < 16; k++) fprintf(stderr, " %d", m[k]);
+            fprintf(stderr, "\n  ring :");
+            for (k = 0; k < 32; k++)
+                fprintf(stderr, " %08x", dbg_ring[(dbg_ring_i + k) & 31]);
+            fprintf(stderr, "\n");
+        }
+    }
 
     /* Phase-5BT: model-space vertex stream (NNK_GX_VD) — shows whether a strip
      * mixes vertices from different models or is a smooth run. */
@@ -303,14 +368,18 @@ static void submit_vertex(Gx *gx)
     case 2: /* triangle strip */
         if (gx->num_consecutive & 1) {
             GxClipVertex tmp = gx->temp_vtx[1];
+            unsigned tb = vtx_born[1];
             gx->temp_vtx[1] = gx->temp_vtx[0];
             gx->temp_vtx[0] = tmp;
+            vtx_born[1] = vtx_born[0];
+            vtx_born[0] = tb;
 
             gx->vtx_in_poly = 2;
             submit_polygon(gx);
             gx->num_consecutive++;
 
             gx->temp_vtx[1] = gx->temp_vtx[2];
+            vtx_born[1] = vtx_born[2];
         } else if (gx->vtx_in_poly == 3) {
             gx->vtx_in_poly = 2;
             submit_polygon(gx);
@@ -318,13 +387,18 @@ static void submit_vertex(Gx *gx)
 
             gx->temp_vtx[0] = gx->temp_vtx[1];
             gx->temp_vtx[1] = gx->temp_vtx[2];
+            vtx_born[0] = vtx_born[1];
+            vtx_born[1] = vtx_born[2];
         }
         break;
     case 3: /* quad strip */
         if (gx->vtx_in_poly == 4) {
             GxClipVertex tmp = gx->temp_vtx[3];
+            unsigned tb = vtx_born[3];
             gx->temp_vtx[3] = gx->temp_vtx[2];
             gx->temp_vtx[2] = tmp;
+            vtx_born[3] = vtx_born[2];
+            vtx_born[2] = tb;
 
             gx->vtx_in_poly = 2;
             submit_polygon(gx);
@@ -332,6 +406,8 @@ static void submit_vertex(Gx *gx)
 
             gx->temp_vtx[0] = gx->temp_vtx[3];
             gx->temp_vtx[1] = gx->temp_vtx[2];
+            vtx_born[0] = vtx_born[3];
+            vtx_born[1] = vtx_born[2];
         }
         break;
     }
@@ -650,10 +726,10 @@ static void submit_polygon(Gx *gx)
                     gx->tex_palette, gx->wbuffer, nv, n, wsize,
                     gx->vp_x0, gx->vp_y0, gx->vp_w, gx->vp_h);
             for (i = 0; i < nv; i++)
-                fprintf(stderr, "  raw%d=(%d,%d,%d|w=%d) col=%u,%u,%u st=%d,%d\n",
+                fprintf(stderr, "  raw%d=(%d,%d,%d|w=%d) col=%u,%u,%u st=%d,%d born=%u\n",
                         i, v[i].clip[0], v[i].clip[1], v[i].clip[2], v[i].clip[3],
                         v[i].col20[0] >> 12, v[i].col20[1] >> 12,
-                        v[i].col20[2] >> 12, v[i].s, v[i].t);
+                        v[i].col20[2] >> 12, v[i].s, v[i].t, vtx_born[i]);
             for (i = 0; i < n; i++)
                 fprintf(stderr, "  clp%d=(%d,%d,%d|w=%d)\n",
                         i, clipped[i].clip[0], clipped[i].clip[1],
@@ -662,6 +738,43 @@ static void submit_polygon(Gx *gx)
                 fprintf(stderr, "  scr%d=(%d,%d|z=%d,w=%d|c=%d,%d,%d|st=%d,%d)\n",
                         i, rv[i].sx, rv[i].sy, rv[i].depth, rv[i].wnorm,
                         rv[i].cr, rv[i].cg, rv[i].cb, rv[i].s, rv[i].t);
+        }
+    }
+
+    /* Phase-5BU per-frame polygon statistics (NNK_GX_PSTAT): polygons that
+     * reach the rasteriser, those with a vertex at sx==0 (the projected
+     * x = -w plane at viewport x0), those spanning the whole 256-px width,
+     * and those with any vertex right of the screen.  Also reports, for a
+     * full-width polygon, the frames in which its raw strip slots were
+     * transformed -- a birth frame != this frame means a slot retained from
+     * an earlier frame. */
+    {
+        int lo = 1 << 20, hi = -(1 << 20), zero = 0;
+        for (i = 0; i < n; i++) {
+            if (rv[i].sx < lo) lo = rv[i].sx;
+            if (rv[i].sx > hi) hi = rv[i].sx;
+            if (rv[i].sx == 0) zero = 1;
+        }
+        ps_total++;
+        if (zero) ps_zero++;
+        if (lo == 0 && hi >= 256) ps_full++;
+        if (hi > 255) ps_gt255++;
+        pstat_check();
+        if (pstat_on && dbg_frame >= pstat_lo && dbg_frame <= pstat_hi &&
+            lo == 0 && hi >= 256) {
+            int k;
+            fprintf(stderr, "pfull f=%u mode=%d nv=%d n=%d sx=%d..%d born=%u,%u,%u",
+                    dbg_frame, gx->polygon_mode, nv, n, lo, hi,
+                    vtx_born[0], vtx_born[1], vtx_born[2]);
+            for (k = 0; k < nv; k++)
+                fprintf(stderr, " raw%d=(%d,%d,%d|%d)",
+                        k, v[k].clip[0], v[k].clip[1], v[k].clip[2], v[k].clip[3]);
+            for (k = 0; k < n; k++)
+                fprintf(stderr, " scr%d=(%d,%d)", k, rv[k].sx, rv[k].sy);
+            fprintf(stderr, "\n    clipm:");
+            for (k = 0; k < 16; k++)
+                fprintf(stderr, " %d", gx->clip_mat[k]);
+            fprintf(stderr, " attr=%08x\n", gx->cur_polygon_attr);
         }
     }
 
@@ -747,6 +860,23 @@ static void exec_matrix_mult(Gx *gx, const int32_t *p, int kind)
     matrix_dirty(gx);
 }
 
+/* Phase-5BU: frame-gated matrix-command log (NNK_GX_PSTAT gate).  One line per
+ * 0x10-0x1F command with its parameters, the matrix mode and stack pointer,
+ * plus a ZERO3 flag when the position matrix's 3x3 part is all zero after the
+ * command -- that is the state that collapses every vertex of a strip onto the
+ * same clip point and paints the band. */
+static void mdbg(const Gx *gx, uint8_t cmd, const int32_t *p, int n)
+{
+    int i, zero3 = 1;
+    pstat_check();
+    if (!pstat_on || dbg_frame < pstat_lo || dbg_frame > pstat_hi) return;
+    for (i = 0; i < 12; i++) if (gx->pos[i]) { zero3 = 0; break; }
+    fprintf(stderr, "mdbg f=%u cmd=%02x mode=%d sp=%u", dbg_frame, cmd,
+            gx->matrix_mode, gx->pos_sp);
+    for (i = 0; i < n && i < 12; i++) fprintf(stderr, " %d", p[i]);
+    fprintf(stderr, "%s\n", zero3 ? " ZERO3" : "");
+}
+
 static void exec_multi(Gx *gx, uint8_t cmd, const uint32_t *params)
 {
     int32_t p[16];
@@ -807,6 +937,7 @@ static void exec_multi(Gx *gx, uint8_t cmd, const uint32_t *params)
         dbg_unknown_hist[cmd]++;
         break;
     }
+    if (cmd >= 0x16 && cmd <= 0x1C) mdbg(gx, cmd, p, n);
 }
 
 static void exec_single(Gx *gx, uint8_t cmd, uint32_t param)
@@ -1049,6 +1180,7 @@ static void exec_single(Gx *gx, uint8_t cmd, uint32_t param)
         dbg_unknown_hist[cmd]++;
         break;
     }
+    if (cmd >= 0x10 && cmd <= 0x15) mdbg(gx, cmd, pp, 1);
 }
 
 /* Phase-5BP: dump the matrix / setup command stream (the words that decide the
