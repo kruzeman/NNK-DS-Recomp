@@ -1175,6 +1175,19 @@ static void nnks_tick(uint32_t *pc_io)
     }
 }
 
+/* Phase-5BX: the next step at which this module needs a per-step look (a
+ * pending NNK_STATE_HASH_AT / NNK_SAVESTATE_SAVE_AT, which fire on the first
+ * step >= the target), or ~0 when nothing is armed.  The idle-loop skip in
+ * run() must never jump over it. */
+static uint64_t nnks_next_step(void)
+{
+    uint64_t n = ~0ull;
+    if (!nnks_ready) return n;
+    if (nnks_save_at && !nnks_save_done && nnks_save_at < n) n = nnks_save_at;
+    if (nnks_hash_at && !nnks_hash_done && nnks_hash_at < n) n = nnks_hash_at;
+    return n;
+}
+
 /* F5 / F9 (see tools/nnk_input.inc's SDL filter). */
 static void nnk_state_ui_key(int fkey)
 {

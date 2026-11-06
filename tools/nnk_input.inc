@@ -178,11 +178,22 @@ static int nnk_input_filter(void *ud, SDL_Event *ev)
 static struct { uint64_t step; SDL_Scancode sc; int down; } nnk_inj[128];
 static int nnk_inj_n, nnk_inj_next;
 
+/* Phase-5BX (perf): the per-dispatch input tick costs ~20 cycles (three
+ * cached-env tests, an SDL scancode loop and a frame compare) and is a NO-OP
+ * for a run with no input source at all — no injection schedule, no
+ * NNK_INPUT_FILE, no NNK_INPUT_RECORD.  `nnk_input_busy` is -1 until
+ * nnk_input_init() has parsed them, then 1 if any source is armed and 0
+ * otherwise; the dispatch loop calls the tick only while it is nonzero.
+ * Nothing changes for a run that DOES have input: busy stays 1 and the tick
+ * runs on every dispatch exactly as before. */
+static int nnk_input_busy = -1;
+
 static void nnk_input_init(void)
 {
     const char *s;
     int i;
     nnk_inited = 1;
+    nnk_input_busy = 0;
     s = getenv("NNK_INPUT_TRACE");
     if (s && s[0]) {
         nnk_in_log = fopen(s, "w");
@@ -236,6 +247,12 @@ static void nnk_input_init(void)
     }
     nnk_ilog("map: arrows=D-pad X=A Z=B S=DS-X A=DS-Y Q=L W=R "
              "Return=Start RShift/Backspace=Select");
+    /* Phase-5BX: any armed input source keeps the per-dispatch tick running. */
+    if (nnk_inj_n) nnk_input_busy = 1;
+    s = getenv("NNK_INPUT_FILE");
+    if (s && s[0]) nnk_input_busy = 1;
+    s = getenv("NNK_INPUT_RECORD");
+    if (s && s[0]) nnk_input_busy = 1;
 }
 
 /* ---- frame-timed mask file (NNK_INPUT_FILE) ------------------------------
@@ -483,6 +500,7 @@ static void nnk_input_atexit(void)
 static void nnk_input_tick(void)
 {
     if (!nnk_inited) nnk_input_init();
+    if (!nnk_input_busy) return;      /* Phase-5BX: nothing armed, nothing to do */
     nnk_input_file_tick();
     while (nnk_inj_next < nnk_inj_n && steps >= nnk_inj[nnk_inj_next].step) {
         SDL_Event ev;
@@ -539,6 +557,7 @@ static int nnk_input_ioread16(uint32_t a, uint32_t *out)
 
 static int nnk_input_ioread16(uint32_t a, uint32_t *out)
 { (void)a; (void)out; return 0; }
+static int nnk_input_busy = 0;   /* Phase-5BX: no input model without NNK_GX */
 static void nnk_input_tick(void) { }
 
 #endif /* NNK_GX */

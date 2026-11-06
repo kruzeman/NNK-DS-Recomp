@@ -75,12 +75,12 @@ assert txt.count(anchor) == 1
 txt = txt.replace(anchor, GLOBALS + "\n" + anchor)
 
 # ---- dispatch loop: mark PRE begin, DMA, SMC, BAND/ANY ---------------------
-a = """            nnk_dma_tick();
+a = """            if (cycles >= nnk_tick_due) nnk_dma_tick();
             nnk_input_tick();
 """
 assert txt.count(a) == 1
 txt = txt.replace(a, """            pf_mark(PF_PRE);
-            nnk_dma_tick();
+            if (cycles >= nnk_tick_due) nnk_dma_tick();
             nnk_input_tick();
             pf_mark(PF_DMA);
             pf_cnt++;
@@ -118,12 +118,12 @@ txt = txt.replace(a, """            halt_reason("dispatch to untranslated pc");
 
 # ---- trace_pc: p5u hook, display tick, probe chain ------------------------
 a = """void trace_pc(uint32_t pc) {
-    p5u_hook(pc);
+    if (nnk_p5u_on) p5u_hook(pc);
 """
 assert txt.count(a) == 1
 txt = txt.replace(a, """void trace_pc(uint32_t pc) {
     pf_mark(PF_ENTRY);
-    p5u_hook(pc);
+    if (nnk_p5u_on) p5u_hook(pc);
     pf_mark(PF_P5U);
 """)
 
