@@ -154,5 +154,9 @@ int gx_write_ppm(const char *path, const GxSurface *sf);
  * submitted, produced spans, but every pixel failed depth/alpha". */
 extern unsigned long long gx_ras_pixels_total;
 extern unsigned long long gx_ras_last_pixels;
+/* Phase-5BY: scanline spans that use the constant-step perspective factor vs
+ * spans that still divide per pixel (diagnostic only). */
+extern unsigned long long gx_ras_yfac_step_spans;
+extern unsigned long long gx_ras_yfac_div_spans;
 
 #endif /* GX_RASTER_H */

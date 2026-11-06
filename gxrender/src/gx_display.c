@@ -16,6 +16,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_opengl.h>
@@ -291,10 +292,40 @@ static int poly_translucent(const GxPolygon *p)
     return (texfmt == 1 || texfmt == 6) || (alpha > 0 && alpha < 31);
 }
 
-static int cmp_sortkey(const void *a, const void *b)
+/* Phase-5BY: stable SortKey sort of a polygon range that does not move the
+ * ~300-byte GxPolygon on every comparison.  The old insertion sort copied the
+ * whole struct on each shift, which made build_render_order 0.7 ms of the
+ * frame (379 polys -> ~36 000 struct copies); now the sort runs on a
+ * key/index array and the range is permuted once.  Same comparison, same
+ * stability, same result order. */
+#define GX_SORT_MAX 8192
+
+static void sort_poly_range(PolyList *lst, int lo, int hi)
 {
-    const GxPolygon *pa = a, *pb = b;
-    return poly_sortkey(pa) - poly_sortkey(pb);
+    static int32_t key[GX_SORT_MAX];
+    static int idx[GX_SORT_MAX];
+    static GxPolygon tmp[GX_SORT_MAX];
+    int n = hi - lo, i, j;
+
+    if (n < 2) return;
+    if (n > GX_SORT_MAX) return;   /* never reached: the lists cap at 4096 */
+    for (i = 0; i < n; i++) {
+        idx[i] = i;
+        key[i] = poly_sortkey(&lst->poly[lo + i]);
+    }
+    for (i = 1; i < n; i++) {
+        int t = idx[i];
+        int32_t k = key[t];
+        j = i - 1;
+        while (j >= 0 && key[idx[j]] > k) {
+            idx[j + 1] = idx[j];
+            j--;
+        }
+        idx[j + 1] = t;
+    }
+    for (i = 0; i < n; i++)
+        tmp[i] = lst->poly[lo + idx[i]];
+    memcpy(&lst->poly[lo], tmp, (size_t)n * sizeof(GxPolygon));
 }
 
 /* Build the render order: [opaque sorted by SortKey (stable)] [translucent
@@ -307,30 +338,13 @@ static void build_render_order(PolyList *current, PolyList *scratch,
     for (i = 0; i < current->n; i++)
         if (!poly_translucent(&current->poly[i]))
             list_push(scratch, &current->poly[i]);
-    for (i = 1; i < scratch->n; i++) {
-        GxPolygon tmp = scratch->poly[i];
-        int j = i - 1;
-        while (j >= 0 && cmp_sortkey(&scratch->poly[j], &tmp) > 0) {
-            scratch->poly[j + 1] = scratch->poly[j];
-            j--;
-        }
-        scratch->poly[j + 1] = tmp;
-    }
+    sort_poly_range(scratch, 0, scratch->n);
     int opaque_n = scratch->n;
     for (i = 0; i < current->n; i++)
         if (poly_translucent(&current->poly[i]))
             list_push(scratch, &current->poly[i]);
-    if (!sort_opaque_only) {
-        for (i = opaque_n + 1; i < scratch->n; i++) {
-            GxPolygon tmp = scratch->poly[i];
-            int j = i - 1;
-            while (j >= opaque_n && cmp_sortkey(&scratch->poly[j], &tmp) > 0) {
-                scratch->poly[j + 1] = scratch->poly[j];
-                j--;
-            }
-            scratch->poly[j + 1] = tmp;
-        }
-    }
+    if (!sort_opaque_only)
+        sort_poly_range(scratch, opaque_n, scratch->n);
 }
 
 /* ---- frame clear (melonDS SoftRenderer3D::ClearBuffers) ---- */
@@ -1361,6 +1375,22 @@ static void retain_poly(void *user, const GxPolygon *poly)
     list_push((PolyList *)user, poly);
 }
 
+/* Phase-5BY: NNK_PERF=2 per-section frame-cost breakdown.  Section timers are
+ * plain file statics (the savestate layout is untouched) and are sampled with
+ * CLOCK_MONOTONIC because SDL_GetTicks' 1 ms resolution is too coarse for the
+ * individual stages.  Sections: 0 clear, 1 order, 2 raster, 3 post,
+ * 4 compose (2D), 5 the rest of the frame. */
+enum { GXPF_CLEAR, GXPF_ORDER, GXPF_RAST, GXPF_POST, GXPF_COMPOSE, GXPF_REST,
+       GXPF_N };
+static double gx_pf_sec[GXPF_N];
+
+static double gx_pf_now(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1e3 + (double)ts.tv_nsec / 1e6;
+}
+
 static int gx_dbg_writer[256 * 192];
 static unsigned gx_dbg_writer_col[256 * 192];
 
@@ -1368,6 +1398,7 @@ static void render_3d_sw(Gxd *g)
 {
     GxRasterEnv env;
     GxPostEnv post;
+    double tp = 0.0, tq = 0.0;
 
     memset(&env, 0, sizeof(env));
     env.tex = &g->gx.texmem;
@@ -1394,8 +1425,11 @@ static void render_3d_sw(Gxd *g)
     post.fog_alpha_only = (int)((g->latched.disp_cnt >> 6) & 1);
     post.aa_enable = (int)((g->latched.disp_cnt >> 4) & 1);
 
+    tp = gx_pf_now();
     clear_frame(&g->sf, &g->latched, g->texvram);
+    tq = gx_pf_now(); gx_pf_sec[GXPF_CLEAR] += tq - tp; tp = tq;
     build_render_order(&g->current, &g->scratch, (int)(g->latched_sort & 1));
+    tq = gx_pf_now(); gx_pf_sec[GXPF_ORDER] += tq - tp; tp = tq;
     {
         int i;
         unsigned long long px0 = gx_ras_pixels_total;
@@ -1468,6 +1502,7 @@ static void render_3d_sw(Gxd *g)
                     g->frames, g->scratch.n, zero_px,
                     gx_ras_pixels_total - px0,
                     (gx_ras_pixels_total - px0) ? "yes" : "no");
+        tq = gx_pf_now(); gx_pf_sec[GXPF_RAST] += tq - tp; tp = tq;
     }
     if (getenv("NNK_GX_POLYDBG") && getenv("NNK_GX_POLYDBG")[0]) {
         const char *polydbg = getenv("NNK_GX_POLYDBG");
@@ -1490,6 +1525,7 @@ static void render_3d_sw(Gxd *g)
         }
     }
     gx_post_pass(&g->sf, &post);
+    tq = gx_pf_now(); gx_pf_sec[GXPF_POST] += tq - tp; tp = tq;
 }
 
 static void render_3d_gl(Gxd *g)
@@ -1706,7 +1742,7 @@ Gxd *gxd_open(const GxdConfig *cfg)
     if (!g) return NULL;
 
     g->windowed = cfg->windowed;
-    { const char *pv = getenv("NNK_PERF"); g->perf = (pv && *pv && *pv != '0'); }
+    { const char *pv = getenv("NNK_PERF"); g->perf = pv ? (unsigned)strtoul(pv, NULL, 0) : 0; }
     g->gl_3d = cfg->gl_3d;
     g->scale = cfg->scale > 0 ? cfg->scale : 1;
     g->layout = cfg->layout;
@@ -2040,6 +2076,8 @@ void gxd_frame(Gxd *g)
     {
         Gx2DState st;
         const uint32_t *fb;
+        double tc = 0.0;
+        if (perf > 1) tc = gx_pf_now();
         state_dump(g);
         gx2d_state_load(&st, g->img);
         if (g->fb3d_override)
@@ -2050,6 +2088,7 @@ void gxd_frame(Gxd *g)
             fb = g->colorbuf;
         gx2d_render_frame(&st, fb, g->screen[0], g->screen[1]);
         dbg_2dinfo(g, &st);
+        if (perf > 1) gx_pf_sec[GXPF_COMPOSE] += gx_pf_now() - tc;
     }
 
     /* 5. present + input */
@@ -2072,11 +2111,38 @@ void gxd_frame(Gxd *g)
             double span = (double)(t1 - t_prev);
             double per = span / (double)t_n;
             double rend = t_render / (double)t_n;
+            unsigned nf = t_n;
+            int k;
             fprintf(stderr,
                     "perf: %.1f fps | frame %.1f ms = render %.1f ms + guest %.1f ms"
                     " (render %.0f%%)\n",
                     (double)t_n * 1000.0 / span, per, rend, per - rend,
                     100.0 * rend / (per > 0 ? per : 1));
+            if (perf > 1) {
+                static const char *names[GXPF_N] = {
+                    "clear", "order", "raster", "post", "compose2d", "rest"
+                };
+                double sum = 0.0;
+                for (k = 0; k < GXPF_REST; k++) sum += gx_pf_sec[k];
+                gx_pf_sec[GXPF_REST] = (rend * (double)nf) - sum;
+                fprintf(stderr, "perfs:");
+                for (k = 0; k < GXPF_N; k++)
+                    fprintf(stderr, " %s=%.2f", names[k],
+                            gx_pf_sec[k] / (double)nf);
+                {
+                    static unsigned long long pxprev;
+                    unsigned long long px = gx_ras_pixels_total - pxprev;
+                    pxprev = gx_ras_pixels_total;
+                    fprintf(stderr,
+                            " ms | yfac step_spans=%llu div_spans=%llu"
+                            " px=%llu/frame\n",
+                            gx_ras_yfac_step_spans, gx_ras_yfac_div_spans,
+                            px / (unsigned long long)nf);
+                }
+                gx_ras_yfac_step_spans = 0;
+                gx_ras_yfac_div_spans = 0;
+            }
+            for (k = 0; k < GXPF_N; k++) gx_pf_sec[k] = 0.0;
             t_prev = t1;
             t_n = 0;
             t_render = 0;
