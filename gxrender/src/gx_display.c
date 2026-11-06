@@ -2129,7 +2129,18 @@ void gxd_frame(Gxd *g)
                 for (k = 0; k < GXPF_N; k++)
                     fprintf(stderr, " %s=%.2f", names[k],
                             gx_pf_sec[k] / (double)nf);
-                fprintf(stderr, " ms\n");
+                {
+                    static unsigned long long pxprev;
+                    unsigned long long px = gx_ras_pixels_total - pxprev;
+                    pxprev = gx_ras_pixels_total;
+                    fprintf(stderr,
+                            " ms | yfac step_spans=%llu div_spans=%llu"
+                            " px=%llu/frame\n",
+                            gx_ras_yfac_step_spans, gx_ras_yfac_div_spans,
+                            px / (unsigned long long)nf);
+                }
+                gx_ras_yfac_step_spans = 0;
+                gx_ras_yfac_div_spans = 0;
             }
             for (k = 0; k < GXPF_N; k++) gx_pf_sec[k] = 0.0;
             t_prev = t1;

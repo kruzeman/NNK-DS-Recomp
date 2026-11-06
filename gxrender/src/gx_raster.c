@@ -27,6 +27,11 @@
  * Plain globals (not Gxd state) so the savestate layout is untouched. */
 unsigned long long gx_ras_pixels_total;
 unsigned long long gx_ras_last_pixels;
+/* Phase-5BY diagnostics: how many scanline spans use the constant-step
+ * perspective factor and how many still divide per pixel.  Span-level counts
+ * only (two increments per scanline), so they do not perturb the fill loop. */
+unsigned long long gx_ras_yfac_step_spans;
+unsigned long long gx_ras_yfac_div_spans;
 
 void gx_surface_clear(GxSurface *sf, uint32_t color6, uint32_t depth,
                       uint32_t attr0)
@@ -742,11 +747,15 @@ typedef struct {
     int32_t y;
 } GxSpan;
 
-/* interp_setx()'s perspective factor for the X direction (shift 8) */
-static inline uint32_t span_yfac(const GxSpan *sp, int32_t xl)
+/* Phase-5BY: the perspective factor the pixel loop needs.  The expression is
+ * interp_setx()'s (same truncating division, same operands, same wrapping of
+ * num through uint32_t); it just takes span fields the caller has hoisted into
+ * locals instead of re-reading them from memory. */
+static inline uint32_t span_yfac_v(int32_t xl, int32_t w0n, int32_t w0d,
+                                   int32_t w1d, int32_t xdiff)
 {
-    uint32_t num = ((uint32_t)(xl * sp->w0n)) << 8;
-    int32_t den = xl * sp->w0d + (sp->xdiff - xl) * sp->w1d;
+    uint32_t num = ((uint32_t)(xl * w0n)) << 8;
+    int32_t den = xl * w0d + (xdiff - xl) * w1d;
 
     return den ? (uint32_t)(num / (uint32_t)den) : 0;
 }
@@ -757,14 +766,14 @@ static inline uint32_t span_yfac(const GxSpan *sp, int32_t xl)
  * - front-facing polygon over an OPAQUE BACK-FACING pixel: ties pass
  *   (DepthTest_LessThan_FrontFacing);
  * - otherwise strictly closer (first-submitted wins ties). */
-static inline int span_depth_ok(const GxSpan *sp, uint32_t dstattr,
-                               int32_t dstz, int32_t z)
+static inline int depth_ok_v(int eqz, int frontfacing, uint32_t dlim,
+                             uint32_t dstattr, int32_t dstz, int32_t z)
 {
-    if (sp->eqz) {
-        uint32_t diff = (uint32_t)(dstz - z + (int32_t)sp->dlim);
-        return diff <= sp->dlim * 2;
+    if (eqz) {
+        uint32_t diff = (uint32_t)(dstz - z + (int32_t)dlim);
+        return diff <= dlim * 2;
     }
-    if (sp->frontfacing && (dstattr & 0x00400010u) == 0x00000010u)
+    if (frontfacing && (dstattr & 0x00400010u) == 0x00000010u)
         return z <= dstz;
     return z < dstz;
 }
@@ -783,6 +792,8 @@ static void span_init(GxSpan *sp, GxSurface *sf, const GxPolygon *poly,
     sp->linear = ip->linear;
     sp->wbuffer = ip->wbuffer;
     sp->need_yfac = ((!ip->linear) || ip->wbuffer) && xdiff != 0;
+    if (sp->need_yfac)
+        gx_ras_yfac_div_spans++;   /* spans that divide per pixel */
     sp->x0 = ip->x0;
     sp->xdiff = xdiff;
     sp->w0n = ip->w0n;
@@ -877,65 +888,91 @@ static void fill_span(GxSpan *sp, int32_t x, int32_t xhi, int covmode,
 {
     GxSurface *sf = sp->sf;
     uint32_t *pcolor = sf->color, *pdepth = sf->depth, *pattr = sf->attr;
-    size_t rowbase = sp->rowbase;
-    int32_t y = sp->y;
-    int aa = sp->aa;
+    /* Phase-5BY: hoist the span state the pixel loop tests every iteration.
+     * The pixel stores go through uint32_t*, so without these local copies the
+     * compiler must reload every GxSpan field after each store.  The
+     * interpolant steppers are copied into locals as well; span_seek()
+     * re-seeds them at the start of every part, so no writeback is needed. */
+    const size_t rowbase = sp->rowbase;
+    const int32_t y = sp->y;
+    const int aa = sp->aa;
+    const int32_t span_x0 = sp->x0, xdiff = sp->xdiff;
+    const int32_t w0n = sp->w0n, w0d = sp->w0d, w1d = sp->w1d;
+    const int linear = sp->linear;
+    const int wbuffer = sp->wbuffer;
+    const int need_yfac = sp->need_yfac;
+    const int eqz = sp->eqz, frontfacing = sp->frontfacing;
+    const uint32_t dlim = sp->dlim;
+    const int aref = sp->env->alpha_ref;
+    const int layer2_ok = sp->layer2_ok;
+    const uint32_t polyattr = sp->polyattr;
+    const int zwrite = (sp->poly->attr & (1u << 11)) != 0;
+    const int has_attr = (pattr != NULL);
+    GxStep av[5], zs;
+    int i;
 
     if (x < 0) x = 0;
     span_seek(sp, x);
+
+    /* the local copies must be taken AFTER the seek: span_seek() rewrites the
+     * live stepper remainders and the copies are what the loop advances */
+    for (i = 0; i < 5; i++) av[i] = sp->at[i];
+    zs = sp->stz;
 
     for (; x < xhi; x++) {
         size_t pa = rowbase + (size_t)x;
         uint32_t dstattr, color, alpha, vr, vg, vb;
         uint32_t *pc = pcolor, *pdp = pdepth, *pat = pattr;
-        int32_t z, xl = x - sp->x0, s16, t16;
+        int32_t z, s16, t16, xl = x - span_x0;
         uint32_t yfac = 0;
         int layer2 = 0;
 
-        if (sp->need_yfac)
-            yfac = span_yfac(sp, xl);
+        if (need_yfac)
+            yfac = span_yfac_v(xl, w0n, w0d, w1d, xdiff);
 
-        z = sp->wbuffer ? st_persp(&sp->stz, yfac) : st_val(&sp->stz);
+        z = wbuffer ? st_persp(&zs, yfac) : st_val(&zs);
 
-        dstattr = pattr ? pattr[pa] : 0;
+        dstattr = has_attr ? pattr[pa] : 0;
 
         /* depth first: a rejected pixel costs one compare, no interpolation
          * and no texel fetch */
-        if (!span_depth_ok(sp, dstattr, (int32_t)pdepth[pa], z)) {
-            if (!sp->layer2_ok || !(dstattr & 0xF))
+        if (!depth_ok_v(eqz, frontfacing, dlim, dstattr,
+                        (int32_t)pdepth[pa], z)) {
+            if (!layer2_ok || !(dstattr & 0xF))
                 goto adv;
             /* melonDS falls through to the pixel underneath (the AA second
              * layer) when the topmost one fails (GPU3D_Soft.cpp:1142-1147) */
             layer2 = 1;
             pc = sf->color2; pdp = sf->depth2; pat = sf->attr2;
             dstattr = pat[pa];
-            if (!span_depth_ok(sp, dstattr, (int32_t)pdp[pa], z))
+            if (!depth_ok_v(eqz, frontfacing, dlim, dstattr,
+                            (int32_t)pdp[pa], z))
                 goto adv;
         }
 
-        if (sp->linear) {
-            vr = (uint32_t)st_val(&sp->at[0]);
-            vg = (uint32_t)st_val(&sp->at[1]);
-            vb = (uint32_t)st_val(&sp->at[2]);
-            s16 = st_val(&sp->at[3]);
-            t16 = st_val(&sp->at[4]);
+        if (linear) {
+            vr = (uint32_t)st_val(&av[0]);
+            vg = (uint32_t)st_val(&av[1]);
+            vb = (uint32_t)st_val(&av[2]);
+            s16 = st_val(&av[3]);
+            t16 = st_val(&av[4]);
         } else {
-            vr = (uint32_t)st_persp(&sp->at[0], yfac);
-            vg = (uint32_t)st_persp(&sp->at[1], yfac);
-            vb = (uint32_t)st_persp(&sp->at[2], yfac);
-            s16 = st_persp(&sp->at[3], yfac);
-            t16 = st_persp(&sp->at[4], yfac);
+            vr = (uint32_t)st_persp(&av[0], yfac);
+            vg = (uint32_t)st_persp(&av[1], yfac);
+            vb = (uint32_t)st_persp(&av[2], yfac);
+            s16 = st_persp(&av[3], yfac);
+            t16 = st_persp(&av[4], yfac);
         }
 
         color = shade_px(&sp->sh, (uint8_t)(vr >> 3), (uint8_t)(vg >> 3),
                          (uint8_t)(vb >> 3), (int16_t)s16, (int16_t)t16);
         alpha = color >> 24;
 
-        if ((int)alpha <= sp->env->alpha_ref)
+        if ((int)alpha <= aref)
             goto adv;
 
         if (alpha == 31) {
-            uint32_t attr = sp->polyattr | edge;
+            uint32_t attr = polyattr | edge;
 
             if (aa) {
                 if (covmode == GX_COV_NONE) {
@@ -987,30 +1024,30 @@ static void fill_span(GxSpan *sp, int32_t x, int32_t xhi, int covmode,
         } else {
             uint32_t dstattr2 = dstattr;
 
-            if (!(sp->poly->attr & (1u << 11))) z = -1;
+            if (!zwrite) z = -1;
             if (gx_tr_n > 0)
-                gx_tr_log("trans", x, y, layer2 + 1, color, sp->polyattr, z);
-            plot_translucent(pc, pdp, pat, pa, color, z, sp->polyattr, sp->env);
+                gx_tr_log("trans", x, y, layer2 + 1, color, polyattr, z);
+            plot_translucent(pc, pdp, pat, pa, color, z, polyattr, sp->env);
             /* blend with the bottom pixel too, if needed
              * (GPU3D_Soft.cpp:1199-1201: dstattr edge flags + top layer) */
             if (!layer2 && sf->attr && (dstattr2 & 0xF) && sf->color2 &&
                 sf->attr2 && sf->depth2) {
                 if (gx_tr_n > 0)
-                    gx_tr_log("trans", x, y, 2, color, sp->polyattr, z);
+                    gx_tr_log("trans", x, y, 2, color, polyattr, z);
                 plot_translucent(sf->color2, sf->depth2, sf->attr2, pa, color,
-                                 z, sp->polyattr, sp->env);
+                                 z, polyattr, sp->env);
             }
         }
 adv:
-        if (sp->linear) {
-            st_adv(&sp->at[0]);
-            st_adv(&sp->at[1]);
-            st_adv(&sp->at[2]);
-            st_adv(&sp->at[3]);
-            st_adv(&sp->at[4]);
+        if (linear) {
+            st_adv(&av[0]);
+            st_adv(&av[1]);
+            st_adv(&av[2]);
+            st_adv(&av[3]);
+            st_adv(&av[4]);
         }
-        if (!sp->wbuffer)
-            st_adv(&sp->stz);
+        if (!wbuffer)
+            st_adv(&zs);
     }
 }
 

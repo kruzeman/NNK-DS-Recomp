@@ -31,6 +31,10 @@ typedef struct {
     uint32_t palbase;       /* texpal << 4 */
     int srepeat, sflip, trepeat, tflip;
     uint8_t alpha0;         /* alpha of texel value 0 (TEXIMAGE_PARAM bit 29) */
+    /* Phase-5BY: two flags that turn the per-texel branches into arithmetic
+     * and let the per-texel palette bounds check go away. */
+    int wrap_fast;          /* repeat S/T, no flip: mask the coords */
+    int pal_safe;           /* paletted index provably inside palette RAM */
 } GxTexCtx;
 
 static inline uint16_t gx_tex_pal(const GxTexMem *mem, uint32_t byte_off)
@@ -54,6 +58,8 @@ static inline void gx_tex_prep(GxTexCtx *c, const GxTexMem *mem,
     c->trepeat = (int)((texparam >> 17) & 1);
     c->tflip = (int)((texparam >> 19) & 1);
     c->alpha0 = (texparam & (1u << 29)) ? 0 : 31;
+    c->wrap_fast = c->srepeat && c->trepeat && !c->sflip && !c->tflip;
+    c->pal_safe = ((uint32_t)(c->palbase >> 1) + 256u <= mem->pal_count);
 }
 
 /* Same arithmetic as the reference gx_tex_lookup(); returns 1 and writes
@@ -70,7 +76,12 @@ static inline int gx_tex_fetch(const GxTexCtx *c, int32_t s, int32_t t,
     s >>= 4; /* 12.4 -> texel */
     t >>= 4;
 
-    /* wrapping: bit16 S repeat, bit18 S flip, bit17 T repeat, bit19 T flip */
+    /* wrapping: bit16 S repeat, bit18 S flip, bit17 T repeat, bit19 T flip.
+     * The common DS texture state (repeat both, no flip) is two masks. */
+    if (c->wrap_fast) {
+        s &= width - 1;
+        t &= height - 1;
+    } else {
     if (c->srepeat) {
         if (c->sflip) {
             if (s & width) s = (width - 1) - (s & (width - 1));
@@ -93,6 +104,7 @@ static inline int gx_tex_fetch(const GxTexCtx *c, int32_t s, int32_t t,
         if (t < 0) t = 0;
         else if (t >= height) t = height - 1;
     }
+    }
 
     switch (c->fmt) {
     case 0: /* no texture */
@@ -102,7 +114,7 @@ static inline int gx_tex_fetch(const GxTexCtx *c, int32_t s, int32_t t,
         vramaddr += (uint32_t)(t * width + s);
         if (vramaddr >= mem->vram_size) return 0;
         pixel = mem->vram[vramaddr];
-        *color = gx_tex_pal(mem, c->palbase + ((uint32_t)(pixel & 0x1F) << 1));
+        *color = c->pal_safe ? mem->pal[(c->palbase >> 1) + (uint32_t)(pixel & 0x1F)] : gx_tex_pal(mem, c->palbase + ((uint32_t)(pixel & 0x1F) << 1));
         /* 3-bit alpha, replicated up (melonDS formula) */
         *alpha = (uint8_t)(((pixel >> 3) & 0x1C) + (pixel >> 6));
         return 1;
@@ -112,7 +124,7 @@ static inline int gx_tex_fetch(const GxTexCtx *c, int32_t s, int32_t t,
         if (vramaddr >= mem->vram_size) return 0;
         pixel = (uint8_t)(mem->vram[vramaddr] >> ((s & 0x3) << 1));
         pixel &= 0x3;
-        *color = gx_tex_pal(mem, c->palbase + ((uint32_t)pixel << 1));
+        *color = c->pal_safe ? mem->pal[(c->palbase >> 1) + (uint32_t)pixel] : gx_tex_pal(mem, c->palbase + ((uint32_t)pixel << 1));
         *alpha = (pixel == 0) ? c->alpha0 : 31;
         return 1;
 
@@ -122,7 +134,7 @@ static inline int gx_tex_fetch(const GxTexCtx *c, int32_t s, int32_t t,
         pixel = mem->vram[vramaddr];
         if (s & 0x1) pixel >>= 4;
         else         pixel &= 0xF;
-        *color = gx_tex_pal(mem, c->palbase + ((uint32_t)pixel << 1));
+        *color = c->pal_safe ? mem->pal[(c->palbase >> 1) + (uint32_t)pixel] : gx_tex_pal(mem, c->palbase + ((uint32_t)pixel << 1));
         *alpha = (pixel == 0) ? c->alpha0 : 31;
         return 1;
 
@@ -130,7 +142,7 @@ static inline int gx_tex_fetch(const GxTexCtx *c, int32_t s, int32_t t,
         vramaddr += (uint32_t)(t * width + s);
         if (vramaddr >= mem->vram_size) return 0;
         pixel = mem->vram[vramaddr];
-        *color = gx_tex_pal(mem, c->palbase + ((uint32_t)pixel << 1));
+        *color = c->pal_safe ? mem->pal[(c->palbase >> 1) + (uint32_t)pixel] : gx_tex_pal(mem, c->palbase + ((uint32_t)pixel << 1));
         *alpha = (pixel == 0) ? c->alpha0 : 31;
         return 1;
 
@@ -214,7 +226,7 @@ static inline int gx_tex_fetch(const GxTexCtx *c, int32_t s, int32_t t,
         vramaddr += (uint32_t)(t * width + s);
         if (vramaddr >= mem->vram_size) return 0;
         pixel = mem->vram[vramaddr];
-        *color = gx_tex_pal(mem, c->palbase + ((uint32_t)(pixel & 0x7) << 1));
+        *color = c->pal_safe ? mem->pal[(c->palbase >> 1) + (uint32_t)(pixel & 0x7)] : gx_tex_pal(mem, c->palbase + ((uint32_t)(pixel & 0x7) << 1));
         *alpha = (uint8_t)(pixel >> 3);
         return 1;
 
