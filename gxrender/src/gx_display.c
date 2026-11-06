@@ -1552,6 +1552,34 @@ static void upload_screen(Gxd *g, int which)
                     GL_BGRA, GL_UNSIGNED_BYTE, g->screen[which]);
 }
 
+/* Window title as a live FPS / frame counter: updated twice a second, so the
+ * operator can see how fast the emulated console is actually running against
+ * the DS refresh rate (59.826 Hz). */
+static void update_title(Gxd *g)
+{
+    static Uint32 t0;
+    static unsigned n0;
+    static char buf[192];
+    Uint32 t = SDL_GetTicks();
+    float fps;
+
+    if (!g->win)
+        return;
+    if (t0 == 0) {
+        t0 = t;
+        n0 = g->frames;
+        return;
+    }
+    if (t - t0 < 500)
+        return;
+    fps = (float)(g->frames - n0) * 1000.0f / (float)(t - t0);
+    snprintf(buf, sizeof buf, "Ni no Kuni DS  |  %.1f / %.1f fps  |  frame %u",
+             (double)fps, 59.826, g->frames);
+    SDL_SetWindowTitle(g->win, buf);
+    t0 = t;
+    n0 = g->frames;
+}
+
 static void present(Gxd *g)
 {
     int rect[2][4];
@@ -2018,6 +2046,7 @@ void gxd_frame(Gxd *g)
     if (g->windowed) {
         pump_events(g);
         present(g);
+        update_title(g);
     }
     g->frames++;
     gx_dbg_frame_set(g->frames);   /* Phase-5BT: tag commands of the next frame */
