@@ -30,11 +30,14 @@ boots the game natively, with the DS GPU modelled by our own renderer (`gxrender
 | in-game cutscene (`data/movie/s01.mods`, 581 frames) | working, read from the ROM |
 | in-game prompt *"Skip the cutscene?"* — box, text, **Yes** and **No** | working |
 | answering the prompt → town map, dialogue that advances with input | working |
+| full 3D scene: geometry, textures, strips, clipping, GX matrix readback | working |
+| frame pacing at the console rate (59.826 Hz) | working |
 | sound | not implemented |
-| full 3D: geometry, textures, extended palette | in progress |
 
 Runs are deterministic: same build + ROM + step budget + input script produce
-identical counters and byte-identical frames.  Savestates (`F5`/`F9`) are part of
+identical counters and byte-identical frames.  Known defect: a strict savestate
+round trip is not yet bit-exact (cold vs reloaded state hashes differ while the
+frames match); it is tracked separately and does not affect normal F5/F9 use.  Savestates (`F5`/`F9`) are part of
 the runtime and load across builds (regions are identified by name and version, a
 mismatched layout restores best-effort with a per-region report).
 
@@ -114,6 +117,21 @@ exact next cycle at which anything can change and runs the tick only then, so 20
 steps execute ~450 k ticks instead of 200 M.  Debug probes are compiled in but
 skipped unless `NNK_PROBES=1` (~9% of the run).
 
+`NNK_PERF=1` splits every presented frame into render (3D rasteriser + 2D compose +
+present) and guest, `NNK_PERF=2` adds the renderer's own sections.  Measured on a
+3D town scene, operator savestate, headless:
+
+| | frame | render | guest | fps |
+|---|---|---|---|---|
+| before the idle-spin skip (Phase-5BX) | 39.6 ms | 10.1 ms | 29.5 ms | 25 |
+| after 5BX (idle spin skipped to the next event) | 22.4 ms | 10.1 ms | 12.2 ms | 45 |
+| after 5BY/5BZ (renderer passes) | 18.7 ms | 7.0 ms | 11.7 ms | 53 |
+
+The windowed run presents at 59.826 Hz (`NNK_FPS_LIMIT=<hz>` changes it,
+`NNK_FPS_LIMIT=0` disables pacing): the emulator is faster than the console, so
+without pacing the game runs at 5-6x speed.  A windowed run is not capped by the
+200 M `STEP_LIMIT` harness guard; headless runs keep it so scripts cannot hang.
+
 ## Verification
 
 ```sh
@@ -132,6 +150,9 @@ SKIP_MELONDS=1 bash tools/verify_phase2a.sh   # boot-chain trace gate: 1000/1000
 | `NNK_INPUT_FILE`, `NNK_INPUT_RECORD`, `NNK_INPUT_TRACE` | scripted input, record, trace |
 | `NNK_SAVESTATE`, `NNK_SAVESTATE_SAVE[_AT]`, `NNK_SAVESTATE_STRICT`, `NNK_STATE_HASH_AT` | savestates and determinism hashes |
 | `NNK_TRACE_FROM`, `NNK_SMC_TRACE`, `NNK_EXC_TRACE`, `NNK_DEBUG_AT_PC`, `NNK_VRAM_TRACE`, `NNK_AOBJ_TRACE`, `NNK_DMA_TRACE`, `NNK_MOVIE_TRACE`, `NNK_PROBES` | tracing and probes |
+| `NNK_PERF=1` / `NNK_PERF=2` | frame = render + guest (plus renderer sections) every 2 s |
+| `NNK_FPS_LIMIT=<hz>` | presentation rate (default 59.826; 0 disables pacing) |
+| `NNK_IRQ_TRACE=1`, `NNK_IO_TRACE=1`, `NNK_STORE_TRACE=1` | per-event debug lines (off by default) |
 | `NNK_DMA_LEGACY_SIZE=1` | A/B the pre-5BF DMA transfer-size bit |
 | `NNK_SMC_IMAGE`, `NNK_ROM_PATH`, `NNK_MOVIE_YUV*`, `NNK_MOVIE_MODS*` | A/B overrides for review only |
 
@@ -150,7 +171,7 @@ SKIP_MELONDS=1 bash tools/verify_phase2a.sh   # boot-chain trace gate: 1000/1000
 | PRELUDE_AUDIT.md | How the build proves the runtime has every feature |
 | gxrender/README.md | GX renderer layout and build |
 | gxrender/GX_COVERAGE.md | GX command coverage (implemented vs stubbed) |
-| PHASE4D…PHASE4Z, PHASE5A…PHASE5BN | The engineering log, one file per investigation: what was measured, how, the fix, and the gates that passed |
+| PHASE4D…PHASE4Z, PHASE5A…PHASE5BX | The engineering log, one file per investigation: what was measured, how, the fix, and the gates that passed |
 
 ## Notes on method
 
@@ -198,8 +219,9 @@ C-рантаймом запускает игру нативно, а GPU DS мо�
 | внутриигровой ролик (`data/movie/s01.mods`, 581 кадр) | работает, читается из ROM |
 | окошко *"Skip the cutscene?"* — рамка, текст, **Yes** и **No** | работает |
 | ответ на окошко → карта города, диалог, продвигаемый вводом | работает |
+| полная 3D-сцена: геометрия, текстуры, strip, клип, чтение матриц GX | работает |
+| подача кадров с частотой консоли (59,826 Гц) | работает |
 | звук | не реализован |
-| полный 3D: геометрия, текстуры, расширенная палитра | в работе |
 
 Прогоны детерминированы: одинаковые бинарь, ROM, лимит шагов и скрипт ввода дают
 идентичные счётчики и побайтово одинаковые кадры.  Сейвстейты (`F5`/`F9`) — часть
@@ -282,6 +304,22 @@ Headless, `/usr/bin/time`, по два прогона:
 200 млн шагов приходится ~450 тыс. тиков вместо 200 млн.  Отладочные пробы
 скомпилированы, но пропускаются без `NNK_PROBES=1` (ещё ~9%).
 
+`NNK_PERF=1` делит каждый поданный кадр на рендер (растеризатор 3D + сборка 2D +
+презентация) и гостя, `NNK_PERF=2` добавляет секции рендерера.  Замер на
+3D-сцене города, операторский сейвстейт, headless:
+
+| | кадр | рендер | гость | fps |
+|---|---|---|---|---|
+| до пропуска idle-петли (Phase-5BX) | 39,6 мс | 10,1 мс | 29,5 мс | 25 |
+| после 5BX (петля пропускается до ближайшего события) | 22,4 мс | 10,1 мс | 12,2 мс | 45 |
+| после 5BY/5BZ (проходы по рендереру) | 18,7 мс | 7,0 мс | 11,7 мс | 53 |
+
+Окно подаёт кадры с частотой 59,826 Гц (`NNK_FPS_LIMIT=<гц>` меняет частоту,
+`NNK_FPS_LIMIT=0` отключает ограничение): эмулятор быстрее консоли, и без
+ограничения игра идёт в 5–6 раз быстрее.  Интерактивный прогон больше не
+ограничен предохранителем `STEP_LIMIT` в 200 млн шагов; headless-прогоны его
+сохраняют, чтобы скрипты не зависали.
+
 ## Проверка
 
 ```sh
@@ -300,6 +338,9 @@ SKIP_MELONDS=1 bash tools/verify_phase2a.sh   # трассировочный г�
 | `NNK_INPUT_FILE`, `NNK_INPUT_RECORD`, `NNK_INPUT_TRACE` | скрипт ввода, запись, трасса |
 | `NNK_SAVESTATE`, `NNK_SAVESTATE_SAVE[_AT]`, `NNK_SAVESTATE_STRICT`, `NNK_STATE_HASH_AT` | сейвстейты и хеши детерминизма |
 | `NNK_TRACE_FROM`, `NNK_SMC_TRACE`, `NNK_EXC_TRACE`, `NNK_DEBUG_AT_PC`, `NNK_VRAM_TRACE`, `NNK_AOBJ_TRACE`, `NNK_DMA_TRACE`, `NNK_MOVIE_TRACE`, `NNK_PROBES` | трассировка и пробы |
+| `NNK_PERF=1` / `NNK_PERF=2` | кадр = рендер + гость (плюс секции рендерера) раз в 2 с |
+| `NNK_FPS_LIMIT=<гц>` | частота подачи кадров (по умолчанию 59,826; 0 отключает) |
+| `NNK_IRQ_TRACE=1`, `NNK_IO_TRACE=1`, `NNK_STORE_TRACE=1` | отладочные строки по событиям (по умолчанию выключены) |
 | `NNK_DMA_LEGACY_SIZE=1` | A/B бита размера передачи DMA до 5BF |
 | `NNK_SMC_IMAGE`, `NNK_ROM_PATH`, `NNK_MOVIE_YUV*`, `NNK_MOVIE_MODS*` | A/B-оверрайды только для ревью |
 
@@ -318,4 +359,4 @@ SKIP_MELONDS=1 bash tools/verify_phase2a.sh   # трассировочный г�
 | PRELUDE_AUDIT.md | Как сборка доказывает наличие всех возможностей рантайма |
 | gxrender/README.md | Устройство и сборка рендерера GX |
 | gxrender/GX_COVERAGE.md | Покрытие команд GX (реализовано / заглушено) |
-| PHASE4D…PHASE4Z, PHASE5A…PHASE5BN | Инженерный журнал: по файлу на исследование — что измерено, как, какой фикс и какие гейты пройдены |
+| PHASE4D…PHASE4Z, PHASE5A…PHASE5BX | Инженерный журнал: по файлу на исследование — что измерено, как, какой фикс и какие гейты пройдены |
