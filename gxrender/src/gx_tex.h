@@ -249,6 +249,134 @@ static inline int gx_tex_fetch(const GxTexCtx *c, int32_t s, int32_t t,
 int gx_tex_lookup(const GxTexMem *mem, uint32_t texparam, uint32_t texpal,
                   int32_t s, int32_t t, uint16_t *color, uint8_t *alpha);
 
+/* ------------------------------------------------------------------ */
+/* Phase-5BZ: format-specialised texel fetches for the 3D span filler. */
+/*                                                                    */
+/* Profile (callgrind, operator 3D-city state, 107 frames): 13.5 M     */
+/* texel fetches/frame-set at 113 Ir each, and 81 % of the pixels are  */
+/* format 5 (4x4-compressed) with repeat+flip on BOTH axes, 17 %       */
+/* format 1 (A3I5) with clamping on both axes.  These two functions    */
+/* are gx_tex_fetch() with the format and the wrap class fixed at the  */
+/* call site (fill_span() checks the class once per span, before the   */
+/* pixel loop), so the per-texel format switch and the wrap-flag       */
+/* branches disappear.  The arithmetic is copied unchanged, so the     */
+/* framebuffer stays bit-identical.  Every path writes both outputs.  */
+/* ------------------------------------------------------------------ */
+
+/* format 5, S and T both repeat+flip */
+static inline void gx_tex_fetch_5_flip(const GxTexCtx *c, int32_t s, int32_t t,
+                                       uint16_t *color, uint8_t *alpha)
+{
+    const GxTexMem *mem = c->mem;
+    int32_t width = c->width, height = c->height;
+    uint32_t vramaddr = c->vramaddr;
+    uint32_t blockaddr, slot1addr, paloffset, palinfo;
+    uint32_t r, g, b;
+    uint8_t val, mode;
+    uint16_t color0, color1;
+
+    s >>= 4;
+    t >>= 4;
+    if (s & width) s = (width - 1) - (s & (width - 1));
+    else           s = (s & (width - 1));
+    if (t & height) t = (height - 1) - (t & (height - 1));
+    else            t = (t & (height - 1));
+
+    blockaddr = vramaddr + (uint32_t)(t & 0x3FC) * (uint32_t)(width >> 2) +
+                (uint32_t)(s & 0x3FC) + (uint32_t)(t & 0x3);
+    blockaddr &= 0x7FFFF;
+
+    slot1addr = 0x20000 + ((blockaddr & 0x1FFFC) >> 1);
+    if (blockaddr >= 0x40000)
+        slot1addr += 0x10000;
+
+    if (blockaddr >= 0x20000 && blockaddr < 0x40000) {
+        val = 0;
+    } else {
+        if (blockaddr >= mem->vram_size) { *color = 0; *alpha = 0; return; }
+        val = (uint8_t)(mem->vram[blockaddr] >> (2 * (s & 0x3)));
+    }
+
+    if (slot1addr + 1 >= mem->vram_size) { *color = 0; *alpha = 0; return; }
+    palinfo = (uint32_t)mem->vram[slot1addr] |
+              ((uint32_t)mem->vram[slot1addr + 1] << 8);
+    paloffset = (palinfo & 0x3FFF) << 2;
+    mode = (uint8_t)(palinfo >> 14);
+
+    switch (val & 0x3) {
+    case 0:
+        *color = gx_tex_pal(mem, c->palbase + paloffset);
+        *alpha = 31;
+        return;
+    case 1:
+        *color = gx_tex_pal(mem, c->palbase + paloffset + 2);
+        *alpha = 31;
+        return;
+    case 2:
+        if (mode == 1 || mode == 3) {
+            color0 = gx_tex_pal(mem, c->palbase + paloffset);
+            color1 = gx_tex_pal(mem, c->palbase + paloffset + 2);
+            if (mode == 1) {
+                r = ((color0 & 0x001F) + (color1 & 0x001F)) >> 1;
+                g = (((color0 & 0x03E0) + (color1 & 0x03E0)) >> 1) & 0x03E0;
+                b = (((color0 & 0x7C00) + (color1 & 0x7C00)) >> 1) & 0x7C00;
+            } else {
+                r = ((color0 & 0x001F) * 5 + (color1 & 0x001F) * 3) >> 3;
+                g = (((color0 & 0x03E0) * 5 + (color1 & 0x03E0) * 3) >> 3) & 0x03E0;
+                b = (((color0 & 0x7C00) * 5 + (color1 & 0x7C00) * 3) >> 3) & 0x7C00;
+            }
+            *color = (uint16_t)(r | g | b);
+        } else {
+            *color = gx_tex_pal(mem, c->palbase + paloffset + 4);
+        }
+        *alpha = 31;
+        return;
+    case 3:
+        if (mode == 2) {
+            *color = gx_tex_pal(mem, c->palbase + paloffset + 6);
+            *alpha = 31;
+        } else if (mode == 3) {
+            color0 = gx_tex_pal(mem, c->palbase + paloffset);
+            color1 = gx_tex_pal(mem, c->palbase + paloffset + 2);
+            r = ((color0 & 0x001F) * 3 + (color1 & 0x001F) * 5) >> 3;
+            g = (((color0 & 0x03E0) * 3 + (color1 & 0x03E0) * 5) >> 3) & 0x03E0;
+            b = (((color0 & 0x7C00) * 3 + (color1 & 0x7C00) * 5) >> 3) & 0x7C00;
+            *color = (uint16_t)(r | g | b);
+            *alpha = 31;
+        } else {
+            *color = 0;
+            *alpha = 0;
+        }
+        return;
+    }
+    *color = 0;
+    *alpha = 0;
+}
+
+/* format 1 (A3I5), S and T both clamped (no repeat) */
+static inline void gx_tex_fetch_1_clamp(const GxTexCtx *c, int32_t s, int32_t t,
+                                        uint16_t *color, uint8_t *alpha)
+{
+    const GxTexMem *mem = c->mem;
+    int32_t width = c->width, height = c->height;
+    uint32_t vramaddr = c->vramaddr;
+    uint8_t pixel;
+
+    s >>= 4;
+    t >>= 4;
+    if (s < 0) s = 0;
+    else if (s >= width) s = width - 1;
+    if (t < 0) t = 0;
+    else if (t >= height) t = height - 1;
+
+    vramaddr += (uint32_t)(t * width + s);
+    if (vramaddr >= mem->vram_size) { *color = 0; *alpha = 0; return; }
+    pixel = mem->vram[vramaddr];
+    *color = c->pal_safe ? mem->pal[(c->palbase >> 1) + (uint32_t)(pixel & 0x1F)]
+                         : gx_tex_pal(mem, c->palbase + ((uint32_t)(pixel & 0x1F) << 1));
+    *alpha = (uint8_t)(((pixel >> 3) & 0x1C) + (pixel >> 6));
+}
+
 /* Decode a whole texture into an RGBA8888 buffer (row-major, width from
  * texparam).  Used by the GL backend skeleton and by tests.  Returns the
  * texel width, or 0 on bad parameters. */

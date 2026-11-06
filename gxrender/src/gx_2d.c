@@ -288,14 +288,18 @@ static void eng_calculate_window_mask(Gx2DEng *en)
 
 /* ---- pixel plot / backdrop / 3D layer ---- */
 
-static void draw_pixel(uint32_t *dst, uint16_t color, uint32_t flag)
+/* Phase-5BZ: always_inline.  It is called straight-line from the BG/sprite
+ * pixel loops with a constant `flag`; keeping it a call cost the 359 000
+ * calls/frame a prologue/epilogue each and a reload of the debug flag. */
+static inline __attribute__((always_inline)) void
+draw_pixel(uint32_t *dst, uint16_t color, uint32_t flag)
 {
     /* melonDS: bit15 of palette colors is the bottom green bit */
     uint8_t r = (uint8_t)((color & 0x001F) << 1);
     uint8_t g = (uint8_t)(((color & 0x03E0) >> 4) | ((color & 0x8000) >> 15));
     uint8_t b = (uint8_t)((color & 0x7C00) >> 9);
 
-    if (dbg_on)
+    if (__builtin_expect(dbg_on != 0, 0))
     {
         unsigned f = flag >> 24;
         int s = 4;                       /* OBJ (sprite flags live below 24) */

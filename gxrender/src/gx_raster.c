@@ -83,30 +83,40 @@ static void shade_ctx_init(GxShadeCtx *c, const GxPolygon *poly,
         gx_tex_prep(&c->tex, env->tex, poly->texparam, poly->texpal);
 }
 
-static inline uint32_t shade_px(const GxShadeCtx *c, uint8_t vr, uint8_t vg,
-                                uint8_t vb, int32_t s, int32_t t)
+static inline void shade_ctx_pre(const GxShadeCtx *c, uint8_t *pvr,
+                                 uint8_t *pvg, uint8_t *pvb)
 {
-    uint8_t r, g, b, a;
+    uint8_t vr = *pvr, vg = *pvg, vb = *pvb;
 
     if (c->blendmode == 2) {
         if (c->highlight) {
-            /* highlight mode: all vertex channels set to the red value;
-             * the toon color is added after texture blending */
             vg = vr;
             vb = vr;
         } else {
-            /* toon mode: vertex color replaced by toon table entry */
             uint16_t tooncolor = c->toon[vr >> 1];
             vr = (uint8_t)((tooncolor << 1) & 0x3E); if (vr) vr++;
             vg = (uint8_t)((tooncolor >> 4) & 0x3E); if (vg) vg++;
             vb = (uint8_t)((tooncolor >> 9) & 0x3E); if (vb) vb++;
         }
     }
+    *pvr = vr; *pvg = vg; *pvb = vb;
+}
+
+/* the part of shade_px() after the texel has been decoded: identical
+ * arithmetic, taking the BGR555 texel and its alpha as arguments so the
+ * span filler can supply them from a format-specialised fetch. */
+/* Phase-5BZ: always_inline -- GCC outlined this when the span loop was
+ * instantiated four times and the call cost 78 Ir/pixel, more than the whole
+ * shading body. */
+static inline __attribute__((always_inline)) uint32_t
+shade_ctx_post(const GxShadeCtx *c, uint8_t vr,
+               uint8_t vg, uint8_t vb, uint16_t tcolor,
+               uint8_t talpha)
+{
+    uint8_t r, g, b, a;
 
     if (c->textured) {
-        uint8_t tr, tg, tb, talpha = 0;
-        uint16_t tcolor = 0;
-        gx_tex_fetch(&c->tex, s, t, &tcolor, &talpha);
+        uint8_t tr, tg, tb;
 
         tr = (uint8_t)((tcolor << 1) & 0x3E); if (tr) tr++;
         tg = (uint8_t)((tcolor >> 4) & 0x3E); if (tg) tg++;
@@ -152,6 +162,18 @@ static inline uint32_t shade_px(const GxShadeCtx *c, uint8_t vr, uint8_t vg,
 
     return (uint32_t)r | ((uint32_t)g << 8) | ((uint32_t)b << 16) |
            ((uint32_t)a << 24);
+}
+
+static inline uint32_t shade_px(const GxShadeCtx *c, uint8_t vr, uint8_t vg,
+                                uint8_t vb, int32_t s, int32_t t)
+{
+    uint16_t tcolor = 0;
+    uint8_t talpha = 0;
+
+    shade_ctx_pre(c, &vr, &vg, &vb);
+    if (c->textured)
+        gx_tex_fetch(&c->tex, s, t, &tcolor, &talpha);
+    return shade_ctx_post(c, vr, vg, vb, tcolor, talpha);
 }
 
 uint32_t gx_shade_pixel(const GxPolygon *poly, uint8_t vr, uint8_t vg,
@@ -260,10 +282,21 @@ static int32_t interp_value(const GxInterp *ip, int32_t y0, int32_t y1)
                     ((int64_t)(1 << ip->shift) - ip->yfactor)) >> ip->shift);
     } else {
         /* linear interpolation */
-        if (y0 < y1)
-            return y0 + (int32_t)((int64_t)(y1 - y0) * ip->x / ip->xdiff);
-        else
-            return y1 + (int32_t)((int64_t)(y0 - y1) * (ip->xdiff - ip->x) / ip->xdiff);
+        /* Phase-5BZ: |y1-y0| <= 0x1FFFF and x <= 256, so the product fits in
+         * 32 bits and a 32-bit division is exactly the 64-bit quotient. */
+        if (y0 < y1) {
+            int32_t d = y1 - y0;
+            if (d <= 0x7FFFFF)
+                return y0 + (int32_t)((int32_t)d * ip->x / ip->xdiff);
+            return y0 + (int32_t)((int64_t)d * ip->x / ip->xdiff);
+        } else {
+            int32_t d = y0 - y1;
+            if (d <= 0x7FFFFF)
+                return y1 + (int32_t)((int32_t)d * (ip->xdiff - ip->x) /
+                                      ip->xdiff);
+            return y1 + (int32_t)((int64_t)d * (ip->xdiff - ip->x) /
+                                  ip->xdiff);
+        }
     }
 }
 
@@ -709,10 +742,25 @@ static inline int32_t st_val(const GxStep *s)
 static void st_seek(GxStep *s, int32_t xl, int32_t xdiff)
 {
     int32_t u = s->up ? xl : (xdiff - xl);
-    int64_t p = s->d * (int64_t)u;
 
-    s->q = p / s->D;
-    s->r = (int32_t)(p % s->D);
+    /* Phase-5BZ: q = floor(d*u/D) with d >= 0.  For the five attribute
+     * interpolants d is a vertex channel difference (|y1-y0|, at most a few
+     * 2^16s) and u <= 256, so d*u fits in 32 bits and a 32-bit division
+     * returns exactly the same quotient as the 64-bit one -- idiv r32 is
+     * roughly half the latency of idiv r64, and this runs per scanline part.
+     * The Z stepper keeps the 64-bit path: its d is (d>>9)*xrecip_z, which
+     * reaches 2^35. */
+    if (s->d <= (int64_t)0x3FFFFF) {
+        int32_t p32 = (int32_t)s->d * u;
+
+        s->q = p32 / s->D;
+        s->r = p32 % s->D;
+    } else {
+        int64_t p = s->d * (int64_t)u;
+
+        s->q = p / s->D;
+        s->r = (int32_t)(p % s->D);
+    }
 }
 
 /* interp_value()'s perspective branch with the perspective factor already
@@ -861,7 +909,16 @@ static void span_init(GxSpan *sp, GxSurface *sf, const GxPolygon *poly,
 }
 
 /* move the steppers to pixel x (spans are filled front to back, and a part
- * can start anywhere inside the span) */
+ * can start anywhere inside the span).
+ *
+ * Phase-5BZ: the three parts of one scanline are filled left to right, so
+ * usually they are already at x and nothing has to be recomputed.  The
+ * steppers are seeded at x == x0 by span_init() (q = r = 0), so the filler
+ * advances the live steppers pixel by pixel -- five adds each, no division --
+ * to reach any later x, instead of re-deriving floor(d*u/D) for every part.
+ * That removes up to 12 of the 18 64/32-bit divisions per scanline.  The
+ * perspective path has no per-pixel step (each pixel is a fresh yfac
+ * division), so it keeps the division seek. */
 static void span_seek(GxSpan *sp, int32_t x)
 {
     int32_t xl = x - sp->x0;
@@ -876,12 +933,170 @@ static void span_seek(GxSpan *sp, int32_t x)
     if (!sp->wbuffer)
         st_seek(&sp->stz, xl, sp->xdiff);
 }
-
 enum { GX_COV_NONE = 0, GX_COV_LEFT = 1, GX_COV_RIGHT = 2 };
 
 /* fill [x, xhi) of one scanline part.  covmode selects the AA coverage rule of
  * the part (interior pixels carry no coverage; the edges accumulate it in
- * *xcovp, which only advances on pixels that are actually written). */
+ * *xcovp, which only advances on pixels that are actually written).
+ *
+ * Phase-5BZ: the per-pixel body is a macro so the texel fetch can be the
+ * one that matches this span's state (see the dispatch at the end of the
+ * function).  GX_SPAN_LOOP is textually the 5BY loop -- same depth rules,
+ * same blending, same order -- with two changes: the early exits jump to a
+ * per-instantiation adv_<TAG> label that still advances the interpolant
+ * steppers (a plain `continue` skips them and silently flattens the span --
+ * the 5BY trap), and the texel fetch is supplied by the
+ * caller, whose class was decided once for the whole span. */
+
+#define GX_SPAN_LOOP(FETCH, TAG)                                              \
+    for (; x < xhi; x++) {                                                    \
+        size_t pa = rowbase + (size_t)x;                                       \
+        uint32_t dstattr, color, alpha, vr, vg, vb;                            \
+        uint32_t *pc = pcolor, *pdp = pdepth, *pat = pattr;                    \
+        int32_t z, s16, t16, xl = x - span_x0;                                 \
+        uint32_t yfac = 0;                                                     \
+        uint8_t vr8, vg8, vb8;                                                 \
+        uint16_t tcolor = 0;                                                   \
+        uint8_t talpha = 0;                                                    \
+        int layer2 = 0;                                                        \
+                                                                               \
+        if (need_yfac)                                                         \
+            yfac = span_yfac_v(xl, w0n, w0d, w1d, xdiff);                      \
+                                                                               \
+        z = wbuffer ? st_persp(&zs, yfac) : st_val(&zs);                       \
+                                                                               \
+        dstattr = has_attr ? pattr[pa] : 0;                                    \
+                                                                               \
+        /* depth first: a rejected pixel costs one compare, no interpolation   \
+         * and no texel fetch */                                               \
+        if (!depth_ok_v(eqz, frontfacing, dlim, dstattr,                       \
+                        (int32_t)pdepth[pa], z)) {                             \
+            if (!layer2_ok || !(dstattr & 0xF))                                \
+                goto adv_##TAG;                                                \
+            /* melonDS falls through to the pixel underneath (the AA second    \
+             * layer) when the topmost one fails (GPU3D_Soft.cpp:1142-1147) */ \
+            layer2 = 1;                                                        \
+            pc = sf->color2; pdp = sf->depth2; pat = sf->attr2;                \
+            dstattr = pat[pa];                                                 \
+            if (!depth_ok_v(eqz, frontfacing, dlim, dstattr,                   \
+                            (int32_t)pdp[pa], z))                              \
+                goto adv_##TAG;                                                \
+        }                                                                      \
+                                                                               \
+        if (linear) {                                                          \
+            vr = (uint32_t)st_val(&av[0]);                                     \
+            vg = (uint32_t)st_val(&av[1]);                                     \
+            vb = (uint32_t)st_val(&av[2]);                                     \
+            s16 = st_val(&av[3]);                                              \
+            t16 = st_val(&av[4]);                                              \
+        } else {                                                               \
+            vr = (uint32_t)st_persp(&av[0], yfac);                             \
+            vg = (uint32_t)st_persp(&av[1], yfac);                             \
+            vb = (uint32_t)st_persp(&av[2], yfac);                             \
+            s16 = st_persp(&av[3], yfac);                                      \
+            t16 = st_persp(&av[4], yfac);                                      \
+        }                                                                      \
+                                                                               \
+        vr8 = (uint8_t)(vr >> 3);                                              \
+        vg8 = (uint8_t)(vg >> 3);                                              \
+        vb8 = (uint8_t)(vb >> 3);                                              \
+        shade_ctx_pre(&sp->sh, &vr8, &vg8, &vb8);                              \
+        FETCH;                                                                 \
+        color = shade_ctx_post(&sp->sh, vr8, vg8, vb8, tcolor, talpha);        \
+        alpha = color >> 24;                                                   \
+                                                                               \
+        if ((int)alpha <= aref)                                                \
+            goto adv_##TAG;                                                    \
+                                                                               \
+        if (alpha == 31) {                                                     \
+            uint32_t attr = polyattr | edge;                                   \
+                                                                               \
+            if (aa) {                                                          \
+                if (covmode == GX_COV_NONE) {                                  \
+                    /* anti-aliasing: interior pixels of the top/bottom        \
+                     * scanline keep full coverage */                          \
+                    if (attr & 0xF) {                                          \
+                        attr |= (0x1Fu << 8);                                  \
+                        if (!layer2 && sf->color2) {                           \
+                            if (tr_on)                                         \
+                                gx_tr_log("push", x, y, 2, sf->color[pa],      \
+                                          pattr ? pattr[pa] : 0,               \
+                                          (int32_t)sf->depth[pa]);             \
+                            sf->color2[pa] = sf->color[pa];                    \
+                            sf->depth2[pa] = sf->depth[pa];                    \
+                            if (sf->attr2) sf->attr2[pa] = sf->attr[pa];       \
+                        }                                                      \
+                    }                                                          \
+                } else {                                                       \
+                    int32_t cov = (int32_t)edgecov;                            \
+                                                                               \
+                    if (cov & (1 << 31)) {                                     \
+                        if (covmode == GX_COV_LEFT) {                          \
+                            cov = *xcovp >> 5;                                 \
+                            if (cov > 31) cov = 31;                            \
+                        } else {                                               \
+                            cov = 0x1F - (*xcovp >> 5);                        \
+                            if (cov < 0) cov = 0;                              \
+                        }                                                      \
+                        *xcovp += (int32_t)(edgecov & 0x3FF);                  \
+                    }                                                          \
+                    attr |= (uint32_t)(cov << 8);                              \
+                    if (!layer2 && sf->color2) {                               \
+                        if (tr_on)                                             \
+                            gx_tr_log("push", x, y, 2, sf->color[pa],          \
+                                      pattr ? pattr[pa] : 0,                   \
+                                      (int32_t)sf->depth[pa]);                 \
+                        sf->color2[pa] = sf->color[pa];                        \
+                        sf->depth2[pa] = sf->depth[pa];                        \
+                        if (sf->attr2) sf->attr2[pa] = sf->attr[pa];           \
+                    }                                                          \
+                }                                                              \
+            }                                                                  \
+            if (tr_on)                                                         \
+                gx_tr_log(opqtag, x, y, layer2 + 1, color, attr, z);           \
+            pdp[pa] = (uint32_t)z;                                             \
+            pc[pa] = color;                                                    \
+            pxrun++;                                                           \
+            if (pat) pat[pa] = attr;                                           \
+        } else {                                                               \
+            uint32_t dstattr2 = dstattr;                                       \
+                                                                               \
+            if (!zwrite) z = -1;                                               \
+            if (tr_on)                                                         \
+                gx_tr_log("trans", x, y, layer2 + 1, color, polyattr, z);       \
+            plot_translucent(pc, pdp, pat, pa, color, z, polyattr, sp->env);   \
+            /* blend with the bottom pixel too, if needed                      \
+             * (GPU3D_Soft.cpp:1199-1201: dstattr edge flags + top layer) */   \
+            if (!layer2 && sf->attr && (dstattr2 & 0xF) && sf->color2 &&       \
+                sf->attr2 && sf->depth2) {                                     \
+                if (tr_on)                                                     \
+                    gx_tr_log("trans", x, y, 2, color, polyattr, z);           \
+                plot_translucent(sf->color2, sf->depth2, sf->attr2, pa, color, \
+                                 z, polyattr, sp->env);                        \
+            }                                                                  \
+        }                                                                      \
+        adv_##TAG:                                                             \
+        if (linear) {                                                          \
+            st_adv(&av[0]);                                                    \
+            st_adv(&av[1]);                                                    \
+            st_adv(&av[2]);                                                    \
+            st_adv(&av[3]);                                                    \
+            st_adv(&av[4]);                                                    \
+        }                                                                      \
+        if (!wbuffer)                                                          \
+            st_adv(&zs);                                                       \
+    }
+
+#define GX_FETCH_NONE()      do { (void)s16; (void)t16; tcolor = 0; talpha = 0; } while (0)
+#define GX_FETCH_GENERIC()   gx_tex_fetch(&sp->sh.tex, (int16_t)s16,          \
+                                          (int16_t)t16, &tcolor, &talpha)
+#define GX_FETCH_5FLIP()     gx_tex_fetch_5_flip(&sp->sh.tex, (int16_t)s16,   \
+                                                 (int16_t)t16, &tcolor,       \
+                                                 &talpha)
+#define GX_FETCH_1CLAMP()    gx_tex_fetch_1_clamp(&sp->sh.tex, (int16_t)s16,  \
+                                                  (int16_t)t16, &tcolor,      \
+                                                  &talpha)
+
 static void fill_span(GxSpan *sp, int32_t x, int32_t xhi, int covmode,
                       uint32_t edgecov, int32_t *xcovp, uint32_t edge,
                       const char *opqtag)
@@ -891,8 +1106,8 @@ static void fill_span(GxSpan *sp, int32_t x, int32_t xhi, int covmode,
     /* Phase-5BY: hoist the span state the pixel loop tests every iteration.
      * The pixel stores go through uint32_t*, so without these local copies the
      * compiler must reload every GxSpan field after each store.  The
-     * interpolant steppers are copied into locals as well; span_seek()
-     * re-seeds them at the start of every part, so no writeback is needed. */
+     * interpolant steppers are copied into locals as well; span_seek() has
+     * already re-seeded them, so no writeback is needed. */
     const size_t rowbase = sp->rowbase;
     const int32_t y = sp->y;
     const int aa = sp->aa;
@@ -909,147 +1124,49 @@ static void fill_span(GxSpan *sp, int32_t x, int32_t xhi, int covmode,
     const int zwrite = (sp->poly->attr & (1u << 11)) != 0;
     const int has_attr = (pattr != NULL);
     GxStep av[5], zs;
-    int i;
+    unsigned long long pxrun = 0;
+    int i, tclass;
+    const int tr_on = gx_tr_n > 0;   /* hoisted: the tracer is off by default */
 
     if (x < 0) x = 0;
     span_seek(sp, x);
 
-    /* the local copies must be taken AFTER the seek: span_seek() rewrites the
-     * live stepper remainders and the copies are what the loop advances */
     for (i = 0; i < 5; i++) av[i] = sp->at[i];
     zs = sp->stz;
 
-    for (; x < xhi; x++) {
-        size_t pa = rowbase + (size_t)x;
-        uint32_t dstattr, color, alpha, vr, vg, vb;
-        uint32_t *pc = pcolor, *pdp = pdepth, *pat = pattr;
-        int32_t z, s16, t16, xl = x - span_x0;
-        uint32_t yfac = 0;
-        int layer2 = 0;
+    /* Phase-5BZ: pick the per-pixel texel fetch for this span.  The two hot
+     * classes (format 5 with flip on both axes, format 1 clamped) account for
+     * 98 % of the texels in the operator state; everything else uses the
+     * generic fetch.  The class test is exact, so the framebuffer is
+     * unchanged -- only the branch structure of the decode differs. */
+    tclass = 0;
+    if (sp->sh.textured) {
+        const GxTexCtx *tc = &sp->sh.tex;
 
-        if (need_yfac)
-            yfac = span_yfac_v(xl, w0n, w0d, w1d, xdiff);
-
-        z = wbuffer ? st_persp(&zs, yfac) : st_val(&zs);
-
-        dstattr = has_attr ? pattr[pa] : 0;
-
-        /* depth first: a rejected pixel costs one compare, no interpolation
-         * and no texel fetch */
-        if (!depth_ok_v(eqz, frontfacing, dlim, dstattr,
-                        (int32_t)pdepth[pa], z)) {
-            if (!layer2_ok || !(dstattr & 0xF))
-                goto adv;
-            /* melonDS falls through to the pixel underneath (the AA second
-             * layer) when the topmost one fails (GPU3D_Soft.cpp:1142-1147) */
-            layer2 = 1;
-            pc = sf->color2; pdp = sf->depth2; pat = sf->attr2;
-            dstattr = pat[pa];
-            if (!depth_ok_v(eqz, frontfacing, dlim, dstattr,
-                            (int32_t)pdp[pa], z))
-                goto adv;
-        }
-
-        if (linear) {
-            vr = (uint32_t)st_val(&av[0]);
-            vg = (uint32_t)st_val(&av[1]);
-            vb = (uint32_t)st_val(&av[2]);
-            s16 = st_val(&av[3]);
-            t16 = st_val(&av[4]);
-        } else {
-            vr = (uint32_t)st_persp(&av[0], yfac);
-            vg = (uint32_t)st_persp(&av[1], yfac);
-            vb = (uint32_t)st_persp(&av[2], yfac);
-            s16 = st_persp(&av[3], yfac);
-            t16 = st_persp(&av[4], yfac);
-        }
-
-        color = shade_px(&sp->sh, (uint8_t)(vr >> 3), (uint8_t)(vg >> 3),
-                         (uint8_t)(vb >> 3), (int16_t)s16, (int16_t)t16);
-        alpha = color >> 24;
-
-        if ((int)alpha <= aref)
-            goto adv;
-
-        if (alpha == 31) {
-            uint32_t attr = polyattr | edge;
-
-            if (aa) {
-                if (covmode == GX_COV_NONE) {
-                    /* anti-aliasing: interior pixels of the top/bottom
-                     * scanline keep full coverage */
-                    if (attr & 0xF) {
-                        attr |= (0x1Fu << 8);
-                        if (!layer2 && sf->color2) {
-                            if (gx_tr_n > 0)
-                                gx_tr_log("push", x, y, 2, sf->color[pa],
-                                          pattr ? pattr[pa] : 0,
-                                          (int32_t)sf->depth[pa]);
-                            sf->color2[pa] = sf->color[pa];
-                            sf->depth2[pa] = sf->depth[pa];
-                            if (sf->attr2) sf->attr2[pa] = sf->attr[pa];
-                        }
-                    }
-                } else {
-                    int32_t cov = (int32_t)edgecov;
-
-                    if (cov & (1 << 31)) {
-                        if (covmode == GX_COV_LEFT) {
-                            cov = *xcovp >> 5;
-                            if (cov > 31) cov = 31;
-                        } else {
-                            cov = 0x1F - (*xcovp >> 5);
-                            if (cov < 0) cov = 0;
-                        }
-                        *xcovp += (int32_t)(edgecov & 0x3FF);
-                    }
-                    attr |= (uint32_t)(cov << 8);
-                    if (!layer2 && sf->color2) {
-                        if (gx_tr_n > 0)
-                            gx_tr_log("push", x, y, 2, sf->color[pa],
-                                      pattr ? pattr[pa] : 0,
-                                      (int32_t)sf->depth[pa]);
-                        sf->color2[pa] = sf->color[pa];
-                        sf->depth2[pa] = sf->depth[pa];
-                        if (sf->attr2) sf->attr2[pa] = sf->attr[pa];
-                    }
-                }
-            }
-            if (gx_tr_n > 0)
-                gx_tr_log(opqtag, x, y, layer2 + 1, color, attr, z);
-            pdp[pa] = (uint32_t)z;
-            pc[pa] = color;
-            gx_ras_pixels_total++;
-            if (pat) pat[pa] = attr;
-        } else {
-            uint32_t dstattr2 = dstattr;
-
-            if (!zwrite) z = -1;
-            if (gx_tr_n > 0)
-                gx_tr_log("trans", x, y, layer2 + 1, color, polyattr, z);
-            plot_translucent(pc, pdp, pat, pa, color, z, polyattr, sp->env);
-            /* blend with the bottom pixel too, if needed
-             * (GPU3D_Soft.cpp:1199-1201: dstattr edge flags + top layer) */
-            if (!layer2 && sf->attr && (dstattr2 & 0xF) && sf->color2 &&
-                sf->attr2 && sf->depth2) {
-                if (gx_tr_n > 0)
-                    gx_tr_log("trans", x, y, 2, color, polyattr, z);
-                plot_translucent(sf->color2, sf->depth2, sf->attr2, pa, color,
-                                 z, polyattr, sp->env);
-            }
-        }
-adv:
-        if (linear) {
-            st_adv(&av[0]);
-            st_adv(&av[1]);
-            st_adv(&av[2]);
-            st_adv(&av[3]);
-            st_adv(&av[4]);
-        }
-        if (!wbuffer)
-            st_adv(&zs);
+        if (tc->fmt == 5 && tc->srepeat && tc->sflip &&
+            tc->trepeat && tc->tflip)
+            tclass = 1;
+        else if (tc->fmt == 1 && !tc->srepeat && !tc->trepeat)
+            tclass = 2;
+        else
+            tclass = 3;
     }
+
+    switch (tclass) {
+    case 0: { GX_SPAN_LOOP(GX_FETCH_NONE(), none); break; }
+    case 1: { GX_SPAN_LOOP(GX_FETCH_5FLIP(), f5); break; }
+    case 2: { GX_SPAN_LOOP(GX_FETCH_1CLAMP(), f1); break; }
+    default: { GX_SPAN_LOOP(GX_FETCH_GENERIC(), gen); break; }
+    }
+
+    gx_ras_pixels_total += pxrun;
 }
+
+#undef GX_SPAN_LOOP
+#undef GX_FETCH_NONE
+#undef GX_FETCH_GENERIC
+#undef GX_FETCH_5FLIP
+#undef GX_FETCH_1CLAMP
 
 static void render_polygon_scanline(GxSurface *sf, GxRPoly *rp, int32_t y,
                                     const GxRasterEnv *env)
