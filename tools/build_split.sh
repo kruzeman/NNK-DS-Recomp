@@ -391,6 +391,29 @@ if [[ -f "$IMAGE" ]] && ! grep -q 'Phase-5BV matrix-readback splice applied' "$I
   fi
 fi
 
+# Phase-5BZ: the frozen image prints every interrupt and every EXMEMCNT write,
+# and it stops an INTERACTIVE run at the 200M harness budget (`halt=step budget
+# exhausted` seconds after the window opens).  Both are wrong for a session:
+# the probes are now opt-in (NNK_IRQ_TRACE / NNK_IO_TRACE, plus NNK_STORE_TRACE
+# for the store probes in tools/nnk_smc.inc) and a windowed run is unbounded
+# unless NNK_STEP_LIMIT says otherwise.  The headless default keeps the guard.
+# Canonical text lives in nnktool/src/recompile.rs; this applies the identical
+# transform to the frozen artifact.  Negative control:
+# NNK_PRELUDE_DISABLE_SPLICE=5bz_quiet.
+if [[ -f "$IMAGE" ]] && ! grep -q 'Phase-5BZ quiet-splice applied' "$IMAGE"; then
+  if splice_disabled 5bz_quiet; then
+    echo "== prelude splice DISABLED by NNK_PRELUDE_DISABLE_SPLICE: Phase-5BZ quiet run (negative control) =="
+  else
+    SPLICED_IMAGE13="$(dirname "$SPLIT")/$(basename "$IMAGE" .c).p5bz.c"
+    mkdir -p "$(dirname "$SPLICED_IMAGE13")"
+    echo "== splice (Phase-5BZ): quiet probes + unlimited interactive budget -> $SPLICED_IMAGE13 =="
+    python3 tools/p5bz_quiet_splice.py "$IMAGE" "$SPLICED_IMAGE13" || {
+      echo "phase-5bz: quiet splice failed" >&2; exit 2; }
+    IMAGE=$SPLICED_IMAGE13
+    SPLICED_FEATURES+=(5bz_quiet_run)
+  fi
+fi
+
 if [[ "$GX" == "1" ]]; then
   [[ -f "$GXDIR/Makefile" ]] || { echo "NNK_GX=1 but $GXDIR/Makefile missing" >&2; exit 2; }
   echo "== gxrender: building libgxrender.a + gx_display.o + gx_gl.o =="

@@ -1,3 +1,10 @@
+
+/* Phase-5BZ: store-level debug chatter is opt-in (NNK_STORE_TRACE). */
+static int sw_store_trace_c = -1;
+static int sw_dbg(const char *name) {
+    if (sw_store_trace_c < 0) sw_store_trace_c = (getenv(name) != NULL) ? 1 : 0;
+    return sw_store_trace_c;
+}
 /* ==========================================================================
  * Phase-4J — SMC: runtime image-state tracking for self-modifying code.
  *
@@ -857,11 +864,11 @@ static inline void smc_note(uint32_t a, uint32_t n) {
     }
     /* Phase-4V probe: who writes the DTCM IRQ-vector slot and the halted
      * code word?  Fires on the exact bytes (mirrors included). */
-    if (a >= 0x027E3FC0u && a <= 0x027E3FFFu)
+    if (a >= 0x027E3FC0u && a <= 0x027E3FFFu && sw_dbg("NNK_STORE_TRACE"))
         fprintf(stderr, "p4v: vslot store a=0x%08X n=%u step=%llu pc=0x%08X old=0x%08X\n",
                 a, n, (unsigned long long)steps, last_pc, ld32(a));
     if ((a & 0xFF000000u) == 0x02000000u && (a & 0x3FFFFFu) <= 0x1E12Cu &&
-        (a & 0x3FFFFFu) + (n ? n : 1u) > 0x1E12Cu)
+        (a & 0x3FFFFFu) + (n ? n : 1u) > 0x1E12Cu && sw_dbg("NNK_STORE_TRACE"))
         fprintf(stderr, "p4v: code store a=0x%08X n=%u step=%llu pc=0x%08X old=0x%08X\n",
                 a, n, (unsigned long long)steps, last_pc, ld32(a));
     if (!smc_armed) return;

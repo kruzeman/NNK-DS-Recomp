@@ -1717,6 +1717,16 @@ static void cp15_write(uint32_t id, uint32_t val) {
  * NNK_STEP_LIMIT=<n> replaces the compile-time budget for this run. */
 static uint64_t step_limit = STEP_LIMIT;
 
+/* Debug chatter is OPT-IN: these print once per event (interrupt, IO write,
+ * store) and used to fire unconditionally, drowning a normal run in stderr.
+ * NNK_IO_TRACE / NNK_IRQ_TRACE / NNK_STORE_TRACE turn them back on. */
+static int nnk_io_trace_c = -1;
+static int nnk_irq_trace_c = -1;
+static int nnk_dbg_on(int *c, const char *name) {
+    if (*c < 0) *c = (getenv(name) != NULL) ? 1 : 0;
+    return *c;
+}
+
 static const char *halt_msg = NULL;
 /* Distinct-PC bitmap, one bit per HALFWORD: Thumb code lives at 2-byte
  * addresses, so a word-granular bitmap would merge two Thumb instructions
@@ -2987,8 +2997,9 @@ static void io_write32_sw(uint32_t a, uint32_t v) {
     }
     case 0x04000204:
         exmemcnt = v;
-        fprintf(stderr, "io: EXMEMCNT=0x%08X pc=0x%08X gba_decay=0x%04X\n",
-                v, last_pc, gba_openbus_tbl[(v >> 2) & 3u]);
+        if (nnk_dbg_on(&nnk_io_trace_c, "NNK_IO_TRACE"))
+            fprintf(stderr, "io: EXMEMCNT=0x%08X pc=0x%08X gba_decay=0x%04X\n",
+                    v, last_pc, gba_openbus_tbl[(v >> 2) & 3u]);
         return;
     case 0x04000208: ime = v & 1u; return;
     case 0x04000210: ie = v; return;
@@ -3862,8 +3873,9 @@ static void irq_enter(uint32_t *pc) {
     r[14] = BIOS_IRQ_RET;
     irq_active = 1;
     cycles += 12u;                     /* BIOS entry: honest small charge */
-    fprintf(stderr, "irq enter step=%llu resume=0x%08X vector=0x%08X sp_irq=0x%08X spsr=0x%08X ime=%u ie=0x%08X if=0x%08X\n",
-            (unsigned long long)steps, resume, vec, r[13], spsr_bank[MODE_IRQ], ime, ie, iflags);
+    if (nnk_dbg_on(&nnk_irq_trace_c, "NNK_IRQ_TRACE"))
+        fprintf(stderr, "irq enter step=%llu resume=0x%08X vector=0x%08X sp_irq=0x%08X spsr=0x%08X ime=%u ie=0x%08X if=0x%08X\n",
+                (unsigned long long)steps, resume, vec, r[13], spsr_bank[MODE_IRQ], ime, ie, iflags);
     *pc = vec;
 }
 static void bios_irq_return(uint32_t *pc) {
@@ -4278,7 +4290,11 @@ const RUNTIME_ALL_MAIN: &str = r##"int main(int argc, char **argv) {
     guest_init();
     nnk_display_open();
     { const char *s = getenv("NNK_STEP_LIMIT");
-      if (s && s[0]) step_limit = strtoull(s, NULL, 0); }
+      if (s && s[0]) step_limit = strtoull(s, NULL, 0);
+      else { const char *m = getenv("NNK_GX");
+             /* an interactive window must not stop after STEP_LIMIT steps:
+              * the default budget is a harness guard, not a session length */
+             if (m && strcmp(m, "window") == 0) step_limit = ~0ull; } }
     { const char *s = getenv("NNK_TRACE_FROM");
       if (s && s[0]) trace_from = strtoull(s, NULL, 0); }
     { const char *s = getenv("NNK_MODE_TRACE");
