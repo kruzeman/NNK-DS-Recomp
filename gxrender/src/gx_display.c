@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <errno.h>
 
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_opengl.h>
@@ -1617,6 +1618,55 @@ static void update_title(Gxd *g)
     n0 = g->frames;
 }
 
+/* Present at the console's own refresh rate.  The runner is far faster than
+ * the DS (335 fps measured on the title screen), so without pacing the game
+ * runs at 5-6x speed: the guest's VBLANK-derived timing is emulated correctly,
+ * but a frame is shown as soon as it is ready.  Sleep until the next slot so
+ * wall-clock speed matches the hardware.  NNK_FPS_LIMIT=<hz> changes the rate
+ * (NNK_FPS_LIMIT=0 disables pacing, e.g. for benchmarks). */
+static void pace_frame(void)
+{
+    static struct timespec next;
+    static int primed, on = -1;
+    static long period_ns;
+    struct timespec now;
+
+    if (on < 0) {
+        const char *s = getenv("NNK_FPS_LIMIT");
+        double fps = (s && s[0]) ? atof(s) : 59.826;
+        on = (fps > 0.0);
+        period_ns = on ? (long)(1000000000.0 / fps) : 0L;
+    }
+    if (!on)
+        return;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    if (!primed) {
+        next = now;
+        primed = 1;
+    }
+    next.tv_nsec += period_ns;
+    while (next.tv_nsec >= 1000000000L) {
+        next.tv_nsec -= 1000000000L;
+        next.tv_sec++;
+    }
+    if (next.tv_sec < now.tv_sec ||
+        (next.tv_sec == now.tv_sec && next.tv_nsec <= now.tv_nsec)) {
+        next = now;             /* too slow to keep up: resync, never build debt */
+        return;
+    }
+    {
+        struct timespec d;
+        d.tv_sec = next.tv_sec - now.tv_sec;
+        d.tv_nsec = next.tv_nsec - now.tv_nsec;
+        if (d.tv_nsec < 0) {
+            d.tv_nsec += 1000000000L;
+            d.tv_sec--;
+        }
+        while (nanosleep(&d, &d) == -1 && errno == EINTR)
+            ;
+    }
+}
+
 static void present(Gxd *g)
 {
     int rect[2][4];
@@ -2097,6 +2147,7 @@ void gxd_frame(Gxd *g)
         pump_events(g);
         present(g);
         update_title(g);
+        pace_frame();           /* 59.826 Hz: the game runs at console speed */
     }
     g->frames++;
     gx_dbg_frame_set(g->frames);   /* Phase-5BT: tag commands of the next frame */
