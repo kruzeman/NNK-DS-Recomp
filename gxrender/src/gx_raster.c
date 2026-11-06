@@ -49,43 +49,65 @@ int64_t gx_poly_area2(const GxPolygon *poly)
            (int64_t)(c->sx - a->sx) * (b->sy - a->sy);
 }
 
-uint32_t gx_shade_pixel(const GxPolygon *poly, uint8_t vr, uint8_t vg,
-                        uint8_t vb, int32_t s, int32_t t,
-                        const GxRasterEnv *env)
+/* Phase-5BY: the shading state (blend mode, polygon alpha, texture decode) is
+ * constant for a whole polygon, so the rasteriser prepares it once and calls
+ * shade_px() per pixel.  gx_shade_pixel() is the reference entry point used by
+ * tests/test_shade.c and is defined as prepare-once + shade_px, so the two
+ * paths share one implementation and cannot diverge. */
+typedef struct {
+    uint32_t blendmode;    /* POLYGON_ATTR bits 4-5 */
+    uint32_t polyalpha;    /* POLYGON_ATTR bits 16-20 */
+    int wireframe;         /* polyalpha == 0 */
+    int textured;
+    int highlight;
+    const uint16_t *toon;
+    GxTexCtx tex;          /* prepared only when textured */
+} GxShadeCtx;
+
+static void shade_ctx_init(GxShadeCtx *c, const GxPolygon *poly,
+                           const GxRasterEnv *env)
+{
+    c->blendmode = (poly->attr >> 4) & 0x3u;
+    c->polyalpha = (poly->attr >> 16) & 0x1Fu;
+    c->wireframe = (c->polyalpha == 0);
+    c->textured = env->tex_enable && env->tex &&
+                  ((poly->texparam >> 26) & 0x7u) != 0;
+    c->highlight = env->highlight;
+    c->toon = env->toon;
+    if (c->textured)
+        gx_tex_prep(&c->tex, env->tex, poly->texparam, poly->texpal);
+}
+
+static inline uint32_t shade_px(const GxShadeCtx *c, uint8_t vr, uint8_t vg,
+                                uint8_t vb, int32_t s, int32_t t)
 {
     uint8_t r, g, b, a;
-    uint32_t blendmode = (poly->attr >> 4) & 0x3;
-    uint32_t polyalpha = (poly->attr >> 16) & 0x1F;
-    int wireframe = (polyalpha == 0);
-    int textured = env->tex_enable && env->tex &&
-                   ((poly->texparam >> 26) & 0x7) != 0;
 
-    if (blendmode == 2) {
-        if (env->highlight) {
+    if (c->blendmode == 2) {
+        if (c->highlight) {
             /* highlight mode: all vertex channels set to the red value;
              * the toon color is added after texture blending */
             vg = vr;
             vb = vr;
         } else {
             /* toon mode: vertex color replaced by toon table entry */
-            uint16_t tooncolor = env->toon[vr >> 1];
+            uint16_t tooncolor = c->toon[vr >> 1];
             vr = (uint8_t)((tooncolor << 1) & 0x3E); if (vr) vr++;
             vg = (uint8_t)((tooncolor >> 4) & 0x3E); if (vg) vg++;
             vb = (uint8_t)((tooncolor >> 9) & 0x3E); if (vb) vb++;
         }
     }
 
-    if (textured) {
+    if (c->textured) {
         uint8_t tr, tg, tb, talpha = 0;
         uint16_t tcolor = 0;
-        gx_tex_lookup(env->tex, poly->texparam, poly->texpal, s, t,
-                      &tcolor, &talpha);
+        gx_tex_fetch(&c->tex, s, t, &tcolor, &talpha);
 
         tr = (uint8_t)((tcolor << 1) & 0x3E); if (tr) tr++;
         tg = (uint8_t)((tcolor >> 4) & 0x3E); if (tg) tg++;
         tb = (uint8_t)((tcolor >> 9) & 0x3E); if (tb) tb++;
 
-        if (blendmode & 0x1) {
+        if (c->blendmode & 0x1) {
             /* decal */
             if (talpha == 0) {
                 r = vr; g = vg; b = vb;
@@ -96,22 +118,22 @@ uint32_t gx_shade_pixel(const GxPolygon *poly, uint8_t vr, uint8_t vg,
                 g = (uint8_t)(((tg * talpha) + (vg * (31 - talpha))) >> 5);
                 b = (uint8_t)(((tb * talpha) + (vb * (31 - talpha))) >> 5);
             }
-            a = (uint8_t)polyalpha;
+            a = (uint8_t)c->polyalpha;
         } else {
             /* modulate */
             r = (uint8_t)((((int)tr + 1) * ((int)vr + 1) - 1) >> 6);
             g = (uint8_t)((((int)tg + 1) * ((int)vg + 1) - 1) >> 6);
             b = (uint8_t)((((int)tb + 1) * ((int)vb + 1) - 1) >> 6);
-            a = (uint8_t)((((int)talpha + 1) * ((int)polyalpha + 1) - 1) >> 5);
+            a = (uint8_t)((((int)talpha + 1) * ((int)c->polyalpha + 1) - 1) >> 5);
         }
     } else {
         r = vr; g = vg; b = vb;
-        a = (uint8_t)polyalpha;
+        a = (uint8_t)c->polyalpha;
     }
 
-    if (blendmode == 2 && env->highlight) {
+    if (c->blendmode == 2 && c->highlight) {
         /* add the toon color of the original (red) vertex value */
-        uint16_t tooncolor = env->toon[vr >> 1];
+        uint16_t tooncolor = c->toon[vr >> 1];
         uint8_t hvr = (uint8_t)((tooncolor << 1) & 0x3E); if (hvr) hvr++;
         uint8_t hvg = (uint8_t)((tooncolor >> 4) & 0x3E); if (hvg) hvg++;
         uint8_t hvb = (uint8_t)((tooncolor >> 9) & 0x3E); if (hvb) hvb++;
@@ -121,10 +143,20 @@ uint32_t gx_shade_pixel(const GxPolygon *poly, uint8_t vr, uint8_t vg,
         if ((uint16_t)b + hvb > 63) b = 63; else b = (uint8_t)(b + hvb);
     }
 
-    if (wireframe) a = 31;
+    if (c->wireframe) a = 31;
 
     return (uint32_t)r | ((uint32_t)g << 8) | ((uint32_t)b << 16) |
            ((uint32_t)a << 24);
+}
+
+uint32_t gx_shade_pixel(const GxPolygon *poly, uint8_t vr, uint8_t vg,
+                        uint8_t vb, int32_t s, int32_t t,
+                        const GxRasterEnv *env)
+{
+    GxShadeCtx c;
+
+    shade_ctx_init(&c, poly, env);
+    return shade_px(&c, vr, vg, vb, s, t);
 }
 
 static uint32_t alpha_blend(uint32_t src, uint32_t dst, uint32_t alpha,
@@ -154,25 +186,6 @@ static uint32_t alpha_blend(uint32_t src, uint32_t dst, uint32_t alpha,
         dstalpha = alpha;
 
     return srcR | (srcG << 8) | (srcB << 16) | (dstalpha << 24);
-}
-
-/* depth test (melonDS GPU3D_Soft.cpp:385-425):
- * - POLYGON_ATTR bit 14 set: DepthTest_Equal_Z/W, pass when the new depth is
- *   within +-0x200 (Z mode) / +-0xFF (W mode) of the stored depth;
- * - front-facing polygon over an OPAQUE BACK-FACING pixel: ties pass
- *   (DepthTest_LessThan_FrontFacing);
- * - otherwise strictly closer (first-submitted wins ties). */
-static int depth_pass(const GxPolygon *poly, uint32_t dstattr,
-                      int32_t dstz, int32_t z)
-{
-    if (poly->attr & (1u << 14)) {
-        int32_t lim = poly->wbuffer ? 0xFF : 0x200;
-        uint32_t diff = (uint32_t)(dstz - z + lim);
-        return diff <= (uint32_t)(lim * 2);
-    }
-    if (poly->facing_view && (dstattr & 0x00400010u) == 0x00000010u)
-        return z <= dstz;
-    return z < dstz;
 }
 
 /* ------------------------------------------------------------------ */
@@ -642,6 +655,365 @@ static void gx_tr_log(const char *tag, int x, int y, int layer,
     }
 }
 
+/* ------------------------------------------------------------------ */
+/* Phase-5BY: incremental span filler                                 */
+/*                                                                    */
+/* melonDS fills a scanline as left edge / interior / right edge, and  */
+/* so did this file -- with the same per-pixel body written out three  */
+/* times, re-deriving every interpolant through function calls (five   */
+/* or six 64-bit divides per pixel) and fetching a texel even for the  */
+/* pixels the depth test rejected.  This filler reproduces the exact    */
+/* melonDS arithmetic, but:                                            */
+/*   - the linear (W-equal) path becomes fixed-point steppers that      */
+/*     advance each interpolant by a constant per pixel, giving the    */
+/*     same floor(d*u/xdiff) sequence without a per-pixel division;    */
+/*   - the perspective path hoists everything but the one perspective  */
+/*     factor division (interp_setx) out of the loop;                   */
+/*   - the shading/toon/texel state is prepared once per polygon;       */
+/*   - the depth test runs before attribute interpolation and the texel */
+/*     fetch, so rejected pixels cost a compare;                        */
+/*   - row pointers are hoisted and the tracer is gated once.           */
+/* The arithmetic (including the truncating/arith-shift order) is       */
+/* unchanged, so the framebuffer is bit-identical.                      */
+
+typedef struct {
+    int64_t q;      /* floor(d*u/D) at the current pixel */
+    int64_t qs;     /* per-pixel step of q */
+    int32_t r;      /* remainder, 0 <= r < D */
+    int32_t rs;     /* per-pixel step of r */
+    int32_t D;      /* divisor: xdiff for attributes, 8192 for Z-buffer z */
+    int32_t base;   /* value at u == 0 */
+    int64_t d;      /* |y1-y0|: perspective factor path / Z-buffer step */
+    int32_t up;     /* y0 < y1 */
+} GxStep;
+
+static inline void st_adv(GxStep *s)
+{
+    s->q += s->qs;
+    s->r += s->rs;
+    if (s->r < 0)          { s->r += s->D; s->q--; }
+    else if (s->r >= s->D) { s->r -= s->D; s->q++; }
+}
+
+static inline int32_t st_val(const GxStep *s)
+{
+    return s->base + (int32_t)s->q;
+}
+
+/* seed q/r for pixel offset xl (u counts from the near end of the span) */
+static void st_seek(GxStep *s, int32_t xl, int32_t xdiff)
+{
+    int32_t u = s->up ? xl : (xdiff - xl);
+    int64_t p = s->d * (int64_t)u;
+
+    s->q = p / s->D;
+    s->r = (int32_t)(p % s->D);
+}
+
+/* interp_value()'s perspective branch with the perspective factor already
+ * computed (shift is 8 for the X direction, 256 = 1 << 8) */
+static inline int32_t st_persp(const GxStep *s, uint32_t yfac)
+{
+    int64_t f = s->up ? (int64_t)yfac : ((int64_t)256 - (int64_t)yfac);
+
+    return s->base + (int32_t)(((int64_t)s->d * f) >> 8);
+}
+
+typedef struct {
+    GxSurface *sf;
+    const GxPolygon *poly;
+    const GxRasterEnv *env;
+    GxShadeCtx sh;
+
+    int linear;     /* interp_x linear mode (melonDS W-equal fast path) */
+    int wbuffer;    /* W-buffered: z uses the perspective factor */
+    int need_yfac;  /* the per-pixel perspective factor is used at all */
+    int32_t x0, xdiff, w0n, w0d, w1d;
+
+    GxStep at[5];   /* cr, cg, cb, s, t */
+    GxStep stz;
+
+    uint32_t polyattr;
+    int aa;
+    int layer2_ok;  /* the AA second layer exists on this surface */
+    int eqz, frontfacing;
+    uint32_t dlim;
+    size_t rowbase;
+    int32_t y;
+} GxSpan;
+
+/* interp_setx()'s perspective factor for the X direction (shift 8) */
+static inline uint32_t span_yfac(const GxSpan *sp, int32_t xl)
+{
+    uint32_t num = ((uint32_t)(xl * sp->w0n)) << 8;
+    int32_t den = xl * sp->w0d + (sp->xdiff - xl) * sp->w1d;
+
+    return den ? (uint32_t)(num / (uint32_t)den) : 0;
+}
+
+/* depth test (melonDS GPU3D_Soft.cpp:385-425):
+ * - POLYGON_ATTR bit 14 set: DepthTest_Equal_Z/W, pass when the new depth is
+ *   within +-0x200 (Z mode) / +-0xFF (W mode) of the stored depth;
+ * - front-facing polygon over an OPAQUE BACK-FACING pixel: ties pass
+ *   (DepthTest_LessThan_FrontFacing);
+ * - otherwise strictly closer (first-submitted wins ties). */
+static inline int span_depth_ok(const GxSpan *sp, uint32_t dstattr,
+                               int32_t dstz, int32_t z)
+{
+    if (sp->eqz) {
+        uint32_t diff = (uint32_t)(dstz - z + (int32_t)sp->dlim);
+        return diff <= sp->dlim * 2;
+    }
+    if (sp->frontfacing && (dstattr & 0x00400010u) == 0x00000010u)
+        return z <= dstz;
+    return z < dstz;
+}
+
+static void span_init(GxSpan *sp, GxSurface *sf, const GxPolygon *poly,
+                      const GxRasterEnv *env, const GxInterp *ip,
+                      int32_t zl, int32_t zr, const int32_t va[10],
+                      uint32_t polyattr, int aa, int32_t y)
+{
+    int32_t xdiff = ip->xdiff;
+    int i;
+
+    sp->sf = sf;
+    sp->poly = poly;
+    sp->env = env;
+    sp->linear = ip->linear;
+    sp->wbuffer = ip->wbuffer;
+    sp->need_yfac = ((!ip->linear) || ip->wbuffer) && xdiff != 0;
+    sp->x0 = ip->x0;
+    sp->xdiff = xdiff;
+    sp->w0n = ip->w0n;
+    sp->w0d = ip->w0d;
+    sp->w1d = ip->w1d;
+    sp->polyattr = polyattr;
+    sp->aa = aa;
+    sp->layer2_ok = (sf->attr && sf->color2 && sf->attr2 && sf->depth2) != 0;
+    sp->eqz = (poly->attr & (1u << 14)) != 0;
+    sp->frontfacing = poly->facing_view;
+    sp->dlim = poly->wbuffer ? 0xFFu : 0x200u;
+    sp->rowbase = (size_t)y * (size_t)sf->w;
+    sp->y = y;
+    shade_ctx_init(&sp->sh, poly, env);
+
+    for (i = 0; i < 5; i++) {
+        int32_t y0 = va[i], y1 = va[i + 5];
+        int up = (y0 < y1);
+        GxStep *s = &sp->at[i];
+
+        s->base = y0;
+        s->up = 1;
+        s->d = 0;
+        s->q = 0; s->r = 0; s->qs = 0; s->rs = 0; s->D = 1;
+        if (xdiff > 0 && y0 != y1) {
+            int32_t d = up ? (y1 - y0) : (y0 - y1);
+
+            s->base = up ? y0 : y1;
+            s->up = up;
+            s->d = d;
+            s->D = xdiff;
+            s->qs = up ? (d / xdiff) : -(d / xdiff);
+            s->rs = up ? (d % xdiff) : -(d % xdiff);
+        }
+    }
+
+    /* z: interp_z()'s Z-buffer branch is base + ((disp >> 9) * factor *
+     * xrecip_z >> 13), i.e. base + floor(C * factor / 8192) with C >= 0 --
+     * again a constant-step sequence.  W-buffered polygons use the
+     * perspective factor instead (same form as an attribute). */
+    {
+        GxStep *s = &sp->stz;
+        int up = (zl < zr);
+        int32_t d = up ? (zr - zl) : (zl - zr);
+
+        s->base = (xdiff > 0) ? (up ? zl : zr) : zl;
+        s->up = up;
+        s->d = 0;
+        s->D = 8192;
+        s->q = 0; s->r = 0; s->qs = 0; s->rs = 0;
+        if (xdiff > 0 && zl != zr) {
+            if (ip->wbuffer) {
+                s->d = d;
+            } else {
+                int64_t c = (int64_t)(d >> 9) * (int64_t)ip->xrecip_z;
+                int64_t qs = c / 8192;
+                int32_t rs = (int32_t)(c % 8192);
+
+                s->d = c;
+                s->qs = up ? qs : -qs;
+                s->rs = up ? rs : -rs;
+            }
+        }
+    }
+}
+
+/* move the steppers to pixel x (spans are filled front to back, and a part
+ * can start anywhere inside the span) */
+static void span_seek(GxSpan *sp, int32_t x)
+{
+    int32_t xl = x - sp->x0;
+    int i;
+
+    if (xl < 0) xl = 0;
+    else if (xl > sp->xdiff) xl = sp->xdiff;
+    if (sp->linear) {
+        for (i = 0; i < 5; i++)
+            st_seek(&sp->at[i], xl, sp->xdiff);
+    }
+    if (!sp->wbuffer)
+        st_seek(&sp->stz, xl, sp->xdiff);
+}
+
+enum { GX_COV_NONE = 0, GX_COV_LEFT = 1, GX_COV_RIGHT = 2 };
+
+/* fill [x, xhi) of one scanline part.  covmode selects the AA coverage rule of
+ * the part (interior pixels carry no coverage; the edges accumulate it in
+ * *xcovp, which only advances on pixels that are actually written). */
+static void fill_span(GxSpan *sp, int32_t x, int32_t xhi, int covmode,
+                      uint32_t edgecov, int32_t *xcovp, uint32_t edge,
+                      const char *opqtag)
+{
+    GxSurface *sf = sp->sf;
+    uint32_t *pcolor = sf->color, *pdepth = sf->depth, *pattr = sf->attr;
+    size_t rowbase = sp->rowbase;
+    int32_t y = sp->y;
+    int aa = sp->aa;
+
+    if (x < 0) x = 0;
+    span_seek(sp, x);
+
+    for (; x < xhi; x++) {
+        size_t pa = rowbase + (size_t)x;
+        uint32_t dstattr, color, alpha, vr, vg, vb;
+        uint32_t *pc = pcolor, *pdp = pdepth, *pat = pattr;
+        int32_t z, xl = x - sp->x0, s16, t16;
+        uint32_t yfac = 0;
+        int layer2 = 0;
+
+        if (sp->need_yfac)
+            yfac = span_yfac(sp, xl);
+
+        z = sp->wbuffer ? st_persp(&sp->stz, yfac) : st_val(&sp->stz);
+
+        dstattr = pattr ? pattr[pa] : 0;
+
+        /* depth first: a rejected pixel costs one compare, no interpolation
+         * and no texel fetch */
+        if (!span_depth_ok(sp, dstattr, (int32_t)pdepth[pa], z)) {
+            if (!sp->layer2_ok || !(dstattr & 0xF))
+                goto adv;
+            /* melonDS falls through to the pixel underneath (the AA second
+             * layer) when the topmost one fails (GPU3D_Soft.cpp:1142-1147) */
+            layer2 = 1;
+            pc = sf->color2; pdp = sf->depth2; pat = sf->attr2;
+            dstattr = pat[pa];
+            if (!span_depth_ok(sp, dstattr, (int32_t)pdp[pa], z))
+                goto adv;
+        }
+
+        if (sp->linear) {
+            vr = (uint32_t)st_val(&sp->at[0]);
+            vg = (uint32_t)st_val(&sp->at[1]);
+            vb = (uint32_t)st_val(&sp->at[2]);
+            s16 = st_val(&sp->at[3]);
+            t16 = st_val(&sp->at[4]);
+        } else {
+            vr = (uint32_t)st_persp(&sp->at[0], yfac);
+            vg = (uint32_t)st_persp(&sp->at[1], yfac);
+            vb = (uint32_t)st_persp(&sp->at[2], yfac);
+            s16 = st_persp(&sp->at[3], yfac);
+            t16 = st_persp(&sp->at[4], yfac);
+        }
+
+        color = shade_px(&sp->sh, (uint8_t)(vr >> 3), (uint8_t)(vg >> 3),
+                         (uint8_t)(vb >> 3), (int16_t)s16, (int16_t)t16);
+        alpha = color >> 24;
+
+        if ((int)alpha <= sp->env->alpha_ref)
+            goto adv;
+
+        if (alpha == 31) {
+            uint32_t attr = sp->polyattr | edge;
+
+            if (aa) {
+                if (covmode == GX_COV_NONE) {
+                    /* anti-aliasing: interior pixels of the top/bottom
+                     * scanline keep full coverage */
+                    if (attr & 0xF) {
+                        attr |= (0x1Fu << 8);
+                        if (!layer2 && sf->color2) {
+                            if (gx_tr_n > 0)
+                                gx_tr_log("push", x, y, 2, sf->color[pa],
+                                          pattr ? pattr[pa] : 0,
+                                          (int32_t)sf->depth[pa]);
+                            sf->color2[pa] = sf->color[pa];
+                            sf->depth2[pa] = sf->depth[pa];
+                            if (sf->attr2) sf->attr2[pa] = sf->attr[pa];
+                        }
+                    }
+                } else {
+                    int32_t cov = (int32_t)edgecov;
+
+                    if (cov & (1 << 31)) {
+                        if (covmode == GX_COV_LEFT) {
+                            cov = *xcovp >> 5;
+                            if (cov > 31) cov = 31;
+                        } else {
+                            cov = 0x1F - (*xcovp >> 5);
+                            if (cov < 0) cov = 0;
+                        }
+                        *xcovp += (int32_t)(edgecov & 0x3FF);
+                    }
+                    attr |= (uint32_t)(cov << 8);
+                    if (!layer2 && sf->color2) {
+                        if (gx_tr_n > 0)
+                            gx_tr_log("push", x, y, 2, sf->color[pa],
+                                      pattr ? pattr[pa] : 0,
+                                      (int32_t)sf->depth[pa]);
+                        sf->color2[pa] = sf->color[pa];
+                        sf->depth2[pa] = sf->depth[pa];
+                        if (sf->attr2) sf->attr2[pa] = sf->attr[pa];
+                    }
+                }
+            }
+            if (gx_tr_n > 0)
+                gx_tr_log(opqtag, x, y, layer2 + 1, color, attr, z);
+            pdp[pa] = (uint32_t)z;
+            pc[pa] = color;
+            gx_ras_pixels_total++;
+            if (pat) pat[pa] = attr;
+        } else {
+            uint32_t dstattr2 = dstattr;
+
+            if (!(sp->poly->attr & (1u << 11))) z = -1;
+            if (gx_tr_n > 0)
+                gx_tr_log("trans", x, y, layer2 + 1, color, sp->polyattr, z);
+            plot_translucent(pc, pdp, pat, pa, color, z, sp->polyattr, sp->env);
+            /* blend with the bottom pixel too, if needed
+             * (GPU3D_Soft.cpp:1199-1201: dstattr edge flags + top layer) */
+            if (!layer2 && sf->attr && (dstattr2 & 0xF) && sf->color2 &&
+                sf->attr2 && sf->depth2) {
+                if (gx_tr_n > 0)
+                    gx_tr_log("trans", x, y, 2, color, sp->polyattr, z);
+                plot_translucent(sf->color2, sf->depth2, sf->attr2, pa, color,
+                                 z, sp->polyattr, sp->env);
+            }
+        }
+adv:
+        if (sp->linear) {
+            st_adv(&sp->at[0]);
+            st_adv(&sp->at[1]);
+            st_adv(&sp->at[2]);
+            st_adv(&sp->at[3]);
+            st_adv(&sp->at[4]);
+        }
+        if (!sp->wbuffer)
+            st_adv(&sp->stz);
+    }
+}
+
 static void render_polygon_scanline(GxSurface *sf, GxRPoly *rp, int32_t y,
                                     const GxRasterEnv *env)
 {
@@ -774,282 +1146,59 @@ static void render_polygon_scanline(GxSurface *sf, GxRPoly *rp, int32_t y,
     interp_setup(&interp_x, xstart, xend + 1, wl, wr, polygon->wbuffer, 0);
     if (x < 0) x = 0;
 
-    /* part 1: left edge */
-    edge = yedge | 0x1;
-    xlimit = xstart + l_edgelen;
-    if (xlimit > xend + 1) xlimit = xend + 1;
-    if (xlimit > 256) xlimit = 256;
-    if (l_edgecov & (1 << 31)) {
-        xcov = (l_edgecov >> 12) & 0x3FF;
-        if (xcov == 0x3FF) xcov = 0;
-    }
-    if (!l_filledge) {
-        x = xlimit;
-    } else
-    for (; x < xlimit; x++) {
-        size_t pixeladdr = (size_t)y * sf->w + x;
-        uint32_t dstattr = sf->attr ? sf->attr[pixeladdr] : 0;
-        uint32_t *pcolor = sf->color, *pdepth = sf->depth, *pattr = sf->attr;
-        int layer2 = 0;
-        int32_t z;
-        uint32_t vr, vg, vb, color;
-        int16_t s, t;
-        uint8_t alpha;
+    {
+        /* Phase-5BY: the three fill parts share one incremental filler */
+        GxSpan sp;
+        int32_t va[10];
 
-        interp_setx(&interp_x, x);
-        z = interp_z(&interp_x, zl, zr);
+        if (gx_tr_n < 0)
+            gx_tr_init();
 
-        /* if depth test against the topmost pixel fails, test against the
-         * pixel underneath (AA second layer) */
-        if (!depth_pass(polygon, dstattr, (int32_t)sf->depth[pixeladdr], z)) {
-            if (!sf->attr || !(dstattr & 0xF) || !sf->color2 ||
-                !sf->attr2 || !sf->depth2)
-                continue;
-            /* melonDS falls through to the lower pixel as
-             * pixeladdr += BufferSize in unified 2*w*h buffers
-             * (GPU3D_Soft.cpp:1142-1147); GxSurface keeps the second
-             * layer in separate w*h arrays (color2/depth2/attr2) at the
-             * same base addr */
-            layer2 = 1;
-            pcolor = sf->color2; pdepth = sf->depth2; pattr = sf->attr2;
-            dstattr = pattr[pixeladdr];
-            if (!depth_pass(polygon, dstattr, (int32_t)pdepth[pixeladdr], z))
-                continue;
+        va[0] = rl; va[1] = gl; va[2] = bl; va[3] = sl; va[4] = tl;
+        va[5] = rr; va[6] = gr; va[7] = br; va[8] = sr; va[9] = tr;
+        span_init(&sp, sf, polygon, env, &interp_x, zl, zr, va, polyattr, aa, y);
+
+        /* part 1: left edge */
+        edge = yedge | 0x1;
+        xlimit = xstart + l_edgelen;
+        if (xlimit > xend + 1) xlimit = xend + 1;
+        if (xlimit > 256) xlimit = 256;
+        if (l_edgecov & (1 << 31)) {
+            xcov = (l_edgecov >> 12) & 0x3FF;
+            if (xcov == 0x3FF) xcov = 0;
         }
-
-        vr = (uint32_t)interp_value(&interp_x, rl, rr);
-        vg = (uint32_t)interp_value(&interp_x, gl, gr);
-        vb = (uint32_t)interp_value(&interp_x, bl, br);
-        s = (int16_t)interp_value(&interp_x, sl, sr);
-        t = (int16_t)interp_value(&interp_x, tl, tr);
-
-        color = gx_shade_pixel(polygon, (uint8_t)(vr >> 3), (uint8_t)(vg >> 3),
-                               (uint8_t)(vb >> 3), s, t, env);
-        alpha = (uint8_t)(color >> 24);
-
-        if ((int)alpha <= env->alpha_ref)
-            continue;
-
-        if (alpha == 31) {
-            uint32_t attr = polyattr | (uint32_t)edge;
-            if (aa) {
-                /* anti-aliasing: all edges are rendered; calculate coverage */
-                int32_t cov = l_edgecov;
-                if (cov & (1 << 31)) {
-                    cov = xcov >> 5;
-                    if (cov > 31) cov = 31;
-                    xcov += (l_edgecov & 0x3FF);
-                }
-                attr |= (uint32_t)(cov << 8);
-                /* push old pixel down if needed (only when replacing the
-                 * TOP layer: GPU3D_Soft.cpp:1181-1187, pixeladdr <
-                 * BufferSize; a second-layer plot replaces in place) */
-                if (!layer2 && sf->color2) {
-                    gx_tr_log("push", x, y, 2, sf->color[pixeladdr],
-                              sf->attr ? sf->attr[pixeladdr] : 0,
-                              (int32_t)sf->depth[pixeladdr]);
-                    sf->color2[pixeladdr] = sf->color[pixeladdr];
-                    sf->depth2[pixeladdr] = sf->depth[pixeladdr];
-                    if (sf->attr2)
-                        sf->attr2[pixeladdr] = sf->attr[pixeladdr];
-                }
-            }
-            gx_tr_log("opq1", x, y, layer2 + 1, color, attr, z);
-            pdepth[pixeladdr] = (uint32_t)z;
-            pcolor[pixeladdr] = color;
-            gx_ras_pixels_total++;
-            if (pattr)
-                pattr[pixeladdr] = attr;
+        if (!l_filledge) {
+            x = xlimit;
         } else {
-            uint32_t dstattr2 = dstattr;
-            if (!(polygon->attr & (1u << 11))) z = -1;
-            gx_tr_log("trans", x, y, layer2 + 1, color, polyattr, z);
-            plot_translucent(pcolor, pdepth, pattr, pixeladdr, color, z,
-                             polyattr, env);
-            /* blend with bottom pixel too, if needed
-             * (GPU3D_Soft.cpp:1199-1201: dstattr edge flags + top layer) */
-            if (!layer2 && sf->attr && (dstattr2 & 0xF) && sf->color2 &&
-                sf->attr2 && sf->depth2) {
-                gx_tr_log("trans", x, y, 2, color, polyattr, z);
-                plot_translucent(sf->color2, sf->depth2, sf->attr2, pixeladdr,
-                                 color, z, polyattr, env);
-            }
-        }
-    }
-
-    /* part 2: polygon inside */
-    edge = yedge;
-    xlimit = xend - r_edgelen + 1;
-    if (xlimit > xend + 1) xlimit = xend + 1;
-    if (xlimit > 256) xlimit = 256;
-    if (wireframe && !edge) {
-        if (x < xlimit) x = xlimit;
-    } else
-    for (; x < xlimit; x++) {
-        size_t pixeladdr = (size_t)y * sf->w + x;
-        uint32_t dstattr = sf->attr ? sf->attr[pixeladdr] : 0;
-        uint32_t *pcolor = sf->color, *pdepth = sf->depth, *pattr = sf->attr;
-        int layer2 = 0;
-        int32_t z;
-        uint32_t vr, vg, vb, color;
-        int16_t s, t;
-        uint8_t alpha;
-
-        interp_setx(&interp_x, x);
-        z = interp_z(&interp_x, zl, zr);
-
-        if (!depth_pass(polygon, dstattr, (int32_t)sf->depth[pixeladdr], z)) {
-            if (!sf->attr || !(dstattr & 0xF) || !sf->color2 ||
-                !sf->attr2 || !sf->depth2)
-                continue;
-            /* second layer (GPU3D_Soft.cpp:1236-1244) */
-            layer2 = 1;
-            pcolor = sf->color2; pdepth = sf->depth2; pattr = sf->attr2;
-            dstattr = pattr[pixeladdr];
-            if (!depth_pass(polygon, dstattr, (int32_t)pdepth[pixeladdr], z))
-                continue;
+            fill_span(&sp, x, xlimit, GX_COV_LEFT, (uint32_t)l_edgecov, &xcov,
+                      (uint32_t)edge, "opq1");
+            x = xlimit;
         }
 
-        vr = (uint32_t)interp_value(&interp_x, rl, rr);
-        vg = (uint32_t)interp_value(&interp_x, gl, gr);
-        vb = (uint32_t)interp_value(&interp_x, bl, br);
-        s = (int16_t)interp_value(&interp_x, sl, sr);
-        t = (int16_t)interp_value(&interp_x, tl, tr);
-
-        color = gx_shade_pixel(polygon, (uint8_t)(vr >> 3), (uint8_t)(vg >> 3),
-                               (uint8_t)(vb >> 3), s, t, env);
-        alpha = (uint8_t)(color >> 24);
-
-        if ((int)alpha <= env->alpha_ref)
-            continue;
-
-        if (alpha == 31) {
-            uint32_t attr = polyattr | (uint32_t)edge;
-            if (aa && (attr & 0xF)) {
-                /* anti-aliasing: set coverage to avoid black lines */
-                attr |= (0x1Fu << 8);
-                /* push old pixel down (top layer only:
-                 * GPU3D_Soft.cpp:1270-1276) */
-                if (!layer2 && sf->color2) {
-                    gx_tr_log("push", x, y, 2, sf->color[pixeladdr],
-                              sf->attr ? sf->attr[pixeladdr] : 0,
-                              (int32_t)sf->depth[pixeladdr]);
-                    sf->color2[pixeladdr] = sf->color[pixeladdr];
-                    sf->depth2[pixeladdr] = sf->depth[pixeladdr];
-                    if (sf->attr2)
-                        sf->attr2[pixeladdr] = sf->attr[pixeladdr];
-                }
-            }
-            gx_tr_log("opq2", x, y, layer2 + 1, color, attr, z);
-            pdepth[pixeladdr] = (uint32_t)z;
-            pcolor[pixeladdr] = color;
-            gx_ras_pixels_total++;
-            if (pattr)
-                pattr[pixeladdr] = attr;
+        /* part 2: polygon inside */
+        edge = yedge;
+        xlimit = xend - r_edgelen + 1;
+        if (xlimit > xend + 1) xlimit = xend + 1;
+        if (xlimit > 256) xlimit = 256;
+        if (wireframe && !edge) {
+            if (x < xlimit) x = xlimit;
         } else {
-            uint32_t dstattr2 = dstattr;
-            if (!(polygon->attr & (1u << 11))) z = -1;
-            gx_tr_log("trans", x, y, layer2 + 1, color, polyattr, z);
-            plot_translucent(pcolor, pdepth, pattr, pixeladdr, color, z,
-                             polyattr, env);
-            if (!layer2 && sf->attr && (dstattr2 & 0xF) && sf->color2 &&
-                sf->attr2 && sf->depth2) {
-                gx_tr_log("trans", x, y, 2, color, polyattr, z);
-                plot_translucent(sf->color2, sf->depth2, sf->attr2, pixeladdr,
-                                 color, z, polyattr, env);
-            }
-        }
-    }
-
-    /* part 3: right edge */
-    edge = yedge | 0x2;
-    xlimit = xend + 1;
-    if (xlimit > 256) xlimit = 256;
-    if (r_edgecov & (1 << 31)) {
-        xcov = (r_edgecov >> 12) & 0x3FF;
-        if (xcov == 0x3FF) xcov = 0;
-    }
-    if (r_filledge)
-    for (; x < xlimit; x++) {
-        size_t pixeladdr = (size_t)y * sf->w + x;
-        uint32_t dstattr = sf->attr ? sf->attr[pixeladdr] : 0;
-        uint32_t *pcolor = sf->color, *pdepth = sf->depth, *pattr = sf->attr;
-        int layer2 = 0;
-        int32_t z;
-        uint32_t vr, vg, vb, color;
-        int16_t s, t;
-        uint8_t alpha;
-
-        interp_setx(&interp_x, x);
-        z = interp_z(&interp_x, zl, zr);
-
-        if (!depth_pass(polygon, dstattr, (int32_t)sf->depth[pixeladdr], z)) {
-            if (!sf->attr || !(dstattr & 0xF) || !sf->color2 ||
-                !sf->attr2 || !sf->depth2)
-                continue;
-            /* second layer (GPU3D_Soft.cpp:1328-1336) */
-            layer2 = 1;
-            pcolor = sf->color2; pdepth = sf->depth2; pattr = sf->attr2;
-            dstattr = pattr[pixeladdr];
-            if (!depth_pass(polygon, dstattr, (int32_t)pdepth[pixeladdr], z))
-                continue;
+            fill_span(&sp, x, xlimit, GX_COV_NONE, 0, &xcov, (uint32_t)edge,
+                      "opq2");
+            if (x < xlimit) x = xlimit;
         }
 
-        vr = (uint32_t)interp_value(&interp_x, rl, rr);
-        vg = (uint32_t)interp_value(&interp_x, gl, gr);
-        vb = (uint32_t)interp_value(&interp_x, bl, br);
-        s = (int16_t)interp_value(&interp_x, sl, sr);
-        t = (int16_t)interp_value(&interp_x, tl, tr);
-
-        color = gx_shade_pixel(polygon, (uint8_t)(vr >> 3), (uint8_t)(vg >> 3),
-                               (uint8_t)(vb >> 3), s, t, env);
-        alpha = (uint8_t)(color >> 24);
-
-        if ((int)alpha <= env->alpha_ref)
-            continue;
-
-        if (alpha == 31) {
-            uint32_t attr = polyattr | (uint32_t)edge;
-            if (aa) {
-                /* anti-aliasing: calculate coverage */
-                int32_t cov = r_edgecov;
-                if (cov & (1 << 31)) {
-                    cov = 0x1F - (xcov >> 5);
-                    if (cov < 0) cov = 0;
-                    xcov += (r_edgecov & 0x3FF);
-                }
-                attr |= (uint32_t)(cov << 8);
-                /* push old pixel down (top layer only:
-                 * GPU3D_Soft.cpp:1369-1375) */
-                if (!layer2 && sf->color2) {
-                    gx_tr_log("push", x, y, 2, sf->color[pixeladdr],
-                              sf->attr ? sf->attr[pixeladdr] : 0,
-                              (int32_t)sf->depth[pixeladdr]);
-                    sf->color2[pixeladdr] = sf->color[pixeladdr];
-                    sf->depth2[pixeladdr] = sf->depth[pixeladdr];
-                    if (sf->attr2)
-                        sf->attr2[pixeladdr] = sf->attr[pixeladdr];
-                }
-            }
-            gx_tr_log("opq3", x, y, layer2 + 1, color, attr, z);
-            pdepth[pixeladdr] = (uint32_t)z;
-            pcolor[pixeladdr] = color;
-            gx_ras_pixels_total++;
-            if (pattr)
-                pattr[pixeladdr] = attr;
-        } else {
-            uint32_t dstattr2 = dstattr;
-            if (!(polygon->attr & (1u << 11))) z = -1;
-            gx_tr_log("trans", x, y, layer2 + 1, color, polyattr, z);
-            plot_translucent(pcolor, pdepth, pattr, pixeladdr, color, z,
-                             polyattr, env);
-            if (!layer2 && sf->attr && (dstattr2 & 0xF) && sf->color2 &&
-                sf->attr2 && sf->depth2) {
-                gx_tr_log("trans", x, y, 2, color, polyattr, z);
-                plot_translucent(sf->color2, sf->depth2, sf->attr2, pixeladdr,
-                                 color, z, polyattr, env);
-            }
+        /* part 3: right edge */
+        edge = yedge | 0x2;
+        xlimit = xend + 1;
+        if (xlimit > 256) xlimit = 256;
+        if (r_edgecov & (1 << 31)) {
+            xcov = (r_edgecov >> 12) & 0x3FF;
+            if (xcov == 0x3FF) xcov = 0;
         }
+        if (r_filledge)
+            fill_span(&sp, x, xlimit, GX_COV_RIGHT, (uint32_t)r_edgecov, &xcov,
+                      (uint32_t)edge, "opq3");
     }
 }
 
