@@ -18,7 +18,8 @@ W=work/phase2a
 IMG=work/ghidra_src/arm9.bin
 GH=work/ghidra_arm9_functions.tsv
 ROM="/home/hermes/NiNoKuni/Ni No Kuni.nds"
-SCRATCH=/home/hermes/.hermes/profiles/coder/cache/scratch
+SCRATCH=${NNK_SCRATCH:-/home/hermes/NiNoKuni/work/phase2a}
+mkdir -p "$SCRATCH"
 MTRACE=$SCRATCH/melonds_arm9_trace.txt
 MELONDS=/home/hermes/tools/melonDS/build-ptrace/melonDS
 
