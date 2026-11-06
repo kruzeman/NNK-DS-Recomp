@@ -1043,6 +1043,158 @@ def main():
                           "Phase-5BN IO read hook (io_read32)")
     sys.stderr.write("Phase-5BN: IO touch hooks spliced (write32/16/8, read32)\n")
 
+    # ---- Phase-5BX: the vcount() hooks run on the scanline edge, not per step
+    # Measured (TSC regions, operator state, 88.1 M dispatches): 287 cycles per
+    # dispatched instruction, of which `band-exec` (the compiled guest code) is
+    # ~0.3 % -- the runtime, not the game, is the guest cost.  The two largest
+    # per-step items were the vcount() block + nnk_display_tick() (~65 cycles,
+    # 23 %) and the input tick (~20 cycles).  Both only ever ACT on an event:
+    #   * vcount() = (cycles / 2130) % 263 and `cycles` is monotonic, so the
+    #     5F VBlank-IF raise, the frame edge and the quit poll can only change
+    #     at the next multiple of CYCLES_PER_SCANLINE -> schedule it once
+    #     (nnk_vc_due) and test one integer per instruction.  The edge
+    #     instruction, the IF bit and every presented frame are unchanged.
+    #   * nnk_input_tick() is a NO-OP unless an input source is armed; it now
+    #     reports through nnk_input_busy (tools/nnk_input.inc) and the loop
+    #     skips the call.
+    # The step-PC histogram is the attribution instrument: NNK_PERF=1 samples
+    # every 64th dispatched pc (one masked counter) and prints the top 20 with
+    # shares plus the idle-loop share at exit.
+    BX_GLOBALS = r'''
+/* ==== Phase-5BX: scanline-edge scheduling of the vcount() hooks ==========
+ * `cycles` is monotonic and vcount() = (cycles / CYCLES_PER_SCANLINE) % SCANLINES,
+ * so every vc-dependent event (the Phase-5F VBlank IF raise, the frame edge,
+ * the renderer's quit poll) can only change when `cycles` crosses a scanline
+ * boundary.  nnk_vc_due holds the next such cycle; the per-dispatch cost
+ * collapses to one integer compare.  nnk_vc_edge_step marks the dispatch the
+ * edge belongs to, so trace_pc presents on exactly the instruction the
+ * per-step version presented on. */
+static uint64_t nnk_vc_due;                  /* next cycle a scanline starts  */
+static uint64_t nnk_vc_edge_step = ~0ull;    /* step the pending edge belongs to */
+static int nnk_idle_skip = 1;                /* NNK_IDLE_SKIP=0 disables (A/B) */
+
+/* ==== Phase-5BX: NNK_PERF=1 step-PC histogram (attribution) ==============
+ * Samples the dispatched guest pc every 64th step (a masked counter: one
+ * increment, one test) and prints the top 20 with their share of samples, plus
+ * the share inside the known idle thread loop 0x0200712C..0x02009120 (the WFI
+ * helper is 0x02009118).  A measurement: no guest state, no ordering. */
+#define NNK_PH_BITS 14
+#define NNK_PH_SZ   (1u << NNK_PH_BITS)
+static int nnk_ph_on;
+static uint32_t nnk_ph_mask = 63u;
+static uint32_t nnk_ph_n;
+static uint32_t nnk_ph_pc[NNK_PH_SZ];
+static uint32_t nnk_ph_cnt[NNK_PH_SZ];
+
+static void nnk_ph_sample(uint32_t pc) {
+    uint32_t h = (pc * 2654435761u) >> (32 - NNK_PH_BITS), i = h;
+    for (;;) {
+        if (nnk_ph_cnt[i] == 0u || nnk_ph_pc[i] == pc) {
+            nnk_ph_pc[i] = pc;
+            nnk_ph_cnt[i]++;
+            return;
+        }
+        i = (i + 1u) & (NNK_PH_SZ - 1u);
+        if (i == h) return;                   /* table full: drop the sample */
+    }
+}
+
+static void nnk_ph_report(void) {
+    unsigned i, k, distinct = 0;
+    unsigned long long tot = 0, idle = 0;
+    if (!nnk_ph_on) return;
+    for (i = 0; i < NNK_PH_SZ; i++) {
+        if (!nnk_ph_cnt[i]) continue;
+        distinct++;
+        tot += nnk_ph_cnt[i];
+        if (nnk_ph_pc[i] >= 0x0200712Cu && nnk_ph_pc[i] <= 0x02009120u)
+            idle += nnk_ph_cnt[i];
+    }
+    fprintf(stderr, "pcprof: samples=%llu every=%u steps=%llu distinct_pcs=%u\n",
+            tot, nnk_ph_mask + 1u, (unsigned long long)steps, distinct);
+    fprintf(stderr, "pcprof: idle-loop 0x0200712C..0x02009120 share %.2f%% (%llu samples)\n",
+            tot ? 100.0 * (double)idle / (double)tot : 0.0, idle);
+    for (k = 0; k < 20u; k++) {
+        uint32_t best = 0;
+        unsigned bi = 0;
+        for (i = 0; i < NNK_PH_SZ; i++)
+            if (nnk_ph_cnt[i] > best) { best = nnk_ph_cnt[i]; bi = i; }
+        if (!best) break;
+        fprintf(stderr, "pcprof: #%2u pc=0x%08X hits=%u share=%.2f%%\n",
+                k + 1u, nnk_ph_pc[bi], best,
+                tot ? 100.0 * (double)best / (double)tot : 0.0);
+        nnk_ph_cnt[bi] = 0;
+    }
+    fflush(stderr);
+}
+
+static void nnk_ph_arm(void) {
+    const char *s = getenv("NNK_PERF");
+    const char *d = getenv("NNK_IDLE_SKIP");
+    if (d && d[0] == '0') nnk_idle_skip = 0;         /* A/B: per-step idle loop */
+    if (!s || !s[0] || s[0] == '0') return;
+    { const char *e = getenv("NNK_PC_HIST_EVERY");
+      if (e && e[0]) {
+          long v = strtol(e, NULL, 0);
+          if (v >= 1) nnk_ph_mask = (uint32_t)(v - 1);
+      } }
+    nnk_ph_on = 1;
+    atexit(nnk_ph_report);
+}
+'''
+    BX_STATICS_ANCHOR = "static uint32_t p5f_vc_last = 0xFFFFFFFFu;"
+    if not any("nnk_vc_due" in l for l in prelude):
+        # NOTE: every transform below replaces text INSIDE one prelude element
+        # and never changes the element count: split_dispatch.py later indexes
+        # `prelude[tf_idx:dispatch_idx]` with indices taken from the ORIGINAL
+        # line array, so a re-split would silently truncate run().
+        prelude = list(prelude)
+
+        def _bx(needle, old, new, what):
+            hits = [i for i, l in enumerate(prelude) if needle in l]
+            if len(hits) != 1:
+                die("Phase-5BX: %s anchor matched %d elements" % (what, len(hits)))
+            if prelude[hits[0]].count(old) != 1:
+                die("Phase-5BX: %s body matched %d times"
+                    % (what, prelude[hits[0]].count(old)))
+            prelude[hits[0]] = prelude[hits[0]].replace(old, new, 1)
+
+        _bx(BX_STATICS_ANCHOR, BX_STATICS_ANCHOR,
+            BX_STATICS_ANCHOR + "\n" + BX_GLOBALS.lstrip("\n"), "statics")
+        _bx("Phase-5F: VBlank IRQ producer",
+            """    {   /* Phase-5F: VBlank IRQ producer (melonDS GPU.cpp VCount==192
+         * -> SetDispStatIRQ(0,0), gated on DISPSTAT bit 3). */
+        uint32_t p5f_vc = vcount();
+        if (p5f_vc != p5f_vc_last) {
+            if (p5f_vc == 192u && (dispstat & 0x8u)) iflags |= 0x1u;
+            p5f_vc_last = p5f_vc;
+        }
+    }
+""",
+            """    /* Phase-5BX: the vcount() hooks run on the SCANLINE EDGE (see the
+     * nnk_vc_due block above).  Same edge, same IF bit, same frames. */
+    if (cycles >= nnk_vc_due) {
+        uint32_t p5f_vc = vcount();
+        nnk_vc_due = (cycles / CYCLES_PER_SCANLINE + 1ull) * CYCLES_PER_SCANLINE;
+        if (p5f_vc != p5f_vc_last) {
+            if (p5f_vc == 192u && (dispstat & 0x8u)) iflags |= 0x1u;
+            p5f_vc_last = p5f_vc;
+            nnk_vc_edge_step = steps;
+        }
+    }
+""", "scanline-edge gate")
+        _bx("if (nnk_display_tick()) { halt_reason(",
+            '    if (nnk_display_tick()) { halt_reason("SDL window closed"); step_limit = steps; }\n',
+            '    if (nnk_vc_edge_step == steps && nnk_display_tick())'
+            ' { halt_reason("SDL window closed"); step_limit = steps; }\n',
+            "display tick on the edge")
+        _bx("void trace_pc(uint32_t pc) {",
+            "void trace_pc(uint32_t pc) {\n",
+            "void trace_pc(uint32_t pc) {\n"
+            "    if (nnk_ph_on && (++nnk_ph_n & nnk_ph_mask) == 0u) nnk_ph_sample(pc);\n",
+            "histogram sample")
+        sys.stderr.write("Phase-5BX: scanline-edge gate + NNK_PERF pc histogram spliced\n")
+
     # ---- main TU: prelude + band table + dispatch + tail
     prelude = list(prelude)          # un-static'd copy
     tf_idx = next((i for i, l in enumerate(prelude)
@@ -1052,6 +1204,8 @@ def main():
     main_path = os.path.join(outdir, "nnk_main.c")
     with open(main_path, "w") as fh:
         fh.write('#include "nnk_rt.h"\n\n')
+        # Phase-5BX: callgrind client requests, built only with -DNNK_CG_START.
+        fh.write('#ifdef NNK_CG_START\n#include <valgrind/callgrind.h>\n#endif\n')
         fh.write("static void nnk_boot_firmware(void);\n")
         fh.write("static int nnk_input_ioread16(uint32_t a, uint32_t *out);\n")
         fh.write("static void nnk_input_tick(void);\n")
@@ -1096,14 +1250,60 @@ def main():
         fh.write("             * dispatches, the compiled case is from a stale image generation:\n")
         fh.write("             * re-decode it from live RAM and skip the band switch. */\n")
         fh.write("            if (cycles >= nnk_tick_due) nnk_dma_tick();\n")
-        fh.write("            nnk_input_tick();\n")
-        fh.write("            if (pc >= 0x02900000u && pc < 0x02A00000u && p4x_band_log < 24u) {\n")
+        # Phase-5BX: the input tick is a no-op unless an input source is armed
+        # (-1 = not parsed yet, 1 = armed, 0 = nothing to do: see nnk_input.inc).
+        fh.write("            if (nnk_input_busy) nnk_input_tick();\n")
+        # Phase-5BX: the cheap cap test first (it is 0 once the log is full).
+        fh.write("            if (p4x_band_log < 24u && pc >= 0x02900000u && pc < 0x02A00000u) {\n")
         fh.write("                p4x_band_log++;\n")
         fh.write("                fprintf(stderr, \"p4x band: pc=0x%08X last=0x%08X r0=%08X \"\n")
         fh.write("                        \"r1=%08X r2=%08X r3=%08X r5=%08X r12=%08X r13=%08X \"\n")
         fh.write("                        \"r14=%08X step=%llu\\\\n\",\n")
         fh.write("                        pc, last_pc, r[0], r[1], r[2], r[3], r[5], r[12],\n")
         fh.write("                        r[13], r[14], (unsigned long long)steps);\n")
+        fh.write("            }\n")
+        # Phase-5BX: the guest's idle thread is a pure WFI spin --
+        #   0x02007134 bl 0x02009118 / 0x02009118 mov r0,#0 / 0x0200911C
+        #   mcr p15,0,r0,c7,c0,4 (WFI) / 0x02009120 bx lr / 0x02007138 b 0x02007134
+        # i.e. exactly five ARM instructions per iteration, costs 1/1/1/3/3 card
+        # cycles, and NOTHING else: no memory, no IO, no state beyond r0=0 and
+        # the return address.  Measured on the operator state: 72.9% of all
+        # dispatched guest instructions are those five PCs.  melonDS HALTS the
+        # CPU at the WFI until an IRQ; this model steps through the spin, so the
+        # whole runtime per-instruction overhead (smc probe + trace_pc + band
+        # call ~ 300 Ir) is paid 5 times per iteration for no state change.
+        # Skip the iterations that provably cannot change anything: the next
+        # scheduled tick (nnk_tick_due), the next scanline edge (nnk_vc_due) and
+        # the next step-scripted event (IRQ raise table, ARM7 event table, the
+        # Phase-4C trigger table, NNK_STATE_HASH_AT / NNK_SAVESTATE_SAVE_AT) are
+        # all honoured, so the resumed state is bit-identical.  The five
+        # instructions of one iteration are charged exactly: steps +5, cycles +5
+        # and card_cycles +11 per iteration.
+        fh.write("            if (nnk_idle_skip && pc == 0x02007134u && !nnk_input_busy\n")
+        fh.write("                && !nnk_wfi_probe && !nnk_probe_mask) {\n")
+        fh.write("                uint64_t _dl = nnk_tick_due, _m, _sn;\n")
+        fh.write("                if (nnk_vc_due < _dl) _dl = nnk_vc_due;\n")
+        fh.write("                _m = (_dl > cycles) ? (_dl - cycles) / 5u : 0u;\n")
+        fh.write("                _sn = nnks_next_step();\n")
+        fh.write("                if (irq_raise_n < IRQ_RAISE_N && irq_raise_log[irq_raise_n].step < _sn)\n")
+        fh.write("                    _sn = irq_raise_log[irq_raise_n].step;\n")
+        fh.write("                if (arm7_evt_n < ARM7_EVT_N && arm7_evt_log[arm7_evt_n].step < _sn)\n")
+        fh.write("                    _sn = arm7_evt_log[arm7_evt_n].step;\n")
+        fh.write("                if (irq_trig_n < IRQ_TRIG_N && irq_trig_log[irq_trig_n] < _sn)\n")
+        fh.write("                    _sn = irq_trig_log[irq_trig_n];\n")
+        fh.write("                if (_sn <= steps) _m = 0u;\n")
+        fh.write("                else if ((_sn - steps) / 5u < _m) _m = (_sn - steps) / 5u;\n")
+        fh.write("                if ((step_limit - steps) / 5u < _m) _m = (step_limit - steps) / 5u;\n")
+        fh.write("                if (_m >= 2u) {\n")
+        fh.write("                    steps += 5u * _m - 1u;\n")
+        fh.write("                    cycles += 5u * _m;\n")
+        fh.write("                    card_cycles += 11u * _m;\n")
+        fh.write("                    traced += 5u * _m - 1u;   /* executed, in bulk */\n")
+        fh.write("                    r[0] = 0u;\n")
+        fh.write("                    last_pc = 0x02007138u;\n")
+        fh.write("                    pc = 0x02007134u;\n")
+        fh.write("                    continue;\n")
+        fh.write("                }\n")
         fh.write("            }\n")
         fh.write("            if (nnk_smc_try(&pc)) continue;\n")
         # Phase-5AS: the state CARRIER.  A compiled case translates ONE form
@@ -1156,6 +1356,21 @@ def main():
         tail = inject(tail, "    nnk_display_open();",
                       "    nnk_display_open();\n    nnks_boot(argc, argv);",
                       "Phase-5AQ savestate boot hook")
+        # Phase-5BX: arm the NNK_PERF step-PC histogram (a no-op unless the
+        # operator asked for it).  Inserted INTO the element, not replacing it:
+        # the Phase-5AQ hook above already extended that element.
+        _bh = [i for i, l in enumerate(tail) if "    nnks_boot(argc, argv);" in l]
+        if len(_bh) != 1:
+            die("Phase-5BX: nnks_boot anchor matched %d elements" % len(_bh))
+        tail = list(tail)
+        tail[_bh[0]] = tail[_bh[0]].replace("    nnks_boot(argc, argv);",
+                                            "    nnks_boot(argc, argv);\n"
+                                            "    nnk_ph_arm();\n"
+                                            "#ifdef NNK_CG_START\n"
+                                            "    /* Phase-5BX: callgrind attribution starts HERE so the\n"
+                                            "     * savestate load (97% of a naive profile) is excluded. */\n"
+                                            "    CALLGRIND_START_INSTRUMENTATION;\n"
+                                            "#endif", 1)
         fh.writelines(tail)
     n_cases = sum(len(c) for c in bands.values())
     if n_cases != len(blocks):
