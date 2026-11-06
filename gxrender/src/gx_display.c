@@ -439,6 +439,7 @@ struct Gxd {
                             * frame (GL_FRONT reads are unreliable) */
     int win_shot_w, win_shot_h;
     int quit;
+    unsigned perf;         /* NNK_PERF=1: per-frame guest/render split */
     unsigned frames;
     uint32_t unhandled;
 };
@@ -1705,6 +1706,7 @@ Gxd *gxd_open(const GxdConfig *cfg)
     if (!g) return NULL;
 
     g->windowed = cfg->windowed;
+    { const char *pv = getenv("NNK_PERF"); g->perf = (pv && *pv && *pv != '0'); }
     g->gl_3d = cfg->gl_3d;
     g->scale = cfg->scale > 0 ? cfg->scale : 1;
     g->layout = cfg->layout;
@@ -1996,6 +1998,15 @@ void gxd_advance(Gxd *g)
 
 void gxd_frame(Gxd *g)
 {
+    /* NNK_PERF=1: split the frame budget between rendering (this function:
+     * 3D rasteriser + 2D compose + present, i.e. everything that is not guest
+     * code) and the guest, so "who is to blame" is measured, not guessed. */
+    static Uint32 t_prev;
+    static unsigned t_n;
+    static double t_render;
+    Uint32 t0 = 0, t1;
+    int perf = g->perf;
+    if (perf) t0 = SDL_GetTicks();
     /* 0. Phase-5BU: report the polygon counters of the frame that just ended */
     gx_dbg_pstat_dump();
 
@@ -2050,6 +2061,27 @@ void gxd_frame(Gxd *g)
     }
     g->frames++;
     gx_dbg_frame_set(g->frames);   /* Phase-5BT: tag commands of the next frame */
+
+    if (perf) {
+        t1 = SDL_GetTicks();
+        t_render += (double)(t1 - t0);
+        t_n++;
+        if (t_prev == 0)
+            t_prev = t1;
+        if (t1 - t_prev >= 2000) {
+            double span = (double)(t1 - t_prev);
+            double per = span / (double)t_n;
+            double rend = t_render / (double)t_n;
+            fprintf(stderr,
+                    "perf: %.1f fps | frame %.1f ms = render %.1f ms + guest %.1f ms"
+                    " (render %.0f%%)\n",
+                    (double)t_n * 1000.0 / span, per, rend, per - rend,
+                    100.0 * rend / (per > 0 ? per : 1));
+            t_prev = t1;
+            t_n = 0;
+            t_render = 0;
+        }
+    }
 }
 
 int gxd_should_quit(const Gxd *g) { return g->quit; }
